@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "agentbus"
 version = "0.1.0"
 description = "Reactive pub/sub messaging for AI agents via MQTT"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "aiomqtt>=2.0",
     "pydantic>=2.0",
