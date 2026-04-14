@@ -1,6 +1,6 @@
 # agentbus
 
-> *That insect buzzing in your ear? It has a message.*
+> *The buzz between your agents.*
 
 Reactive pub/sub messaging for AI agents — no polling, instant delivery. Built on MQTT, runs local, scales to multi-machine.
 
@@ -17,7 +17,7 @@ Agent A (Sparrow)           Agent B (Wren)
 
 ## Prerequisites
 
-A running MQTT broker. On Debian/Ubuntu/RPi:
+A running MQTT broker. We use [mosquitto](https://mosquitto.org/) — yes, the pun is intentional. On Debian/Ubuntu/RPi:
 
 ```bash
 sudo apt install mosquitto mosquitto-clients
