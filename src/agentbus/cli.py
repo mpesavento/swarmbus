@@ -154,6 +154,8 @@ def start(
     persistent: bool,
 ) -> None:
     """Start the agentbus listener daemon."""
+    from . import __version__
+
     bus = AgentBus(agent_id=agent_id, broker=broker, port=port, persistent=persistent)
 
     if inbox:
@@ -161,10 +163,21 @@ def start(
     if invoke_cmd:
         bus.register_handler(DirectInvocationHandler(command=shlex.split(invoke_cmd)))
 
-    persistent = PersistentListenerHandler()
-    bus.register_handler(persistent)
+    bus.register_handler(PersistentListenerHandler())
 
-    click.echo(f"[agentbus] {agent_id} listening on {broker}:{port}")
+    # Verbose startup line — all the state a reader of journalctl needs to
+    # diagnose "why didn't my agent react" mysteries without a manual
+    # inspection of the systemd unit. Pulled from the same args the
+    # daemon was actually launched with.
+    click.echo(f"[agentbus] {agent_id} ready")
+    click.echo(f"  version:     {__version__}")
+    click.echo(f"  broker:      {broker}:{port}")
+    click.echo(f"  persistent:  {'yes' if persistent else 'no'}")
+    click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
+    click.echo(f"  invoke:      {invoke_cmd or '(unset — no reactive wake)'}")
+    scoped_key = "AGENTBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
+    outbox_env = os.environ.get(scoped_key) or os.environ.get("AGENTBUS_OUTBOX") or "(unset)"
+    click.echo(f"  outbox env:  {outbox_env}")
     try:
         bus.run()
     except KeyboardInterrupt:
@@ -452,6 +465,270 @@ def tail(
             _emit_new()
     except KeyboardInterrupt:
         click.echo("", err=True)  # newline after ^C
+
+
+@main.command()
+@click.option("--agent-id", default=None, help="Agent id to audit. Defaults to auto-detect from systemd unit or env.")
+@click.option("--broker", default="localhost", show_default=True)
+@click.option("--port", default=1883, show_default=True)
+def doctor(agent_id: str | None, broker: str, port: int) -> None:
+    """Run a self-diagnosis of the local agentbus install + daemon state.
+
+    Prints a checklist of 7 probes: CLI version, broker reachability, my
+    systemd unit state, daemon library freshness (catches stale in-memory
+    Python — the root cause of the 2026-04-14 priority-field incident),
+    --invoke wired, outbox env resolvable, peer discovery. Each failure
+    prints a one-line fix hint. Exits 0 if every check is green, 1 if
+    any is red, 2 if the doctor itself couldn't run.
+
+    Use after any `pip install -U`, after tweaking a systemd unit, or
+    when something "just stopped working" and you want a fast pass/fail
+    signal before diving into logs.
+    """
+    import glob
+    import subprocess
+    from pathlib import Path
+    from . import __version__
+
+    try:
+        agent_id_resolved = agent_id or _detect_agent_id()
+    except Exception as exc:
+        click.echo(f"[doctor] could not detect agent-id: {exc}", err=True)
+        click.echo("[doctor] pass --agent-id <me> to proceed.", err=True)
+        sys.exit(2)
+
+    results: list[tuple[str, str, str | None]] = []
+    # Each tuple: (label, status, fix_hint). status ∈ {"ok","warn","fail","skip"}
+
+    # 1. CLI version
+    try:
+        import agentbus as _ab
+        pkg_path = Path(_ab.__file__).parent
+        results.append((
+            f"agentbus CLI version.... {__version__} at {pkg_path}",
+            "ok",
+            None,
+        ))
+    except Exception as exc:
+        results.append((f"agentbus CLI version.... ERROR {exc}", "fail",
+                        "pip install -e /path/to/agentbus (editable install recommended)"))
+
+    # 2. Broker reachability
+    try:
+        async def _probe_broker():
+            async with aiomqtt.Client(broker, port=port, timeout=2.0):
+                return True
+        asyncio.run(_probe_broker())
+        results.append((f"broker reachable........ {broker}:{port}", "ok", None))
+    except Exception as exc:
+        results.append((f"broker reachable........ {broker}:{port}: {exc}",
+                        "fail",
+                        f"systemctl status mosquitto  (or point --broker at a reachable host)"))
+
+    # 3. Systemd daemon state
+    unit_name = f"agentbus-{agent_id_resolved}.service"
+    try:
+        env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+               "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
+        probe = subprocess.run(
+            ["systemctl", "--user", "show", unit_name,
+             "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecStart"],
+            capture_output=True, text=True, env=env, timeout=3,
+        )
+        if probe.returncode != 0 or not probe.stdout.strip():
+            results.append((
+                f"systemd user unit....... {unit_name} NOT FOUND",
+                "warn",
+                f"scripts/install-systemd.sh {agent_id_resolved} "
+                f"(or leave as-is if you run a bare daemon)",
+            ))
+            active_state = None
+            main_pid = None
+            exec_start = None
+            start_ts = None
+        else:
+            props = dict(line.split("=", 1) for line in probe.stdout.strip().splitlines() if "=" in line)
+            active_state = props.get("ActiveState", "?")
+            main_pid = props.get("MainPID", "0")
+            start_ts = props.get("ExecMainStartTimestamp", "")
+            exec_start = props.get("ExecStart", "")
+            if active_state == "active":
+                results.append((
+                    f"systemd user unit....... active (PID {main_pid}, since {start_ts})",
+                    "ok", None,
+                ))
+            else:
+                results.append((
+                    f"systemd user unit....... {active_state}",
+                    "fail",
+                    f"systemctl --user status {unit_name}  (and restart if needed)",
+                ))
+    except FileNotFoundError:
+        results.append(("systemd user unit....... (systemctl not found)", "skip", None))
+        main_pid = None
+        exec_start = None
+        start_ts = None
+    except Exception as exc:
+        results.append((f"systemd user unit....... ERROR {exc}", "warn", None))
+        main_pid = None
+        exec_start = None
+        start_ts = None
+
+    # 4. Library freshness — does the running daemon's start time predate
+    # the on-disk package source? If so, stale in-memory Python is possible.
+    # This is the exact check that would have saved hours on 2026-04-14.
+    try:
+        if main_pid and main_pid != "0":
+            # Compare daemon process start time to the source file mtime.
+            import datetime
+            try:
+                proc_stat = Path(f"/proc/{main_pid}/stat").read_text().split()
+                # Field 22 is start time in clock ticks since boot; convert.
+                boot_ts = float(Path("/proc/uptime").read_text().split()[0])
+                clock_ticks = os.sysconf("SC_CLK_TCK")
+                start_since_boot = float(proc_stat[21]) / clock_ticks
+                now = datetime.datetime.now()
+                proc_started = now - datetime.timedelta(seconds=boot_ts - start_since_boot)
+                source_mtime = datetime.datetime.fromtimestamp(
+                    Path(_ab.__file__).parent.joinpath("message.py").stat().st_mtime
+                )
+                if source_mtime > proc_started:
+                    results.append((
+                        f"daemon library fresh.... STALE — source modified "
+                        f"{source_mtime:%Y-%m-%d %H:%M:%S} > daemon started "
+                        f"{proc_started:%Y-%m-%d %H:%M:%S}",
+                        "fail",
+                        f"systemctl --user restart {unit_name}  "
+                        f"(running daemon holds old code in memory)",
+                    ))
+                else:
+                    results.append((
+                        f"daemon library fresh.... ok (started "
+                        f"{proc_started:%Y-%m-%d %H:%M:%S}, source last "
+                        f"modified {source_mtime:%Y-%m-%d %H:%M:%S})",
+                        "ok", None,
+                    ))
+            except (FileNotFoundError, PermissionError, IndexError) as exc:
+                results.append((f"daemon library fresh.... could not verify ({exc})",
+                                "skip", None))
+        else:
+            results.append(("daemon library fresh.... (no daemon to check)", "skip", None))
+    except Exception as exc:
+        results.append((f"daemon library fresh.... ERROR {exc}", "warn", None))
+
+    # 5. --invoke wired
+    if exec_start is not None:
+        if "--invoke" in (exec_start or ""):
+            import re as _re
+            m = _re.search(r"--invoke[= ]+\"?([^\"\\s]+)\"?", exec_start)
+            invoke_path = m.group(1) if m else "(parsed)"
+            results.append((f"--invoke wired.......... yes ({invoke_path})", "ok", None))
+        else:
+            results.append((
+                "--invoke wired.......... no reactive wake",
+                "warn",
+                f"edit {Path.home()}/.config/systemd/user/{unit_name} ExecStart "
+                f"to add --invoke <path-to-wake-wrapper>; systemctl --user "
+                f"daemon-reload && restart",
+            ))
+    else:
+        results.append(("--invoke wired.......... (no unit to inspect)", "skip", None))
+
+    # 6. Outbox env var resolvable
+    scoped_key = "AGENTBUS_OUTBOX_" + agent_id_resolved.replace("-", "_").upper()
+    outbox_env = os.environ.get(scoped_key) or os.environ.get("AGENTBUS_OUTBOX")
+    if outbox_env:
+        resolved = outbox_env.replace("{agent_id}", agent_id_resolved)
+        try:
+            p = Path(resolved).expanduser()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch(exist_ok=True)
+            results.append((
+                f"outbox env resolvable... {resolved}",
+                "ok", None,
+            ))
+        except Exception as exc:
+            results.append((
+                f"outbox env resolvable... {resolved}: NOT WRITABLE ({exc})",
+                "fail",
+                "check parent dir permissions",
+            ))
+    else:
+        results.append((
+            "outbox env resolvable... (unset)",
+            "warn",
+            f"export AGENTBUS_OUTBOX_{agent_id_resolved.upper()}=~/sync/"
+            f"{agent_id_resolved}-outbox.md   (or AGENTBUS_OUTBOX with "
+            f"{{agent_id}} template)",
+        ))
+
+    # 7. Peer discovery
+    try:
+        bus = AgentBus.probe(broker=broker, port=port)
+        peers = asyncio.run(bus.list_agents())
+        if agent_id_resolved in peers:
+            others = [p for p in peers if p != agent_id_resolved]
+            results.append((
+                f"peer discovery.......... I'm visible; {len(others)} other peer(s): "
+                f"{', '.join(others) or '(none)'}",
+                "ok", None,
+            ))
+        else:
+            results.append((
+                f"peer discovery.......... I'm NOT in the online list "
+                f"({len(peers)} peers visible: {', '.join(peers) or '(none)'})",
+                "fail",
+                f"systemctl --user restart {unit_name}  "
+                f"(daemon may not have announced presence)",
+            ))
+    except Exception as exc:
+        results.append((f"peer discovery.......... ERROR {exc}", "fail", None))
+
+    # Render
+    click.echo(f"\n[doctor] agentbus health check for agent-id={agent_id_resolved}\n")
+    icon = {"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·"}
+    fails = warns = 0
+    for i, (label, status, hint) in enumerate(results, 1):
+        click.echo(f"  [{icon[status]}] {i}. {label}")
+        if hint:
+            click.echo(f"        fix: {hint}")
+        if status == "fail":
+            fails += 1
+        elif status == "warn":
+            warns += 1
+    click.echo("")
+    if fails:
+        click.echo(f"[doctor] {fails} failure(s), {warns} warning(s) — some checks are red.")
+        sys.exit(1)
+    elif warns:
+        click.echo(f"[doctor] all critical checks passed; {warns} warning(s) above.")
+        sys.exit(0)
+    else:
+        click.echo("[doctor] all green.")
+        sys.exit(0)
+
+
+def _detect_agent_id() -> str:
+    """Best-effort agent-id detection: look for an active systemd user
+    unit named agentbus-*.service. Error out if ambiguous or none."""
+    import subprocess
+    env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
+    res = subprocess.run(
+        ["systemctl", "--user", "list-units", "--type=service", "--no-legend",
+         "--no-pager", "agentbus-*.service"],
+        capture_output=True, text=True, env=env, timeout=3,
+    )
+    units = [line.split()[0] for line in res.stdout.strip().splitlines() if line.strip()]
+    candidates = []
+    for u in units:
+        if u.startswith("agentbus-") and u.endswith(".service"):
+            candidates.append(u[len("agentbus-"):-len(".service")])
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise RuntimeError(f"multiple agentbus units running ({candidates}); pass --agent-id")
+    raise RuntimeError("no agentbus-*.service unit detected")
 
 
 @main.command("mcp-server")

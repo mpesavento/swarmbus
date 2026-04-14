@@ -1,4 +1,6 @@
 # src/agentbus/__init__.py
+__version__ = "0.1.0"
+
 from .bus import AgentBus
 from .message import AgentMessage
 from .handlers.base import BaseHandler

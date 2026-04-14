@@ -358,6 +358,29 @@ Anonymous is safe within a tailnet — the mesh is already authenticated. Never 
 
 If you can't use Tailscale, run mosquitto with TLS + username/password auth. The agentbus CLI doesn't yet expose TLS flags; supply them via a mosquitto client config file or use the Python API with the aiomqtt TLS parameters directly. This is out of scope for the bundled setup scripts.
 
+## Troubleshooting
+
+Symptoms we hit during real deployment and the first thing to check. In every case, start with `agentbus doctor --agent-id <me>` — it turns most of this table into a one-command answer.
+
+| Symptom | Likely cause | First check |
+|---|---|---|
+| Every `agentbus send` reports "Sent to X" but peer never sees the message. | Peer's daemon has stale in-memory Python (pre-upgrade code). Wire-envelope change rejected by pydantic, dropped silently. | `agentbus doctor --agent-id <peer>` → check "daemon library fresh". Fix: `systemctl --user restart agentbus-<peer>.service`. |
+| `priority=high` messages sent but no wake wrapper ever fires. | (a) CLI default is `normal` — make sure `--priority high` is actually on the send. (b) Receiver's systemd unit has no `--invoke` flag. | `agentbus doctor` → check "--invoke wired". Fix: edit `~/.config/systemd/user/agentbus-<me>.service` ExecStart to add `--invoke <wrapper-path>`, `daemon-reload`, `restart`. |
+| `agentbus list` returns nothing, but peers are running. | (a) Broker not reachable. (b) Peers' daemons crashed without `--persistent` so presence wasn't retained. | `agentbus doctor` → "broker reachable" + "peer discovery". If broker is fine, have peers restart with `--persistent` (the default on `agentbus start`). |
+| `inbox-watch.sh` cron silently never pings operator. | Neither `TELEGRAM_BOT_TOKEN` env var nor `~/.secrets/TELEGRAM_BOT_TOKEN` file present. The script logs a skip reason to stderr (post-`aaa1823`) — but older installs silently no-op'd. | `tail ~/logs/inbox-watch-<agent>.log` for `[inbox-watch] no TELEGRAM_BOT_TOKEN...`. Fix: add the token to cron env or the secrets file. |
+| `inbox-watch.sh` never pings operator but log shows `pushed summary (1 msgs)`. | Bot is correctly sending, but to a different Telegram chat than the one the operator is watching. (Each agent typically has its own bot; all pings for agent X land in conversations with bot X.) | Check the operator's conversations with that agent's Telegram bot, not the current chat. |
+| Send errors with `[Errno 111] Connection refused`. | mosquitto isn't running (or `--broker` points at a host that can't reach 1883). | `systemctl status mosquitto` locally, or `mosquitto_pub -h <broker> -t ping -m x` from a peer host. |
+| `agentbus tail` prints old messages every time. | Cursor file was cleared (SIGKILL mid-write, manual delete, script rotation). | Check `~/.agentbus/cursors/<agent>--<consumer>.cursor`; after `aaa1823` the write is atomic, so corruption of the cursor itself is rare. |
+| `agentbus tail --follow` dies when inbox file is rotated/moved. | Pre-`0d1415a` builds didn't catch `FileNotFoundError` in the poll loop. | Upgrade agentbus + restart the `tail --follow` process. |
+| "My daemon is running but messages just pile up in the inbox file and nothing fires." | File-bridge caught the message (archive OK), but `--invoke` is either missing or broken. For Claude Code, a fresh session spawn is ~100k tokens — policy default is `priority=high` only. | `tail ~/.local/state/agentbus-wake/<agent>.log`. If you see `policy=priority-high; priority=normal; archive-only` that's working-as-designed. Override with `AGENTBUS_WAKE_POLICY=all` for testing. |
+| Restarted daemon still rejects `priority=high`. | In-process Python module cache. The `pip install` wrote new bytes, but the already-running daemon reads its old loaded module. | `systemctl --user restart agentbus-<agent>.service` (full process replacement, not `--reload`). |
+
+For deeper diagnosis: `systemctl --user status agentbus-<agent>.service`, `journalctl --user -u agentbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
+
+## Onboarding a new agent
+
+Walk-through at [docs/agent-onboarding.md](docs/agent-onboarding.md). Linear steps: pick agent-id → install → setup script → `install-systemd.sh` → `agentbus doctor` → self-probe → announce.
+
 ## License
 
 MIT
