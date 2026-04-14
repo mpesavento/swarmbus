@@ -33,8 +33,14 @@
 #
 # Crontab example (every 5 minutes, off-minute to avoid synchronized fleets):
 #   2,7,12,17,22,27,32,37,42,47,52,57 * * * * \
-#     TELEGRAM_CHAT_ID=12345 bash /path/to/inbox-watch.sh --agent-id myagent \
+#     TELEGRAM_BOT_TOKEN=<your-bot-token> TELEGRAM_CHAT_ID=12345 \
+#     bash /path/to/inbox-watch.sh --agent-id myagent \
 #       >> ~/logs/inbox-watch.log 2>&1
+#
+# TELEGRAM_BOT_TOKEN can be omitted from the inline cron env **only** if
+# ~/.secrets/TELEGRAM_BOT_TOKEN exists — the script falls back to reading
+# that file. Without either source the push is silently skipped (logged
+# to the agent's state dir only).
 
 set -euo pipefail
 
@@ -151,7 +157,13 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
 elif [ -f "$TOKEN_FILE" ]; then
   token=$(cat "$TOKEN_FILE")
 else
-  _log "no TELEGRAM_BOT_TOKEN env var or token file at $TOKEN_FILE; skipping push"
+  # Visible on stderr so cron's redirect captures it — the silent-in-log
+  # behavior was a real bug (operator follows minimal doc example, no
+  # TELEGRAM_BOT_TOKEN in env and no ~/.secrets file, every tick silently
+  # no-ops with the failure only in the agent's state dir).
+  msg="[inbox-watch] no TELEGRAM_BOT_TOKEN env var or token file at $TOKEN_FILE; skipping push"
+  _log "$msg"
+  echo "$msg" >&2
   exit 0
 fi
 
