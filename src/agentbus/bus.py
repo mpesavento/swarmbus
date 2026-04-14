@@ -172,6 +172,82 @@ class AgentBus:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, reconnect_max)
 
+    async def read_inbox(self, max_messages: int = 10, drain_timeout: float = 1.0) -> list[dict]:
+        """Non-blocking drain of queued retained messages for this agent.
+
+        Returns a list of message dicts (up to `max_messages`). Malformed
+        envelopes are skipped. Broker errors are logged and return [].
+        """
+        messages: list[dict] = []
+        try:
+            async with aiomqtt.Client(self.broker, port=self.port) as client:
+                await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+                try:
+                    async with asyncio.timeout(drain_timeout):
+                        async for mqtt_msg in client.messages:
+                            try:
+                                msg = AgentMessage.from_json(mqtt_msg.payload)
+                                messages.append(json.loads(msg.to_json()))
+                            except Exception as exc:
+                                logger.warning("read_inbox: skipping bad envelope: %s", exc)
+                            if len(messages) >= max_messages:
+                                break
+                except asyncio.TimeoutError:
+                    pass
+        except aiomqtt.MqttError as exc:
+            logger.error("read_inbox: broker error (%s:%d): %s", self.broker, self.port, exc)
+        return messages
+
+    async def watch_inbox(self, timeout: float = 30.0) -> dict | None:
+        """Long-poll — blocks until a message arrives, returns it, or times out.
+
+        Returns None on timeout or broker unavailability.
+        """
+        try:
+            async with aiomqtt.Client(self.broker, port=self.port) as client:
+                await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+                try:
+                    async with asyncio.timeout(timeout):
+                        async for mqtt_msg in client.messages:
+                            try:
+                                msg = AgentMessage.from_json(mqtt_msg.payload)
+                                return json.loads(msg.to_json())
+                            except Exception as exc:
+                                logger.warning("watch_inbox: skipping bad envelope: %s", exc)
+                                continue
+                except asyncio.TimeoutError:
+                    return None
+        except aiomqtt.MqttError as exc:
+            logger.error("watch_inbox: broker error (%s:%d): %s", self.broker, self.port, exc)
+        return None
+
+    async def list_agents(self, collect_window: float = 0.5) -> list[str]:
+        """Return sorted IDs of agents whose latest retained presence is online."""
+        online: set[str] = set()
+        try:
+            async with aiomqtt.Client(self.broker, port=self.port) as client:
+                await client.subscribe("agents/+/presence", qos=0)
+                try:
+                    async with asyncio.timeout(collect_window):
+                        async for mqtt_msg in client.messages:
+                            try:
+                                payload = json.loads(mqtt_msg.payload)
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                continue
+                            name = payload.get("agent")
+                            status = payload.get("status")
+                            if not name:
+                                continue
+                            if status == "online":
+                                online.add(name)
+                            else:
+                                online.discard(name)
+                except asyncio.TimeoutError:
+                    pass
+        except aiomqtt.MqttError as exc:
+            logger.warning("list_agents: broker error: %s", exc)
+        return sorted(online)
+
     async def disconnect(self) -> None:
         """Publish offline presence (retained). Call before process exit if
         not using listen()."""

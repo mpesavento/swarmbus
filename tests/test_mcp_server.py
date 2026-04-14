@@ -46,8 +46,7 @@ async def test_send_message_tool_calls_bus():
 
 @pytest.mark.asyncio
 async def test_list_agents_returns_list():
-    with patch("agentbus.mcp_server.AgentBus"), \
-         patch("agentbus.mcp_server.aiomqtt.Client", return_value=_FakePresenceClient([])):
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakePresenceClient([])):
         app = create_mcp_app(agent_id="sparrow", broker="localhost")
         list_fn = app._tool_fns["list_agents"]
         result = await list_fn()
@@ -62,8 +61,7 @@ async def test_list_agents_reports_online_only():
         {"agent": "wren", "status": "online"},
         {"agent": "ghost", "status": "offline"},  # should be filtered
     ]
-    with patch("agentbus.mcp_server.AgentBus"), \
-         patch("agentbus.mcp_server.aiomqtt.Client", return_value=_FakePresenceClient(retained)):
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakePresenceClient(retained)):
         app = create_mcp_app(agent_id="sparrow", broker="localhost")
         result = await app._tool_fns["list_agents"]()
     assert set(result) == {"sparrow", "wren"}
@@ -77,8 +75,7 @@ async def test_list_agents_latest_status_wins():
         {"agent": "wren", "status": "online"},
         {"agent": "wren", "status": "offline"},  # supersedes
     ]
-    with patch("agentbus.mcp_server.AgentBus"), \
-         patch("agentbus.mcp_server.aiomqtt.Client", return_value=_FakePresenceClient(retained)):
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakePresenceClient(retained)):
         app = create_mcp_app(agent_id="sparrow", broker="localhost")
         result = await app._tool_fns["list_agents"]()
     assert result == []
@@ -95,10 +92,9 @@ async def test_read_inbox_logs_broker_error(caplog):
         async def __aexit__(self, *_):
             pass
 
-    with patch("agentbus.mcp_server.AgentBus"), \
-         patch("agentbus.mcp_server.aiomqtt.Client", return_value=_BadClient()):
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_BadClient()):
         app = create_mcp_app(agent_id="sparrow", broker="localhost")
-        with caplog.at_level("ERROR", logger="agentbus.mcp_server"):
+        with caplog.at_level("ERROR", logger="agentbus.bus"):
             result = await app._tool_fns["read_inbox"]()
     assert result == []
     assert any("broker error" in r.message for r in caplog.records)
@@ -119,8 +115,7 @@ async def test_list_agents_skips_malformed_payloads():
                 yield _FakePresenceMsg({"agent": "sparrow", "status": "online"})
             return _gen()
 
-    with patch("agentbus.mcp_server.AgentBus"), \
-         patch("agentbus.mcp_server.aiomqtt.Client", return_value=_MixedClient()):
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_MixedClient()):
         app = create_mcp_app(agent_id="sparrow", broker="localhost")
         result = await app._tool_fns["list_agents"]()
     assert result == ["sparrow"]
