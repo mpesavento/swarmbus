@@ -116,12 +116,12 @@ reader doesn't think they were skipped.
 
 ### Operational / protocol gotchas (behavioural findings, not code bugs)
 
-- [ ] **Rolling-upgrade discipline.** Any wire-format-affecting change
-      (new Literal in an envelope field, new topic shape, new MQTT
-      reserved keywords) will silently break older daemons until they
-      all restart. Suggest a `CHANGELOG.md` with a "wire-compat"
-      bullet per release, and a `agentbus doctor` subcommand that
-      probes the current broker's envelope compatibility.
+- [x] **Rolling-upgrade discipline.** Closed via `CHANGELOG.md` with a
+      "Wire-compat" bullet per release (commit `cec46aa`) + `agentbus
+      doctor` subcommand (commit `eab328e`) that includes a "daemon
+      library fresh" check — compares running daemon start time to
+      source-on-disk mtime and flags stale in-memory Python as
+      "STALE — restart recommended".
 
 - [ ] **Claude Code session wake cost.** Documented in
       `claude-code-wake.sh`: a fresh spawn is ~100k tokens bootstrap.
