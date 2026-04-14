@@ -4,17 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from typing import List
 
 import aiomqtt
 
-from .message import AgentMessage
+from .message import AgentMessage, _validate_agent_id
 from .handlers.base import BaseHandler
 
 logger = logging.getLogger(__name__)
-
-_AGENT_ID_RE = re.compile(r'^[a-z0-9_-]{1,64}$')
 
 
 class AgentBus:
@@ -25,7 +22,9 @@ class AgentBus:
         port: int = 1883,
         retain: bool = True,
     ) -> None:
-        if not _AGENT_ID_RE.match(agent_id):
+        try:
+            _validate_agent_id(agent_id)
+        except ValueError:
             raise ValueError(f"agent_id must match [a-z0-9_-]{{1,64}}, got: {agent_id!r}")
         self.agent_id = agent_id
         self.broker = broker

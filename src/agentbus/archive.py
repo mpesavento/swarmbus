@@ -31,12 +31,17 @@ class SQLiteArchive(BaseHandler):
     def __init__(self, db_path: str) -> None:
         self.db_path = Path(db_path).expanduser()
 
-    async def handle(
+    async def handle(self, msg: AgentMessage) -> None:
+        """BaseHandler interface — archives with direction='received'."""
+        await self.archive(msg, direction="received")
+
+    async def archive(
         self,
         msg: AgentMessage,
         direction: str = "received",
         error: Optional[str] = None,
     ) -> None:
+        """Store a message with explicit direction and optional error note."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(_CREATE_TABLE)

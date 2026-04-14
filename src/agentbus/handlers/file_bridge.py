@@ -16,7 +16,7 @@ class FileBridgeHandler(BaseHandler):
             f"From: {msg.from_agent} | {msg.subject}\n"
             f"{msg.body}\n"
         )
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._append, entry)
 
     def _append(self, entry: str) -> None:

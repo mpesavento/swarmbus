@@ -31,7 +31,7 @@ class DirectInvocationHandler(BaseHandler):
         if msg.reply_to:
             env["AGENTBUS_REPLY_TO"] = msg.reply_to
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: subprocess.run(
