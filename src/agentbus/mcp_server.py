@@ -48,7 +48,6 @@ def create_mcp_app(agent_id: str, broker: str = "localhost", port: int = 1883) -
     """Create and return the MCP app (testable without running the server)."""
     bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
     app = _MCPApp()
-    _presence_cache: dict[str, str] = {}
 
     @app.tool(name="send_message")
     async def send_message(
@@ -100,8 +99,38 @@ def create_mcp_app(agent_id: str, broker: str = "localhost", port: int = 1883) -
 
     @app.tool(name="list_agents")
     async def list_agents() -> list[str]:
-        """Return list of agent IDs seen on presence topics."""
-        return list(_presence_cache.keys())
+        """Return IDs of agents currently online.
+
+        Subscribes briefly to `agents/+/presence` and collects retained
+        messages. Agents are reported only when their latest retained
+        presence message is status=online.
+        """
+        online: set[str] = set()
+        try:
+            async with aiomqtt.Client(broker, port=port) as client:
+                await client.subscribe("agents/+/presence", qos=0)
+                # Retained messages arrive on SUBACK; collect for a short
+                # window, then return what we have.
+                try:
+                    async with asyncio.timeout(0.5):
+                        async for mqtt_msg in client.messages:
+                            try:
+                                payload = json.loads(mqtt_msg.payload)
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                continue
+                            name = payload.get("agent")
+                            status = payload.get("status")
+                            if not name:
+                                continue
+                            if status == "online":
+                                online.add(name)
+                            else:
+                                online.discard(name)
+                except asyncio.TimeoutError:
+                    pass
+        except aiomqtt.MqttError as exc:
+            logger.warning("list_agents: broker error: %s", exc)
+        return sorted(online)
 
     return app
 
