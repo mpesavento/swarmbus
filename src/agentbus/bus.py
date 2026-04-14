@@ -20,8 +20,17 @@ class AgentBus:
         agent_id: str,
         broker: str = "localhost",
         port: int = 1883,
-        retain: bool = True,
+        retain: bool = False,
     ) -> None:
+        """Construct an AgentBus.
+
+        retain: whether published inbox/broadcast messages are retained by the
+            broker. Default **False** — retained inbox messages are redelivered
+            to subscribers on every reconnect, which is almost never the
+            desired semantic for directed messages. Presence publishes use
+            retain=True unconditionally so late subscribers can see who is
+            currently online.
+        """
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
         self.broker = broker
@@ -61,17 +70,22 @@ class AgentBus:
             )
 
     async def listen(self) -> None:
+        # Retained presence so late subscribers see current state.
+        # LWT retained too so an unexpected disconnect overwrites "online"
+        # with "offline" — without retain, a crashed agent would leave
+        # stale "online" state that never clears.
         will = aiomqtt.Will(
             topic=f"agents/{self.agent_id}/presence",
             payload=json.dumps({"agent": self.agent_id, "status": "offline"}),
-            qos=0,
-            retain=False,
+            qos=1,
+            retain=True,
         )
         async with aiomqtt.Client(self.broker, port=self.port, will=will) as client:
             await client.publish(
                 f"agents/{self.agent_id}/presence",
                 json.dumps({"agent": self.agent_id, "status": "online"}),
-                qos=0,
+                qos=1,
+                retain=True,
             )
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             await client.subscribe("agents/broadcast", qos=1)
@@ -93,12 +107,14 @@ class AgentBus:
                         )
 
     async def disconnect(self) -> None:
-        """Publish offline presence. Call before process exit if not using listen()."""
+        """Publish offline presence (retained). Call before process exit if
+        not using listen()."""
         async with aiomqtt.Client(self.broker, port=self.port) as client:
             await client.publish(
                 f"agents/{self.agent_id}/presence",
                 json.dumps({"agent": self.agent_id, "status": "offline"}),
-                qos=0,
+                qos=1,
+                retain=True,
             )
 
     def run(self) -> None:

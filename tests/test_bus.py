@@ -65,6 +65,63 @@ async def test_send_publishes_to_correct_topic():
 
 
 @pytest.mark.asyncio
+async def test_send_default_retain_is_false():
+    """Inbox messages must not be retained by default (would replay forever)."""
+    bus = AgentBus(agent_id="sparrow", broker="localhost")
+    captured = {}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, topic, payload, qos=0, retain=False):
+            captured["retain"] = retain
+
+    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+        await bus.send(to="wren", subject="hi", body="x")
+
+    assert captured["retain"] is False
+
+
+@pytest.mark.asyncio
+async def test_listen_retains_online_presence():
+    """Late subscribers must see current presence via retained messages."""
+    bus = AgentBus(agent_id="sparrow", broker="localhost")
+    published = []
+    will_args = {}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, topic, payload, qos=0, retain=False):
+            published.append({"topic": topic, "retain": retain, "qos": qos})
+        async def subscribe(self, *args, **kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _gen():
+                if False:
+                    yield
+            return _gen()
+
+    def _capture_client(broker, port, will=None):
+        will_args["payload"] = will.payload if will else None
+        will_args["retain"] = will.retain if will else None
+        return FakeClient()
+
+    with patch("agentbus.bus.aiomqtt.Client", side_effect=_capture_client):
+        await bus.listen()
+
+    online = [p for p in published if p["topic"] == "agents/sparrow/presence"]
+    assert online, "expected an online presence publish"
+    assert online[0]["retain"] is True
+    assert will_args["retain"] is True  # LWT also retained
+
+
+@pytest.mark.asyncio
 async def test_send_broadcast_uses_correct_topic():
     bus = AgentBus(agent_id="sparrow", broker="localhost")
     published = []
