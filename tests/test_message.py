@@ -59,15 +59,42 @@ def test_from_json_invalid_envelope():
     with pytest.raises(Exception):
         AgentMessage.from_json('{"not": "valid"}')
 
-def test_priority_urgent():
+def test_priority_high():
     msg = AgentMessage.create(
         from_="sparrow", to="wren", subject="urgent!", body="now",
-        priority="urgent",
+        priority="high",
     )
-    assert msg.priority == "urgent"
+    assert msg.priority == "high"
     raw = msg.to_json()
     restored = AgentMessage.from_json(raw)
-    assert restored.priority == "urgent"
+    assert restored.priority == "high"
+
+
+def test_priority_low():
+    msg = AgentMessage.create(
+        from_="sparrow", to="wren", subject="fyi", body="fire and forget",
+        priority="low",
+    )
+    assert msg.priority == "low"
+
+
+def test_priority_accepts_unknown_strings_for_forward_compat():
+    """Regression test: the envelope must pass through unknown priority
+    strings rather than raising. A real incident occurred when an earlier
+    version used Literal["normal", "urgent"] — a newer peer emitting
+    priority="high" caused older daemons to silently discard every such
+    message (ValidationError at from_json). The Literal is now gone;
+    priority is `str`, and callers that care validate at the application
+    layer (e.g. wake wrappers gating on "high"). Unknown values MUST NOT
+    raise."""
+    msg = AgentMessage.create(
+        from_="sparrow", to="wren", subject="x", body="y",
+        priority="some-future-priority-value",
+    )
+    assert msg.priority == "some-future-priority-value"
+    # And it must round-trip through JSON the same way:
+    restored = AgentMessage.from_json(msg.to_json())
+    assert restored.priority == "some-future-priority-value"
 
 def test_reply_to():
     original = AgentMessage.create(from_="sparrow", to="wren", subject="q", body="?")

@@ -125,6 +125,65 @@ def test_send_outbox_template_substitution_via_env():
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/{agent_id}-outbox.md"
 
 
+def test_send_priority_roundtrips_cli_to_envelope():
+    """Regression: the --priority CLI flag must actually thread through
+    to AgentBus.send's priority kwarg. An earlier version had no --priority
+    flag at all — priority=high claims in docs and wake wrappers were
+    untestable from the shell. Never again."""
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(main, [
+            "send", "--agent-id", "sparrow", "--to", "wren",
+            "--subject", "x", "--body", "y",
+            "--priority", "high",
+        ])
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["priority"] == "high"
+
+
+def test_send_priority_default_is_normal():
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(main, [
+            "send", "--agent-id", "sparrow", "--to", "wren",
+            "--subject", "x", "--body", "y",
+        ])
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["priority"] == "normal"
+
+
+def test_send_priority_rejects_unknown_at_cli():
+    """CLI level accepts only the canonical set — prevents typos. The
+    wire envelope accepts any string for forward-compat, but operators
+    typing agentbus send on the command line shouldn't silently send
+    'hight' and have the wake gate miss it."""
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "send", "--agent-id", "sparrow", "--to", "wren",
+        "--subject", "x", "--body", "y",
+        "--priority", "hight",
+    ])
+    assert result.exit_code != 0
+    assert "hight" in result.output or "Invalid value" in result.output
+
+
+def test_send_content_type_roundtrips():
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        runner.invoke(main, [
+            "send", "--agent-id", "sparrow", "--to", "wren",
+            "--subject", "x", "--body", "y",
+            "--content-type", "text/markdown",
+        ])
+    assert instance.send.call_args.kwargs["content_type"] == "text/markdown"
+
+
 def test_send_reply_to_roundtrips():
     runner = CliRunner()
     with patch("agentbus.cli.AgentBus") as MockBus:

@@ -5,7 +5,7 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -49,7 +49,15 @@ class AgentMessage(BaseModel):
     subject: str
     body: str
     content_type: str = "text/plain"
-    priority: Literal["normal", "urgent"] = "normal"
+    # `priority` is kept as `str` (not `Literal[...]`) on purpose: the wire
+    # envelope must be forward/backward compatible across rolling upgrades.
+    # Known values are "low", "normal", "high" (the wake wrappers gate on
+    # "high"). Any other string passes through — callers may log a warning
+    # if they don't recognise it, but MUST NOT drop the message. See
+    # https://github.com/mpesavento/agentbus — historical gotcha: an earlier
+    # version used Literal["normal", "urgent"], which meant priority="high"
+    # from a newer peer was silently discarded by older daemons.
+    priority: str = "normal"
     reply_to: Optional[str] = None
 
     @field_validator("from_agent", mode="before")
@@ -77,7 +85,7 @@ class AgentMessage(BaseModel):
         subject: str,
         body: str,
         content_type: str = "text/plain",
-        priority: Literal["normal", "urgent"] = "normal",
+        priority: str = "normal",
         reply_to: Optional[str] = None,
     ) -> "AgentMessage":
         return cls.model_validate({
