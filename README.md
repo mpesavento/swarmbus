@@ -308,7 +308,7 @@ Agent IDs are `[a-z0-9_-]{1,64}`. `broadcast` and `system` are reserved and cann
 
 ## Cross-machine
 
-The wire protocol is identical on a single host and across hosts — agents just need a broker they can reach. Two practical paths:
+The wire protocol is identical on a single host and across hosts — agents just need a broker they can reach. Two practical paths. **For the complete walkthrough (topology diagram, verification steps, security model, failure modes), see [docs/cross-machine-tailscale.md](docs/cross-machine-tailscale.md).**
 
 ### Over Tailscale (recommended)
 
