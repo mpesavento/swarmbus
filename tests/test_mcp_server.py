@@ -85,6 +85,26 @@ async def test_list_agents_latest_status_wins():
 
 
 @pytest.mark.asyncio
+async def test_read_inbox_logs_broker_error(caplog):
+    """Broker errors must log at ERROR, not silently return []."""
+    import aiomqtt as _aiomqtt
+
+    class _BadClient:
+        async def __aenter__(self):
+            raise _aiomqtt.MqttError("connection refused")
+        async def __aexit__(self, *_):
+            pass
+
+    with patch("agentbus.mcp_server.AgentBus"), \
+         patch("agentbus.mcp_server.aiomqtt.Client", return_value=_BadClient()):
+        app = create_mcp_app(agent_id="sparrow", broker="localhost")
+        with caplog.at_level("ERROR", logger="agentbus.mcp_server"):
+            result = await app._tool_fns["read_inbox"]()
+    assert result == []
+    assert any("broker error" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_list_agents_skips_malformed_payloads():
     class _BadPayloadMsg:
         payload = b"not json at all"

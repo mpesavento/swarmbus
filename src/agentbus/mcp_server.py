@@ -17,6 +17,7 @@ import logging
 from typing import Any
 
 import aiomqtt
+from pydantic import ValidationError
 
 from .bus import AgentBus
 from .message import AgentMessage
@@ -62,39 +63,55 @@ def create_mcp_app(agent_id: str, broker: str = "localhost", port: int = 1883) -
 
     @app.tool(name="read_inbox")
     async def read_inbox() -> list[dict]:
-        """Poll for queued messages (retain=True). Returns up to 10 recent messages."""
+        """Poll for queued messages (retain=True). Returns up to 10 recent messages.
+
+        Broker errors are logged and surface as an empty list so a caller
+        can distinguish "no messages" from "broker unreachable" only via
+        the server log. Malformed envelopes are skipped, not fatal.
+        """
         messages: list[dict] = []
         try:
             async with aiomqtt.Client(broker, port=port) as client:
                 await client.subscribe(f"agents/{agent_id}/inbox", qos=1)
-                async with asyncio.timeout(1.0):
-                    async for mqtt_msg in client.messages:
-                        try:
-                            msg = AgentMessage.from_json(mqtt_msg.payload)
-                            messages.append(json.loads(msg.to_json()))
-                        except Exception:
-                            pass
-                        if len(messages) >= 10:
-                            break
-        except (asyncio.TimeoutError, Exception):
-            pass
+                try:
+                    async with asyncio.timeout(1.0):
+                        async for mqtt_msg in client.messages:
+                            try:
+                                msg = AgentMessage.from_json(mqtt_msg.payload)
+                                messages.append(json.loads(msg.to_json()))
+                            except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+                                logger.warning("read_inbox: skipping bad envelope: %s", exc)
+                            if len(messages) >= 10:
+                                break
+                except asyncio.TimeoutError:
+                    pass
+        except aiomqtt.MqttError as exc:
+            logger.error("read_inbox: broker error (%s:%d): %s", broker, port, exc)
         return messages
 
     @app.tool(name="watch_inbox")
     async def watch_inbox(timeout: float = 30.0) -> dict | None:
-        """Long-poll — blocks until a message arrives, then returns it."""
+        """Long-poll — blocks until a message arrives, then returns it.
+
+        Returns None on timeout or broker unavailability (the latter is
+        logged at ERROR for operator visibility).
+        """
         try:
             async with aiomqtt.Client(broker, port=port) as client:
                 await client.subscribe(f"agents/{agent_id}/inbox", qos=1)
-                async with asyncio.timeout(timeout):
-                    async for mqtt_msg in client.messages:
-                        try:
-                            msg = AgentMessage.from_json(mqtt_msg.payload)
-                            return json.loads(msg.to_json())
-                        except Exception:
-                            continue
-        except asyncio.TimeoutError:
-            return None
+                try:
+                    async with asyncio.timeout(timeout):
+                        async for mqtt_msg in client.messages:
+                            try:
+                                msg = AgentMessage.from_json(mqtt_msg.payload)
+                                return json.loads(msg.to_json())
+                            except (ValidationError, json.JSONDecodeError, ValueError) as exc:
+                                logger.warning("watch_inbox: skipping bad envelope: %s", exc)
+                                continue
+                except asyncio.TimeoutError:
+                    return None
+        except aiomqtt.MqttError as exc:
+            logger.error("watch_inbox: broker error (%s:%d): %s", broker, port, exc)
         return None
 
     @app.tool(name="list_agents")
