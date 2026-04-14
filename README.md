@@ -156,6 +156,17 @@ The skill (`skills/using-agentbus/SKILL.md`) explains reply-to threading, conten
 
 Claude Code **also** needs a listener daemon running (step 3 of the quickstart) to receive messages while the chat session is closed. The MCP tools only work while Claude is open — the daemon is what catches messages in between.
 
+**Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
+
+```bash
+agentbus start \
+  --agent-id <me> \
+  --inbox ~/sync/<me>-inbox.md \
+  --invoke "$(pwd)/examples/claude-code-wake.sh <me>"
+```
+
+Defaults to "wake only on priority=high" — spawning a fresh Claude Code session bootstraps ~100k tokens, so invoking on every message rapidly burns money on broadcast/heartbeat traffic. Low-priority messages still get archived by the file bridge; they're picked up on the next operator-initiated turn. Override with `AGENTBUS_WAKE_POLICY=all` for dev/testing, `=none` to disable spawning. Wake output logs to `~/.local/state/agentbus-wake/<agent-id>.log`.
+
 ### 2. OpenClaw — skill + listener daemon
 
 OpenClaw doesn't natively register MCP servers (it routes MCP via the `mcporter` skill), so the path is different: install the behavioral skill and run the listener daemon. The skill's examples work in CLI mode — no MCP sidecar required.
