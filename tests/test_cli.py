@@ -411,6 +411,59 @@ def test_tail_missing_inbox_exits_2(tmp_path):
     assert "inbox does not exist" in result.output
 
 
+def test_tail_detects_inode_change_and_rereads(tmp_path):
+    """If the inbox file is replaced (different inode) with content ≥ old
+    cursor, tail must detect the inode change and re-read from 0 rather than
+    silently seeking mid-file into the replacement.
+    """
+    import os
+    inbox = tmp_path / "inbox.md"
+    cursors = tmp_path / "cursors"
+    inbox.write_text("original content one\noriginal content two\n")
+    runner = CliRunner()
+    # First call consumes the whole original file.
+    runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    # Replace the file at the same path — new inode, enough content to
+    # exceed the old cursor size.
+    os.remove(inbox)
+    inbox.write_text("replacement A\nreplacement B\nreplacement C\n")
+    result = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    assert "inode changed" in result.output
+    assert "replacement A" in result.output
+    # Original content should NOT reappear in the replacement read.
+    assert "original content one" not in result.output
+
+
+def test_tail_cursor_legacy_format_reads_fresh(tmp_path):
+    """A legacy cursor file with just '<offset>' (no inode) should still be
+    honoured on next call — the first read writes the inode back, and no
+    spurious re-emit happens just because the stored inode was missing."""
+    inbox = tmp_path / "inbox.md"
+    cursors = tmp_path / "cursors"
+    cursors.mkdir()
+    inbox.write_text("line one\nline two\n")
+    cursor_file = cursors / "sparrow--default.cursor"
+    # Simulate a legacy cursor: offset-only, no inode.
+    cursor_file.write_text(str(len(inbox.read_bytes())))
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    assert result.exit_code == 0, result.output
+    # No new content to emit (offset == size), and no "inode changed" noise.
+    assert "inode changed" not in result.output
+    assert "line one" not in result.output
+    # Cursor should now have the inode recorded.
+    assert len(cursor_file.read_text().split()) == 2
+
+
 def test_tail_rejects_path_traversal_consumer(tmp_path):
     inbox = tmp_path / "inbox.md"
     inbox.write_text("anything\n")
@@ -455,8 +508,10 @@ def test_tail_cursor_write_is_atomic(tmp_path):
     # The atomic write means no .tmp leftover.
     assert cursor_file.exists()
     assert not (cursors / "sparrow--default.tmp").exists()
-    # Cursor content must parse as int (not empty/garbage).
-    int(cursor_file.read_text().strip())
+    # Cursor content must parse: "<offset> <inode>" (post-inode-tracking).
+    parts = cursor_file.read_text().strip().split()
+    assert len(parts) == 2
+    int(parts[0]); int(parts[1])
 
 
 def test_tail_handles_file_truncation(tmp_path):

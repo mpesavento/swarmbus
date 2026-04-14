@@ -346,11 +346,18 @@ def tail(
         click.echo(f"[agentbus] inbox does not exist: {inbox_path}", err=True)
         sys.exit(2)
 
-    def _read_cursor() -> int:
+    def _read_cursor() -> tuple[int, int | None]:
+        """Return (offset, stored_inode). stored_inode is None on cold-start
+        or legacy cursor formats so the first call falls through to emit
+        everything from offset 0."""
         if reset or not cursor_file.exists():
-            return 0
+            return 0, None
         try:
-            return int(cursor_file.read_text().strip())
+            raw = cursor_file.read_text().strip()
+            parts = raw.split()
+            offset = int(parts[0])
+            inode = int(parts[1]) if len(parts) >= 2 else None
+            return offset, inode
         except (ValueError, OSError):
             # Corrupt/empty cursor — re-emit from start. Loud enough to notice
             # if it happens, quiet enough not to crash a follower loop.
@@ -358,14 +365,15 @@ def tail(
                 f"[agentbus] cursor {cursor_file} unreadable; restarting from offset 0",
                 err=True,
             )
-            return 0
+            return 0, None
 
-    def _write_cursor(offset: int) -> None:
+    def _write_cursor(offset: int, inode: int) -> None:
         # Atomic write so a SIGKILL between truncate and write can't leave
         # an empty cursor file (which would cause the next call to re-emit
-        # the entire inbox).
+        # the entire inbox). Format: "<offset> <inode>". Whitespace-separated
+        # for trivial backward compat with legacy "<offset>" cursor files.
         tmp = cursor_file.with_suffix(".tmp")
-        tmp.write_text(str(offset))
+        tmp.write_text(f"{offset} {inode}")
         os.replace(tmp, cursor_file)
 
     def _emit_new() -> int | None:
@@ -376,17 +384,35 @@ def tail(
         appends one whole entry per syscall in O_APPEND mode, so the file
         size we see is always at an entry boundary even if we read while
         the daemon is mid-burst.
+
+        Rotation detection: we persist the file's st_ino alongside the
+        offset. If the inode changes (logrotate, mv, rm+recreate,
+        restart+refill), we reset to offset 0 so the new file is re-read
+        from its beginning rather than silently seeking mid-file.
         """
         try:
-            size = inbox_path.stat().st_size
+            stat = inbox_path.stat()
         except FileNotFoundError:
             return None
-        start = _read_cursor()
-        if size < start:
-            # File was truncated/rotated in place — reset to start.
+        size = stat.st_size
+        current_inode = stat.st_ino
+        start, stored_inode = _read_cursor()
+        if stored_inode is not None and stored_inode != current_inode:
+            click.echo(
+                f"[agentbus] inbox inode changed "
+                f"({stored_inode} → {current_inode}); re-reading from 0",
+                err=True,
+            )
+            start = 0
+        elif size < start:
+            # Same inode but file was truncated in place (copytruncate style).
             click.echo(f"[agentbus] inbox shrank ({size} < cursor {start}); resetting", err=True)
             start = 0
         if size == start:
+            # Still update the cursor to record the current inode in case this
+            # is a cold-start against an existing cursor with no inode field.
+            if stored_inode != current_inode:
+                _write_cursor(start, current_inode)
             return start
         try:
             with inbox_path.open("rb") as f:
@@ -395,7 +421,7 @@ def tail(
         except FileNotFoundError:
             return None
         click.echo(chunk.decode("utf-8", errors="replace"), nl=False)
-        _write_cursor(size)
+        _write_cursor(size, current_inode)
         return size
 
     _emit_new()

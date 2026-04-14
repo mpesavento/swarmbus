@@ -269,7 +269,7 @@ agentbus mcp-server --agent-id sparrow
 
 `--body` and `--body-file` are mutually exclusive; exactly one is required.
 
-**Two receive models.** `start` is a persistent daemon that file-bridges incoming messages (reactive, survives session restarts). `read` / `watch` are one-shot calls an agent session can make directly. Most setups want both: the daemon for durability, the one-shot commands for responsive interaction within a session.
+**Three receive tools — pick one per agent-id.** `start` is a persistent daemon that file-bridges incoming messages (reactive, durable). `tail` reads new content from the daemon's inbox file with cursor tracking (correct companion to `start`). `read` / `watch` open a fresh one-shot MQTT subscription (correct when no daemon is running for this id — ephemeral scripts, CI jobs). **Don't combine `start` + `read`/`watch` for the same id** — they race for QoS1 messages and the loser silently drops them. See the Quickstart section above for the decision rule.
 
 ---
 
@@ -308,19 +308,44 @@ Agent IDs are `[a-z0-9_-]{1,64}`. `broadcast` and `system` are reserved and cann
 
 ## Cross-machine
 
-Change the broker host:
+The wire protocol is identical on a single host and across hosts — agents just need a broker they can reach. Two practical paths:
 
-```python
-bus = AgentBus(agent_id="sparrow", broker="clawd-rpi.tailnet.ts.net")
-```
+### Over Tailscale (recommended)
 
-or
+Tailscale gives you WireGuard-encrypted, peer-authenticated connectivity between hosts with zero public exposure. agentbus needs no TLS or auth configuration on the broker because the tailnet itself is authenticated. This is the path we use between an always-on Pi (Sparrow + Wren + broker) and occasional peers like a laptop Claude Code session.
+
+One-time broker host setup (the machine that runs mosquitto):
 
 ```bash
-agentbus start --agent-id sparrow --broker clawd-rpi.tailnet.ts.net
+# Adds /etc/mosquitto/conf.d/tailscale.conf binding a listener to the
+# host's Tailscale IP, keeps the default 127.0.0.1 listener for local
+# daemons. Use --tailscale-only if you want NO LAN exposure at all.
+bash scripts/setup-mosquitto.sh --tailscale
 ```
 
-The wire protocol is the same. Tailscale or a VPN between hosts is recommended; mosquitto supports TLS + auth for untrusted networks.
+The script prints the broker address to use from remote hosts (either the Tailscale IP `100.x.y.z` or the MagicDNS hostname `<host>.<tailnet>.ts.net`).
+
+On any other tailnet-joined host running an agent, point at that broker:
+
+```bash
+# Python
+bus = AgentBus(agent_id="laptop-cc", broker="clawd-rpi.tailea0d6e.ts.net")
+
+# CLI
+agentbus start --agent-id laptop-cc \
+  --broker clawd-rpi.tailea0d6e.ts.net \
+  --inbox ~/sync/laptop-cc-inbox.md
+
+agentbus send --agent-id laptop-cc --to sparrow \
+  --broker clawd-rpi.tailea0d6e.ts.net \
+  --subject "hi" --body "from the laptop"
+```
+
+Anonymous is safe within a tailnet — the mesh is already authenticated. Never do this on the public internet.
+
+### Other networks
+
+If you can't use Tailscale, run mosquitto with TLS + username/password auth. The agentbus CLI doesn't yet expose TLS flags; supply them via a mosquitto client config file or use the Python API with the aiomqtt TLS parameters directly. This is out of scope for the bundled setup scripts.
 
 ## License
 
