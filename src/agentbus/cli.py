@@ -34,6 +34,14 @@ def main() -> None:
 @click.option("--port", default=1883, show_default=True)
 @click.option("--content-type", default="text/plain", show_default=True)
 @click.option("--reply-to", "reply_to", default=None, help="Agent id for the peer to reply to (defaults to unset)")
+@click.option(
+    "--outbox",
+    "outbox",
+    default=None,
+    envvar="AGENTBUS_OUTBOX",
+    help="Append each sent message to this file (audit trail). "
+         "Can also be set via the AGENTBUS_OUTBOX env var.",
+)
 @click.pass_context
 def send(
     ctx: click.Context,
@@ -46,6 +54,7 @@ def send(
     port: int,
     content_type: str,
     reply_to: str | None,
+    outbox: str | None,
 ) -> None:
     """Send a message to another agent.
 
@@ -74,6 +83,7 @@ def send(
             body=body,
             content_type=content_type,
             reply_to=reply_to,
+            outbox_path=outbox,
         ))
     except aiomqtt.MqttError as exc:
         click.echo(f"[agentbus] broker unreachable ({broker}:{port}): {exc}", err=True)

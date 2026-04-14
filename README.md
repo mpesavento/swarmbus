@@ -201,6 +201,11 @@ The CLI is the universal fallback. Every operation the MCP sidecar exposes is al
 # Send (inline body)
 agentbus send --agent-id sparrow --to wren --subject hello --body "Hi Wren"
 
+# Send with audit trail (appends to outbox.md; pair with the peer's inbox.md)
+agentbus send --agent-id sparrow --to wren --subject hello --body "Hi Wren" \
+  --outbox ~/sync/sparrow-outbox.md
+# Or set AGENTBUS_OUTBOX in the environment so every send logs automatically
+
 # Send from a file
 agentbus send --agent-id sparrow --to wren --subject report --body-file report.md
 

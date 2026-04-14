@@ -162,6 +162,19 @@ Reactive delivery requires a listener process to be running for the *receiving* 
 
 Most deployments run both: the daemon for durability, one-shot calls for responsiveness within a session. If `list_agents` comes back without your peer, they likely don't have their daemon up.
 
+## Archive — always keep both sides of the conversation
+
+`FileBridgeHandler` (or `agentbus start --inbox <path>`) archives *received* messages. Archive *sent* messages with `--outbox` (CLI) or `outbox_path=` (Python API) — both write the same format, so an agent's sent and received logs are structurally identical and can be merged into one reconstruction of the conversation.
+
+```bash
+agentbus send --agent-id sparrow --to wren --subject "..." --body "..." \
+  --outbox ~/sync/sparrow-outbox.md
+# or export once:
+export AGENTBUS_OUTBOX=~/sync/sparrow-outbox.md
+```
+
+You should always set this when running on behalf of a real agent identity — an unarchived send is a dropped audit trail.
+
 **For reactive wake-up on hosts that have agent sessions outside the chat loop** (e.g. OpenClaw), pair the file bridge with a `--invoke` wrapper that triggers a fresh agent turn. See `examples/openclaw-wake.sh` for the reference pattern:
 
 ```bash

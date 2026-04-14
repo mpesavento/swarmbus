@@ -25,6 +25,35 @@ def test_send_inline_body(tmp_path):
     assert call_kwargs["reply_to"] is None
 
 
+def test_send_outbox_flag_passed_through():
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(main, [
+            "send", "--agent-id", "sparrow", "--to", "wren",
+            "--subject", "x", "--body", "y",
+            "--outbox", "/tmp/sparrow-outbox.md",
+        ])
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/sparrow-outbox.md"
+
+
+def test_send_outbox_from_env_var():
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(
+            main,
+            ["send", "--agent-id", "sparrow", "--to", "wren",
+             "--subject", "x", "--body", "y"],
+            env={"AGENTBUS_OUTBOX": "/tmp/env-outbox.md"},
+        )
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/env-outbox.md"
+
+
 def test_send_reply_to_roundtrips():
     runner = CliRunner()
     with patch("agentbus.cli.AgentBus") as MockBus:

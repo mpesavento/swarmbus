@@ -191,3 +191,56 @@ async def test_probe_bypasses_agent_id_validation():
     bus = AgentBus.probe(broker="localhost")
     assert bus.agent_id == "_probe"
     assert bus.broker == "localhost"
+
+
+# --------------------------------------------------------------------------
+# outbox logging on send
+# --------------------------------------------------------------------------
+
+
+class _NullPublishClient:
+    """aiomqtt stand-in that accepts publish() and is a no-op otherwise."""
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        pass
+
+    async def publish(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_send_appends_to_outbox(tmp_path):
+    outbox = tmp_path / "outbox.md"
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+        bus = AgentBus(agent_id="sparrow")
+        await bus.send(
+            to="wren",
+            subject="hello",
+            body="hi wren",
+            outbox_path=str(outbox),
+        )
+    text = outbox.read_text()
+    assert "To: wren" in text
+    assert "hello" in text
+    assert "hi wren" in text
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_creates_parent_dirs(tmp_path):
+    outbox = tmp_path / "nested" / "sparrow-outbox.md"
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+        bus = AgentBus(agent_id="sparrow")
+        await bus.send(to="wren", subject="x", body="y", outbox_path=str(outbox))
+    assert outbox.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_disabled_when_unset(tmp_path):
+    """No outbox_path → no file written; confirms the append is opt-in."""
+    outbox = tmp_path / "should_not_exist.md"
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+        bus = AgentBus(agent_id="sparrow")
+        await bus.send(to="wren", subject="x", body="y")
+    assert not outbox.exists()

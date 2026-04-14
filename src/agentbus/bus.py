@@ -14,6 +14,29 @@ from .handlers.base import BaseHandler
 logger = logging.getLogger(__name__)
 
 
+def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
+    """Append a sent message to the sender's outbox log.
+
+    Mirrors FileBridgeHandler's inbox format so an agent's outbound and
+    inbound logs are structurally identical (same heading shape, swapped
+    direction). Failures to write are logged but never raise — archive
+    loss should not break message delivery.
+    """
+    from pathlib import Path
+    p = Path(path).expanduser()
+    entry = (
+        f"\n## [{msg.ts.strftime('%Y-%m-%d %H:%M')}] "
+        f"To: {msg.to} | {msg.subject}\n"
+        f"{msg.body}\n"
+    )
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(entry)
+    except OSError as exc:
+        logger.warning("outbox append to %s failed: %s", p, exc)
+
+
 class AgentBus:
     def __init__(
         self,
@@ -101,6 +124,7 @@ class AgentBus:
         content_type: str = "text/plain",
         priority: str = "normal",
         reply_to: str | None = None,
+        outbox_path: str | None = None,
     ) -> None:
         """Publish a message.
 
@@ -108,6 +132,10 @@ class AgentBus:
         reused — no per-call connection churn. Otherwise a one-shot client is
         opened just for this publish (fine for CLI/single-shot use, but avoid
         for tight loops).
+
+        If `outbox_path` is set, the message is appended to that file after a
+        successful publish. Format mirrors `FileBridgeHandler` but with `To:`
+        so an agent's send-log and receive-log stay structurally identical.
         """
         msg = AgentMessage.create(
             from_=self.agent_id,
@@ -123,9 +151,14 @@ class AgentBus:
         payload = msg.to_json()
         if self._client is not None:
             await self._client.publish(topic, payload, qos=1, retain=self.retain)
-            return
-        async with aiomqtt.Client(self.broker, port=self.port) as client:
-            await client.publish(topic, payload, qos=1, retain=self.retain)
+        else:
+            async with aiomqtt.Client(self.broker, port=self.port) as client:
+                await client.publish(topic, payload, qos=1, retain=self.retain)
+
+        if outbox_path:
+            await asyncio.get_running_loop().run_in_executor(
+                None, _append_outbox_entry, outbox_path, msg
+            )
 
     async def listen(
         self,
