@@ -244,3 +244,19 @@ async def test_send_outbox_disabled_when_unset(tmp_path):
         bus = AgentBus(agent_id="sparrow")
         await bus.send(to="wren", subject="x", body="y")
     assert not outbox.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_agent_id_template_substitutes(tmp_path):
+    """`{agent_id}` in outbox_path → replaced with the bus's agent_id."""
+    template = str(tmp_path / "{agent_id}-outbox.md")
+    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+        bus_s = AgentBus(agent_id="sparrow")
+        await bus_s.send(to="wren", subject="s", body="b1", outbox_path=template)
+        bus_w = AgentBus(agent_id="wren")
+        await bus_w.send(to="sparrow", subject="w", body="b2", outbox_path=template)
+    assert (tmp_path / "sparrow-outbox.md").read_text().startswith("\n## ")
+    assert (tmp_path / "wren-outbox.md").read_text().startswith("\n## ")
+    assert "b1" in (tmp_path / "sparrow-outbox.md").read_text()
+    assert "b2" in (tmp_path / "wren-outbox.md").read_text()
+    assert "b2" not in (tmp_path / "sparrow-outbox.md").read_text()

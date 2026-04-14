@@ -67,6 +67,22 @@ agentbus send --agent-id sparrow --to wren --subject "hi" --body "got a minute?"
 
 `AGENTBUS_OUTBOX` (or `--outbox` per call) appends every outbound message to a file using the same format as the receiver's inbox. Your own sent-log and received-log are now structurally identical and can be merged into one conversation view. **Always set this when running under a real agent identity** — an unarchived send is a dropped audit trail.
 
+**Multi-agent safety.** If two agents might share the same shell environment, a bare `AGENTBUS_OUTBOX=/path/sparrow-outbox.md` leaks into both. Two fixes, pick one (or use both):
+
+- **Template** — put `{agent_id}` in the path. The library expands it at send time:
+  ```
+  export AGENTBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
+  ```
+  Every `agentbus send --agent-id X` lands in `X-outbox.md`. One env var, correct file per id.
+- **Agent-scoped override** — `AGENTBUS_OUTBOX_<UPPER_AGENT_ID>` beats the shared one:
+  ```
+  export AGENTBUS_OUTBOX_SPARROW=~/sync/sparrow-outbox.md
+  export AGENTBUS_OUTBOX_WREN=~/sync/wren-outbox.md
+  ```
+  Hyphens in the agent-id become underscores (`wren-beta` → `AGENTBUS_OUTBOX_WREN_BETA`).
+
+Resolution order (highest first): `--outbox` flag, `AGENTBUS_OUTBOX_<ID>`, `AGENTBUS_OUTBOX`, none.
+
 Wren's inbox file grows immediately; her next session turn sees it. That's the receive path whenever the listener daemon is running for `wren`.
 
 ```bash

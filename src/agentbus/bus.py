@@ -136,6 +136,10 @@ class AgentBus:
         If `outbox_path` is set, the message is appended to that file after a
         successful publish. Format mirrors `FileBridgeHandler` but with `To:`
         so an agent's send-log and receive-log stay structurally identical.
+        The path may contain `{agent_id}` as a placeholder — it expands to
+        `self.agent_id` at call time. This lets multiple agents in the same
+        process space safely share one outbox-path template:
+        `outbox_path="~/sync/{agent_id}-outbox.md"`.
         """
         msg = AgentMessage.create(
             from_=self.agent_id,
@@ -156,8 +160,9 @@ class AgentBus:
                 await client.publish(topic, payload, qos=1, retain=self.retain)
 
         if outbox_path:
+            resolved = outbox_path.replace("{agent_id}", self.agent_id)
             await asyncio.get_running_loop().run_in_executor(
-                None, _append_outbox_entry, outbox_path, msg
+                None, _append_outbox_entry, resolved, msg
             )
 
     async def listen(

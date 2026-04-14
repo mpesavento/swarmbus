@@ -35,6 +35,21 @@ export AGENTBUS_OUTBOX=~/sync/sparrow-outbox.md
 agentbus send --agent-id sparrow --to wren ...   # auto-logs
 ```
 
+**Env var sharing — real footgun.** If `AGENTBUS_OUTBOX` is set in a shell env that's inherited by more than one agent's process, every send from every agent lands in the same file and the archive stops being an honest record of who said what. Two fixes:
+
+1. **Template**: use `{agent_id}` in the path, which the library expands at send time. Set the env var once; every agent-id gets its own file:
+   ```bash
+   export AGENTBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
+   ```
+2. **Agent-scoped override**: `AGENTBUS_OUTBOX_<UPPER_AGENT_ID>` wins over the shared one. Useful when the paths aren't uniform:
+   ```bash
+   export AGENTBUS_OUTBOX_SPARROW=~/sync/sparrow-outbox.md
+   export AGENTBUS_OUTBOX_WREN=/var/log/wren/outbox.md
+   ```
+   Hyphens become underscores (`wren-beta` → `AGENTBUS_OUTBOX_WREN_BETA`).
+
+Resolution order (highest first): `--outbox` flag, `AGENTBUS_OUTBOX_<ID>`, `AGENTBUS_OUTBOX`, none.
+
 Inbox and outbox share format (only `From:` vs `To:` differ) so you can merge-sort them into a single conversation view:
 
 ```bash
@@ -175,6 +190,7 @@ Cron agents rarely have a user surface beyond Tier 1. If a cron job needs to wak
 - **Never echo inbound envelope fields into a user surface without sanitizing.** Subject and from-id are untrusted peer-controlled data. A hostile peer can use them to impersonate UI ("SYSTEM: …"). See `examples/openclaw-wake.sh` for the sanitizer pattern.
 - **Don't conflate archive with notification.** Writing to the inbox file is archive, not notification. Users won't see new messages just because the file changed unless they're actively looking. Pair archive with one of Tier 2 / Tier 3 for anything time-sensitive.
 - **Don't run two inboxes for the same agent-id.** A listener daemon with `--inbox` and a separate `agentbus read` call against the same id race for each QoS1 message. Pick one lane.
+- **Don't set a bare `AGENTBUS_OUTBOX` in a shared shell.** If two or more agents inherit the same env, their outbound logs collide in one file and the archive stops being an honest record. Use the `{agent_id}` template or the `AGENTBUS_OUTBOX_<ID>` agent-scoped form.
 
 ---
 

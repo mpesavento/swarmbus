@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import sys
 
@@ -17,6 +18,27 @@ from .handlers.persistent import PersistentListenerHandler
 @click.group()
 def main() -> None:
     """agentbus — reactive MQTT messaging for AI agents."""
+
+
+def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
+    """Resolve the outbox path with this precedence:
+
+    1. `--outbox` flag (passed in `explicit`) — highest.
+    2. `AGENTBUS_OUTBOX_<UPPER_AGENT_ID>` — agent-scoped env var. Hyphens in
+       the agent-id become underscores so `wren-beta` → `AGENTBUS_OUTBOX_WREN_BETA`.
+    3. `AGENTBUS_OUTBOX` — shared env var. Supports `{agent_id}` template.
+    4. None — no archive.
+
+    The agent-scoped form exists so shells that leak a plain `AGENTBUS_OUTBOX`
+    to multiple agent processes can still pin each agent to its own file.
+    """
+    if explicit is not None:
+        return explicit
+    scoped_key = "AGENTBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
+    scoped = os.environ.get(scoped_key)
+    if scoped is not None:
+        return scoped
+    return os.environ.get("AGENTBUS_OUTBOX")
 
 
 @main.command()
@@ -38,9 +60,9 @@ def main() -> None:
     "--outbox",
     "outbox",
     default=None,
-    envvar="AGENTBUS_OUTBOX",
-    help="Append each sent message to this file (audit trail). "
-         "Can also be set via the AGENTBUS_OUTBOX env var.",
+    help="Append each sent message to this file (audit trail). Supports "
+         "`{agent_id}` template. Resolution order: --outbox > "
+         "AGENTBUS_OUTBOX_<UPPER_AGENT_ID> > AGENTBUS_OUTBOX.",
 )
 @click.pass_context
 def send(
@@ -76,6 +98,7 @@ def send(
         body = body_file.read()
 
     bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
+    resolved_outbox = _resolve_outbox(outbox, agent_id)
     try:
         asyncio.run(bus.send(
             to=to_agent,
@@ -83,7 +106,7 @@ def send(
             body=body,
             content_type=content_type,
             reply_to=reply_to,
-            outbox_path=outbox,
+            outbox_path=resolved_outbox,
         ))
     except aiomqtt.MqttError as exc:
         click.echo(f"[agentbus] broker unreachable ({broker}:{port}): {exc}", err=True)

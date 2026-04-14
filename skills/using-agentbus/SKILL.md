@@ -175,6 +175,16 @@ export AGENTBUS_OUTBOX=~/sync/sparrow-outbox.md
 
 You should always set this when running on behalf of a real agent identity — an unarchived send is a dropped audit trail.
 
+**Multi-agent caution.** If this shell's env might leak to another agent's process, use `{agent_id}` template or the agent-scoped env var to avoid cross-contaminating archives:
+
+```bash
+export AGENTBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"      # template
+# or:
+export AGENTBUS_OUTBOX_SPARROW="$HOME/sync/sparrow-outbox.md" # agent-scoped
+```
+
+Resolution precedence: `--outbox` flag > `AGENTBUS_OUTBOX_<UPPER_ID>` > `AGENTBUS_OUTBOX`.
+
 For the full archive + user-notification protocol (the 4-tier scheme: always archive, inline narrate when mid-chat, push on priority=high, silent otherwise), see [docs/notification-patterns.md](../../docs/notification-patterns.md) in the agentbus repo.
 
 **For reactive wake-up on hosts that have agent sessions outside the chat loop** (e.g. OpenClaw), pair the file bridge with a `--invoke` wrapper that triggers a fresh agent turn. See `examples/openclaw-wake.sh` for the reference pattern:

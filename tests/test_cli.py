@@ -39,7 +39,7 @@ def test_send_outbox_flag_passed_through():
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/sparrow-outbox.md"
 
 
-def test_send_outbox_from_env_var():
+def test_send_outbox_from_shared_env_var():
     runner = CliRunner()
     with patch("agentbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
@@ -52,6 +52,77 @@ def test_send_outbox_from_env_var():
         )
     assert result.exit_code == 0, result.output
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/env-outbox.md"
+
+
+def test_send_outbox_agent_scoped_env_wins_over_shared():
+    """AGENTBUS_OUTBOX_<ID> must take precedence over AGENTBUS_OUTBOX."""
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(
+            main,
+            ["send", "--agent-id", "sparrow", "--to", "wren",
+             "--subject", "x", "--body", "y"],
+            env={
+                "AGENTBUS_OUTBOX": "/tmp/shared.md",
+                "AGENTBUS_OUTBOX_SPARROW": "/tmp/sparrow-specific.md",
+            },
+        )
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/sparrow-specific.md"
+
+
+def test_send_outbox_explicit_flag_wins_over_env():
+    """--outbox must take precedence over any env var."""
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(
+            main,
+            ["send", "--agent-id", "sparrow", "--to", "wren",
+             "--subject", "x", "--body", "y",
+             "--outbox", "/tmp/flag.md"],
+            env={
+                "AGENTBUS_OUTBOX": "/tmp/shared.md",
+                "AGENTBUS_OUTBOX_SPARROW": "/tmp/scoped.md",
+            },
+        )
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/flag.md"
+
+
+def test_send_outbox_agent_id_with_hyphens_in_env_var():
+    """wren-beta → AGENTBUS_OUTBOX_WREN_BETA (hyphen -> underscore, upper)."""
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(
+            main,
+            ["send", "--agent-id", "wren-beta", "--to", "sparrow",
+             "--subject", "x", "--body", "y"],
+            env={"AGENTBUS_OUTBOX_WREN_BETA": "/tmp/wren-beta.md"},
+        )
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/wren-beta.md"
+
+
+def test_send_outbox_template_substitution_via_env():
+    """`{agent_id}` in shared AGENTBUS_OUTBOX survives to the bus call (substitution happens in AgentBus.send)."""
+    runner = CliRunner()
+    with patch("agentbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(
+            main,
+            ["send", "--agent-id", "sparrow", "--to", "wren",
+             "--subject", "x", "--body", "y"],
+            env={"AGENTBUS_OUTBOX": "/tmp/{agent_id}-outbox.md"},
+        )
+    assert result.exit_code == 0, result.output
+    assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/{agent_id}-outbox.md"
 
 
 def test_send_reply_to_roundtrips():
