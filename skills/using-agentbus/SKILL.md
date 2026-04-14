@@ -22,8 +22,9 @@ If you're not sure, try `agentbus --help` first. If that works, use CLI mode. If
 | Intent | MCP form | CLI form |
 |---|---|---|
 | Send to a peer | `send_message(to, subject, body, content_type?)` | `agentbus send --agent-id <me> --to <peer> --subject "..." --body "..."` |
-| Drain queued messages, exit | `read_inbox()` | `agentbus read --agent-id <me>` (add `--json` for structured output) |
-| Block until a message arrives | `watch_inbox(timeout=30)` | `agentbus watch --agent-id <me> --timeout 30` |
+| Read from daemon's inbox file (use when daemon is running) | (use file directly) | `agentbus tail --agent-id <me>` (add `--follow` to stream) |
+| Drain MQTT queue, exit (no-daemon contexts) | `read_inbox()` | `agentbus read --agent-id <me>` (add `--json` for structured output) |
+| Block until a message arrives (no-daemon contexts) | `watch_inbox(timeout=30)` | `agentbus watch --agent-id <me> --timeout 30` |
 | Who's online? | `list_agents()` | `agentbus list` |
 
 Always know your own agent-id. In MCP mode it was passed to the sidecar at startup; in CLI mode you must supply `--agent-id <me>` on every call.
@@ -155,12 +156,13 @@ fi
 
 ## Receive model — know what's running
 
-Reactive delivery requires a listener process to be running for the *receiving* agent. Two shapes:
+Reactive delivery requires a listener process to be running for the *receiving* agent. Three modes, used in different combinations:
 
-1. **Persistent daemon** (`agentbus start --agent-id <me> --inbox <path>`) — long-running, file-bridges incoming messages into a markdown file the agent can read on next turn. This is what catches messages while the agent's chat session is closed.
-2. **One-shot** (`agentbus read` / `watch` or `read_inbox` / `watch_inbox`) — drains retained messages the broker held while you were offline, or blocks for a new one. Useful mid-session.
+1. **Persistent daemon** (`agentbus start --agent-id <me> --inbox <path>`) — long-running, file-bridges every incoming message into a markdown file. Default `--persistent` flag uses an MQTT persistent session so a crashed/restarted daemon doesn't lose queued QoS1 messages. This is the canonical receive path for always-on agents.
+2. **File tail** (`agentbus tail --agent-id <me>`) — reads new content from the daemon's inbox file using a per-consumer cursor. Use this when a daemon IS running and you want to consume what arrived since your last read. Zero MQTT contention; cursor stored at `~/.agentbus/cursors/<agent-id>--<consumer>.cursor`. Pair with `--follow` for streaming.
+3. **MQTT one-shot** (`agentbus read` / `watch` or the MCP `read_inbox` / `watch_inbox` tools) — opens a fresh non-persistent MQTT connection. Use ONLY when no daemon is running for this agent-id; otherwise you race the daemon and silently lose messages.
 
-Most deployments run both: the daemon for durability, one-shot calls for responsiveness within a session. If `list_agents` comes back without your peer, they likely don't have their daemon up.
+**Decision rule:** if a daemon is running for your id, use `tail`. If not, use `read`/`watch`. Never use both `read`/`watch` AND a daemon for the same id at the same time. If `list_agents` comes back without your peer, they likely don't have their daemon up.
 
 ## Archive — always keep both sides of the conversation
 

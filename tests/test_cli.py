@@ -317,6 +317,119 @@ def test_list_prints_agents():
     assert "wren" in result.output
 
 
+def test_tail_reads_full_file_on_first_call(tmp_path):
+    inbox = tmp_path / "inbox.md"
+    inbox.write_text("\n## [2026-04-14 10:00] From: wren | hi\nhello sparrow\n")
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "tail",
+        "--agent-id", "sparrow",
+        "--inbox", str(inbox),
+        "--cursor-dir", str(tmp_path / "cursors"),
+    ])
+    assert result.exit_code == 0, result.output
+    assert "hello sparrow" in result.output
+    # Second call should print nothing new.
+    result2 = runner.invoke(main, [
+        "tail",
+        "--agent-id", "sparrow",
+        "--inbox", str(inbox),
+        "--cursor-dir", str(tmp_path / "cursors"),
+    ])
+    assert result2.exit_code == 0
+    assert result2.output == ""
+
+
+def test_tail_only_shows_new_content_since_cursor(tmp_path):
+    inbox = tmp_path / "inbox.md"
+    cursors = tmp_path / "cursors"
+    inbox.write_text("\n## [10:00] From: wren | first\nearly message\n")
+    runner = CliRunner()
+    runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    # Append a new entry.
+    with inbox.open("a") as f:
+        f.write("\n## [10:01] From: wren | second\nfollowup\n")
+    result = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    assert "followup" in result.output
+    assert "early message" not in result.output
+
+
+def test_tail_reset_flag_rereads_from_start(tmp_path):
+    inbox = tmp_path / "inbox.md"
+    cursors = tmp_path / "cursors"
+    inbox.write_text("whole body\n")
+    runner = CliRunner()
+    # First call — consumes.
+    runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    # Second call with --reset — re-reads everything.
+    result = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+        "--reset",
+    ])
+    assert "whole body" in result.output
+
+
+def test_tail_separate_consumers_have_independent_cursors(tmp_path):
+    inbox = tmp_path / "inbox.md"
+    cursors = tmp_path / "cursors"
+    inbox.write_text("message A\n")
+    runner = CliRunner()
+    # Consumer "bot" reads.
+    result1 = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+        "--consumer", "bot",
+    ])
+    assert "message A" in result1.output
+    # Consumer "human" reads the same file — should still see everything.
+    result2 = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+        "--consumer", "human",
+    ])
+    assert "message A" in result2.output
+
+
+def test_tail_missing_inbox_exits_2(tmp_path):
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(tmp_path / "does-not-exist.md"),
+        "--cursor-dir", str(tmp_path / "cursors"),
+    ])
+    assert result.exit_code == 2
+    assert "inbox does not exist" in result.output
+
+
+def test_tail_handles_file_truncation(tmp_path):
+    inbox = tmp_path / "inbox.md"
+    cursors = tmp_path / "cursors"
+    inbox.write_text("long original content\n")
+    runner = CliRunner()
+    runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    # Truncate the file (rotation / manual edit / shell > redirection).
+    inbox.write_text("short\n")
+    result = runner.invoke(main, [
+        "tail", "--agent-id", "sparrow",
+        "--inbox", str(inbox), "--cursor-dir", str(cursors),
+    ])
+    assert "short" in result.output
+    assert "inbox shrank" in result.output
+
+
 def test_read_broker_unreachable_exits_2():
     runner = CliRunner()
     with patch("agentbus.cli.AgentBus") as MockBus:

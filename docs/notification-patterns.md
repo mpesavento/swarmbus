@@ -189,7 +189,7 @@ Cron agents rarely have a user surface beyond Tier 1. If a cron job needs to wak
 - **Never skip Tier 1.** An un-archived send isn't recoverable by reading the peer's archive — you lose what you said, bodies may have been rendered into prompts that now differ from the wire. Always set `AGENTBUS_OUTBOX`.
 - **Never echo inbound envelope fields into a user surface without sanitizing.** Subject and from-id are untrusted peer-controlled data. A hostile peer can use them to impersonate UI ("SYSTEM: …"). See `examples/openclaw-wake.sh` for the sanitizer pattern.
 - **Don't conflate archive with notification.** Writing to the inbox file is archive, not notification. Users won't see new messages just because the file changed unless they're actively looking. Pair archive with one of Tier 2 / Tier 3 for anything time-sensitive.
-- **Don't run two inboxes for the same agent-id.** A listener daemon with `--inbox` and a separate `agentbus read` call against the same id race for each QoS1 message. Pick one lane.
+- **Don't race the daemon for MQTT messages.** A listener daemon and a separate `agentbus read` / `agentbus watch` call against the same id race for each QoS1 message. When a daemon is running for an id, consume via `agentbus tail --agent-id <id>` (file-based, cursor-tracked, zero broker contention). Reserve `read`/`watch` for ephemeral agents that have no daemon.
 - **Don't set a bare `AGENTBUS_OUTBOX` in a shared shell.** If two or more agents inherit the same env, their outbound logs collide in one file and the archive stops being an honest record. Use the `{agent_id}` template or the `AGENTBUS_OUTBOX_<ID>` agent-scoped form.
 
 ---

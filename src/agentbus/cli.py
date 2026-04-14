@@ -120,15 +120,24 @@ def send(
 @click.option("--port", default=1883, show_default=True)
 @click.option("--inbox", default=None, help="Path for file bridge (inbox.md)")
 @click.option("--invoke", "invoke_cmd", default=None, help="Command to invoke on message")
+@click.option(
+    "--persistent/--no-persistent",
+    default=True,
+    show_default=True,
+    help="Use an MQTT persistent session so queued QoS1 messages survive "
+         "daemon restarts. Disable only if another process holds the same "
+         "`agentbus-<id>` client identifier.",
+)
 def start(
     agent_id: str,
     broker: str,
     port: int,
     inbox: str | None,
     invoke_cmd: str | None,
+    persistent: bool,
 ) -> None:
     """Start the agentbus listener daemon."""
-    bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
+    bus = AgentBus(agent_id=agent_id, broker=broker, port=port, persistent=persistent)
 
     if inbox:
         bus.register_handler(FileBridgeHandler(inbox))
@@ -253,6 +262,110 @@ def list_agents_cmd(broker: str, port: int, as_json: bool) -> None:
         return
     for a in agents:
         click.echo(a)
+
+
+@main.command()
+@click.option("--agent-id", required=True, help="This agent's ID")
+@click.option(
+    "--inbox",
+    default=None,
+    help="Path to the inbox file written by the listener daemon. "
+         "Defaults to ~/sync/<agent-id>-inbox.md.",
+)
+@click.option(
+    "--consumer",
+    default="default",
+    show_default=True,
+    help="Consumer name — identifies this reader's cursor. Different names "
+         "give independent read positions (two scripts both reading the "
+         "same inbox without colliding).",
+)
+@click.option(
+    "--cursor-dir",
+    default=None,
+    help="Directory for cursor files. Defaults to ~/.agentbus/cursors/.",
+)
+@click.option(
+    "--follow", "-f",
+    is_flag=True,
+    help="Keep polling for new content (0.5s interval). Blocks until Ctrl+C.",
+)
+@click.option(
+    "--reset",
+    is_flag=True,
+    help="Reset cursor to start of file before reading.",
+)
+def tail(
+    agent_id: str,
+    inbox: str | None,
+    consumer: str,
+    cursor_dir: str | None,
+    follow: bool,
+    reset: bool,
+) -> None:
+    """Read new entries from the daemon's inbox file, advancing a cursor.
+
+    Companion to `agentbus start --inbox`: the daemon is the sole MQTT
+    subscriber, `agentbus tail` reads the file it produces. This is how
+    you read messages when a daemon is already running — avoids the
+    race that `agentbus read` would create by subscribing to the same
+    topic as the daemon.
+
+    \b
+    agentbus tail --agent-id sparrow              # read new lines since last call
+    agentbus tail --agent-id sparrow --follow     # block; stream new content
+    agentbus tail --agent-id sparrow --consumer bot   # separate cursor
+    """
+    from pathlib import Path
+
+    inbox_path = Path(inbox).expanduser() if inbox else Path.home() / "sync" / f"{agent_id}-inbox.md"
+    cursors_root = Path(cursor_dir).expanduser() if cursor_dir else Path.home() / ".agentbus" / "cursors"
+    cursors_root.mkdir(parents=True, exist_ok=True)
+    cursor_file = cursors_root / f"{agent_id}--{consumer}.cursor"
+
+    if not inbox_path.exists():
+        click.echo(f"[agentbus] inbox does not exist: {inbox_path}", err=True)
+        sys.exit(2)
+
+    def _read_cursor() -> int:
+        if reset or not cursor_file.exists():
+            return 0
+        try:
+            return int(cursor_file.read_text().strip())
+        except (ValueError, OSError):
+            return 0
+
+    def _write_cursor(offset: int) -> None:
+        cursor_file.write_text(str(offset))
+
+    def _emit_new() -> int:
+        """Read from cursor → EOF, print, advance cursor. Returns new offset."""
+        start = _read_cursor()
+        size = inbox_path.stat().st_size
+        if size < start:
+            # File was truncated/rotated — reset to start.
+            click.echo(f"[agentbus] inbox shrank ({size} < cursor {start}); resetting", err=True)
+            start = 0
+        if size == start:
+            return start
+        with inbox_path.open("rb") as f:
+            f.seek(start)
+            chunk = f.read(size - start)
+        click.echo(chunk.decode("utf-8", errors="replace"), nl=False)
+        _write_cursor(size)
+        return size
+
+    _emit_new()
+    if not follow:
+        return
+
+    import time
+    try:
+        while True:
+            time.sleep(0.5)
+            _emit_new()
+    except KeyboardInterrupt:
+        click.echo("", err=True)  # newline after ^C
 
 
 @main.command("mcp-server")

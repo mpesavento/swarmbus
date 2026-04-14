@@ -247,6 +247,65 @@ async def test_send_outbox_disabled_when_unset(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_listen_persistent_passes_stable_identifier_and_clean_session():
+    """persistent=True → stable client-id + clean_session=False on the MQTT client."""
+    captured_kwargs = {}
+
+    class _ClientStub:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, *_args, **_kwargs):
+            pass
+        async def subscribe(self, *_args, **_kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _empty():
+                if False:
+                    yield  # make generator
+            return _empty()
+
+    with patch("agentbus.bus.aiomqtt.Client", _ClientStub):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        await bus.listen()
+    assert captured_kwargs.get("identifier") == "agentbus-sparrow"
+    assert captured_kwargs.get("clean_session") is False
+
+
+@pytest.mark.asyncio
+async def test_listen_non_persistent_omits_identifier():
+    captured_kwargs = {}
+
+    class _ClientStub:
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, *_args, **_kwargs):
+            pass
+        async def subscribe(self, *_args, **_kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _empty():
+                if False:
+                    yield
+            return _empty()
+
+    with patch("agentbus.bus.aiomqtt.Client", _ClientStub):
+        bus = AgentBus(agent_id="sparrow", persistent=False)
+        await bus.listen()
+    assert "identifier" not in captured_kwargs
+    assert "clean_session" not in captured_kwargs
+
+
+@pytest.mark.asyncio
 async def test_send_outbox_agent_id_template_substitutes(tmp_path):
     """`{agent_id}` in outbox_path → replaced with the bus's agent_id."""
     template = str(tmp_path / "{agent_id}-outbox.md")

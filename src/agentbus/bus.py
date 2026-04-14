@@ -44,6 +44,7 @@ class AgentBus:
         broker: str = "localhost",
         port: int = 1883,
         retain: bool = False,
+        persistent: bool = False,
     ) -> None:
         """Construct an AgentBus.
 
@@ -53,12 +54,21 @@ class AgentBus:
             desired semantic for directed messages. Presence publishes use
             retain=True unconditionally so late subscribers can see who is
             currently online.
+
+        persistent: whether `listen()` uses an MQTT persistent session. When
+            True, the broker queues QoS1 messages for this agent-id even when
+            the listener is disconnected, and redelivers them on reconnect —
+            a crashed or restarted daemon does not lose messages. Comes with
+            a tradeoff: only one client can be connected with this session's
+            identifier at a time; a second connection attempt kicks the first.
+            Default False for backward compatibility; daemons should set True.
         """
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
         self.broker = broker
         self.port = port
         self.retain = retain
+        self.persistent = persistent
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -80,6 +90,7 @@ class AgentBus:
         self.broker = broker
         self.port = port
         self.retain = False
+        self.persistent = False
         self._handlers = []
         self._client = None
         self._client_cm = None
@@ -187,11 +198,18 @@ class AgentBus:
             qos=1,
             retain=True,
         )
+        # Persistent session: stable client identifier + clean_session=False
+        # so the broker queues QoS1 messages for this agent when the listener
+        # is offline, and redelivers them on reconnect.
+        client_kwargs: dict[str, Any] = {"will": will}
+        if self.persistent:
+            client_kwargs["identifier"] = f"agentbus-{self.agent_id}"
+            client_kwargs["clean_session"] = False
         backoff = reconnect_initial
         while True:
             try:
                 async with aiomqtt.Client(
-                    self.broker, port=self.port, will=will
+                    self.broker, port=self.port, **client_kwargs
                 ) as client:
                     await client.publish(
                         f"agents/{self.agent_id}/presence",

@@ -89,18 +89,27 @@ Wren's inbox file grows immediately; her next session turn sees it. That's the r
 agentbus list                              # who's online right now?
 ```
 
-**One-shot `read` / `watch` are for agent-ids that do NOT have a daemon running.** Non-persistent MQTT sessions (the fresh client each CLI call opens) and a running daemon are mutually exclusive for the same agent-id — whichever is subscribed when a QoS1 message arrives consumes it; the other never sees it. So pick a lane:
+**Two read paths, pick by deployment shape:**
 
-- **Always-on agent (Sparrow, Wren, any long-lived session)**: run the daemon. Receive via the inbox file.
-- **Ephemeral or scripted agent (one-off jobs, CI, shell pipelines)**: skip the daemon. Use `agentbus read` / `agentbus watch` directly.
+- **Always-on agent with a daemon (Sparrow, Wren, any long-lived session)**: use `agentbus tail` to read new content from the inbox file. No MQTT contention with the daemon — the daemon is the sole broker subscriber, tail just reads the file it writes. Cursor-tracked so repeat calls only show new.
+- **Ephemeral or scripted agent without a daemon**: use `agentbus read` / `agentbus watch`. These open a fresh MQTT connection, catch retained messages or messages published during the connection window, and exit.
 
 ```bash
-# Only when NO daemon is running for this id:
-agentbus read --agent-id scratch           # drain retained messages, exit
+# With a daemon running (Sparrow/Wren pattern):
+agentbus tail --agent-id sparrow              # new entries since last call
+agentbus tail --agent-id sparrow --follow     # stream new content (blocks)
+agentbus tail --agent-id sparrow --consumer bot  # separate cursor
+
+# No daemon — ephemeral (CI job, shell pipeline):
+agentbus read --agent-id scratch              # drain retained messages, exit
 agentbus watch --agent-id scratch --timeout 60  # block until one arrives
 ```
 
-That's the whole loop: broker → pick daemon *or* one-shot per agent-id → `send` from anywhere → peer receives.
+**What to never do:** run `agentbus read` or `agentbus watch` against an agent-id that already has a daemon running. They'd race the daemon for QoS1 messages — whichever client is currently subscribed wins and the other silently never sees them. Use `agentbus tail` (file-based) instead.
+
+**Daemon durability.** By default `agentbus start` uses an MQTT persistent session (`--persistent`, on by default), so a crashed or restarted daemon doesn't lose queued messages — the broker redelivers them on reconnect. Disable with `--no-persistent` only if another process is already holding the `agentbus-<agent-id>` client identifier.
+
+That's the whole loop: broker → daemon OR one-shot per agent-id → `send` from anywhere → peer receives via tail (if daemon) or read (if not).
 
 ---
 
@@ -235,12 +244,17 @@ agentbus send --agent-id sparrow --to wren --subject report --body-file report.m
 # Send from stdin (pipe-friendly)
 cat report.md | agentbus send --agent-id sparrow --to wren --subject report --body-file -
 
-# Drain queued messages and exit (non-blocking)
+# Drain queued messages and exit (non-blocking; use ONLY when no daemon is running for this id)
 agentbus read --agent-id sparrow
 agentbus read --agent-id sparrow --json | jq '.[].subject'
 
-# Block until a message arrives
+# Block until a message arrives (no-daemon contexts)
 agentbus watch --agent-id sparrow --timeout 60
+
+# Read from the daemon's inbox file with cursor tracking (use this when a daemon IS running)
+agentbus tail --agent-id sparrow            # new entries since last call
+agentbus tail --agent-id sparrow --follow   # stream — blocks until ^C
+agentbus tail --agent-id sparrow --consumer bot  # independent cursor
 
 # Who's online?
 agentbus list
