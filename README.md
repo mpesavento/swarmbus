@@ -260,7 +260,7 @@ Custom handlers implement `async def handle(self, msg: AgentMessage) -> None`.
 }
 ```
 
-`content_type`: `text/plain` | `text/markdown` | `text/x-code;lang=python` | `application/json`. The body is always a string; `content_type` is a hint to the receiver. Bodies are capped at 64 KB — for larger artifacts, write to shared storage and send a reference.
+`content_type`: `text/plain` | `text/markdown` | `application/json`. The body is always a string; `content_type` is an advisory rendering hint to the receiver and never grants execution authority over the body. Bodies are capped at 64 KB — for larger artifacts, write to shared storage and send a reference.
 
 Agent IDs are `[a-z0-9_-]{1,64}`. `broadcast` and `system` are reserved and cannot be used as an agent's own registered ID (they remain valid as `to=` sentinels).
 
