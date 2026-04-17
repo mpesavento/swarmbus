@@ -21,28 +21,28 @@ set -euo pipefail
 
 MODE="${1:-default}"
 
-echo "[agentbus] Installing mosquitto..."
+echo "[swarmbus] Installing mosquitto..."
 sudo apt-get update -qq
 sudo apt-get install -y mosquitto mosquitto-clients
 
 _require_tailscale() {
   if ! command -v tailscale >/dev/null 2>&1; then
-    echo "[agentbus] ERROR: tailscale CLI not found. Install tailscale first:"
+    echo "[swarmbus] ERROR: tailscale CLI not found. Install tailscale first:"
     echo "           https://tailscale.com/download/linux"
     exit 1
   fi
   TS_IP=$(tailscale ip -4 2>/dev/null | head -1)
   if [ -z "${TS_IP}" ]; then
-    echo "[agentbus] ERROR: could not read Tailscale IPv4 address."
+    echo "[swarmbus] ERROR: could not read Tailscale IPv4 address."
     echo "           Run 'tailscale up' and try again."
     exit 1
   fi
-  echo "[agentbus] Tailscale IPv4: $TS_IP"
+  echo "[swarmbus] Tailscale IPv4: $TS_IP"
 }
 
 case "$MODE" in
   default)
-    echo "[agentbus] Using default config (localhost-only)."
+    echo "[swarmbus] Using default config (localhost-only)."
     ;;
   --tailscale|--tailscale-only)
     _require_tailscale
@@ -61,17 +61,17 @@ allow_anonymous true
 listener 1883 ${TS_IP}
 allow_anonymous true"
     fi
-    echo "[agentbus] Writing $CONF_PATH (requires sudo)..."
+    echo "[swarmbus] Writing $CONF_PATH (requires sudo)..."
     echo "$MAIN_CFG" | sudo tee "$CONF_PATH" >/dev/null
     ;;
   *)
-    echo "[agentbus] Unknown mode: $MODE"
+    echo "[swarmbus] Unknown mode: $MODE"
     echo "           Usage: $0 [--tailscale | --tailscale-only]"
     exit 1
     ;;
 esac
 
-echo "[agentbus] Enabling mosquitto systemd service..."
+echo "[swarmbus] Enabling mosquitto systemd service..."
 sudo systemctl enable mosquitto
 sudo systemctl restart mosquitto
 sudo systemctl status mosquitto --no-pager
@@ -80,18 +80,18 @@ echo
 case "$MODE" in
   --tailscale)
     TS_HOSTNAME=$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("Self",{}).get("DNSName","").rstrip("."))' 2>/dev/null || true)
-    echo "[agentbus] mosquitto listening on 127.0.0.1:1883 AND ${TS_IP}:1883"
-    echo "[agentbus] Remote agents point at:"
+    echo "[swarmbus] mosquitto listening on 127.0.0.1:1883 AND ${TS_IP}:1883"
+    echo "[swarmbus] Remote agents point at:"
     echo "             --broker ${TS_IP}             # or:"
     [ -n "$TS_HOSTNAME" ] && echo "             --broker ${TS_HOSTNAME}   # MagicDNS"
     ;;
   --tailscale-only)
-    echo "[agentbus] mosquitto listening on ${TS_IP}:1883 ONLY. Local 127.0.0.1 access is off."
-    echo "[agentbus] Local daemons on this host must point at --broker ${TS_IP}."
+    echo "[swarmbus] mosquitto listening on ${TS_IP}:1883 ONLY. Local 127.0.0.1 access is off."
+    echo "[swarmbus] Local daemons on this host must point at --broker ${TS_IP}."
     ;;
   *)
-    echo "[agentbus] mosquitto broker running on 127.0.0.1:1883 (localhost only)"
-    echo "[agentbus] For cross-machine access, re-run with --tailscale."
+    echo "[swarmbus] mosquitto broker running on 127.0.0.1:1883 (localhost only)"
+    echo "[swarmbus] For cross-machine access, re-run with --tailscale."
     ;;
 esac
-echo "[agentbus] Test local: mosquitto_pub -t test -m hello & mosquitto_sub -t test"
+echo "[swarmbus] Test local: mosquitto_pub -t test -m hello & mosquitto_sub -t test"

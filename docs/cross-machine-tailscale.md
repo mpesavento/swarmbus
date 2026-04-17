@@ -1,6 +1,6 @@
-# Cross-machine agentbus over Tailscale
+# Cross-machine swarmbus over Tailscale
 
-agentbus was designed to work single-host *or* across hosts unchanged — the wire protocol is identical. This doc walks through the cross-host case end to end: the topology, the broker host setup, the peer-agent setup, the security model, and the failure modes you should know about before you rely on it.
+swarmbus was designed to work single-host *or* across hosts unchanged — the wire protocol is identical. This doc walks through the cross-host case end to end: the topology, the broker host setup, the peer-agent setup, the security model, and the failure modes you should know about before you rely on it.
 
 If you only have one machine, skip this doc — the main quickstart covers you.
 
@@ -55,7 +55,7 @@ Outside a tailnet (public internet, VPS accessible from anywhere): don't do this
                           WireGuard mesh (Tailscale)
 ```
 
-One broker, many peers. Peers on the broker host reach it via `localhost`; peers elsewhere reach it via the broker's Tailscale IP or MagicDNS hostname. The agentbus wire protocol doesn't change — neither does any message envelope. This is purely a reachability change.
+One broker, many peers. Peers on the broker host reach it via `localhost`; peers elsewhere reach it via the broker's Tailscale IP or MagicDNS hostname. The swarmbus wire protocol doesn't change — neither does any message envelope. This is purely a reachability change.
 
 ---
 
@@ -63,7 +63,7 @@ One broker, many peers. Peers on the broker host reach it via `localhost`; peers
 
 1. **Tailscale installed and running on all hosts** — broker host, and every host that will run an agent. Verify with `tailscale status`; all relevant nodes should be listed, not "offline".
 2. **MagicDNS enabled** on the tailnet (optional but recommended — lets you use `host.<tailnet>.ts.net` hostnames instead of hard-coding IPs).
-3. **agentbus installed on all hosts** (`pip install agentbus`). The CLI is what we'll use for the tests below.
+3. **swarmbus installed on all hosts** (`pip install swarmbus`). The CLI is what we'll use for the tests below.
 4. **mosquitto installed on the broker host only**. The other hosts don't need it.
 5. **Firewall**: on Linux, make sure `ufw` / `iptables` isn't blocking 1883 on the Tailscale interface. Default Debian has no rules, so typically nothing to do. On macOS, the system firewall generally allows established tailnet connections automatically.
 
@@ -75,7 +75,7 @@ One command:
 
 ```bash
 # On the machine that will run mosquitto:
-cd ~/path/to/agentbus
+cd ~/path/to/swarmbus
 bash scripts/setup-mosquitto.sh --tailscale
 ```
 
@@ -121,7 +121,7 @@ If the subscriber never sees "hello from peer", the broker isn't reachable. Most
 
 ## Peer agent setup
 
-Every agentbus invocation on a non-broker host takes `--broker <address>`. That's the only thing that changes compared to the single-host quickstart.
+Every swarmbus invocation on a non-broker host takes `--broker <address>`. That's the only thing that changes compared to the single-host quickstart.
 
 Pick an addressing form:
 
@@ -133,8 +133,8 @@ Pick an addressing form:
 
 ```bash
 # On the peer:
-export AGENTBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
-agentbus list --broker broker-host.your-tailnet.ts.net
+export SWARMBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
+swarmbus list --broker broker-host.your-tailnet.ts.net
 # Expect to see whichever agents have listener daemons up on the broker host.
 ```
 
@@ -143,7 +143,7 @@ If `list` comes back empty but you know Planner + Coder are running daemons, the
 ### Run a full listener peer on the laptop
 
 ```bash
-agentbus start \
+swarmbus start \
   --agent-id laptop-cc \
   --broker broker-host.your-tailnet.ts.net \
   --inbox ~/sync/laptop-cc-inbox.md
@@ -154,7 +154,7 @@ Now `laptop-cc` is a first-class peer — Planner and Coder can `send_message(to
 From the laptop, back the other way:
 
 ```bash
-agentbus send \
+swarmbus send \
   --agent-id laptop-cc \
   --broker broker-host.your-tailnet.ts.net \
   --to planner --subject "hi" --body "from the laptop"
@@ -166,21 +166,21 @@ Most tailnet-connected agents talk to exactly one broker. Set it once:
 
 ```bash
 # in the peer host's shell profile
-export AGENTBUS_BROKER=broker-host.your-tailnet.ts.net   # future: honoured by CLI auto-default
-# current: wrap agentbus in a small alias
-alias agentbus='agentbus --broker broker-host.your-tailnet.ts.net' # won't work; broker is per-subcommand
+export SWARMBUS_BROKER=broker-host.your-tailnet.ts.net   # future: honoured by CLI auto-default
+# current: wrap swarmbus in a small alias
+alias swarmbus='swarmbus --broker broker-host.your-tailnet.ts.net' # won't work; broker is per-subcommand
 ```
 
 Today the cleanest route is a tiny wrapper script in `~/bin/ab`:
 
 ```bash
 #!/usr/bin/env bash
-# Redirect agentbus through the tailnet broker.
-exec agentbus "${@/#send/send --broker broker-host.your-tailnet.ts.net}"
+# Redirect swarmbus through the tailnet broker.
+exec swarmbus "${@/#send/send --broker broker-host.your-tailnet.ts.net}"
 # (simpler: just always type --broker explicitly)
 ```
 
-If `AGENTBUS_BROKER` as a universal env default would be useful to you, it's a small CLI patch — tell the maintainer.
+If `SWARMBUS_BROKER` as a universal env default would be useful to you, it's a small CLI patch — tell the maintainer.
 
 ---
 
@@ -192,7 +192,7 @@ If `AGENTBUS_BROKER` as a universal env default would be useful to you, it's a s
 | **Transport encryption** | WireGuard end-to-end between peers. | Nothing on top — mosquitto doesn't need TLS here. |
 | **Application auth** | None, and that's fine inside the tailnet. | Do not reuse this broker for clients outside the tailnet. |
 | **Message integrity** | Standard MQTT QoS1 delivery guarantees. | Handlers must be idempotent (QoS1 can redeliver). |
-| **Agent-level auth** | agentbus has none — the `agent_id` is self-asserted. | If two peers on the tailnet should NOT be able to impersonate each other, this isn't the right layer. Use mosquitto ACLs per-client-id or switch to MQTT auth. |
+| **Agent-level auth** | swarmbus has none — the `agent_id` is self-asserted. | If two peers on the tailnet should NOT be able to impersonate each other, this isn't the right layer. Use mosquitto ACLs per-client-id or switch to MQTT auth. |
 
 Bottom line: Tailscale authenticates that your peer is who you added to the tailnet. It does *not* authenticate that the agent running on that peer is the agent it claims to be — any tailnet-joined peer can send as any `agent_id`. That's usually fine between your own agents on your own hosts. It's not fine in a multi-tenant deployment.
 
@@ -208,15 +208,15 @@ Bottom line: Tailscale authenticates that your peer is who you added to the tail
 
 ### Broker host goes offline
 
-All non-broker peers lose connectivity. Their daemons enter exponential-backoff reconnect (1s, 2s, 4s, ... capped at 60s). As soon as the broker comes back up, every peer reconnects; if `--persistent` is on (default for `agentbus start`), the broker redelivers QoS1 messages that were queued while a peer was disconnected. Messages sent *to* the broker while *it* was down are simply lost — the sender gets an MqttError on `send`, not silent swallow.
+All non-broker peers lose connectivity. Their daemons enter exponential-backoff reconnect (1s, 2s, 4s, ... capped at 60s). As soon as the broker comes back up, every peer reconnects; if `--persistent` is on (default for `swarmbus start`), the broker redelivers QoS1 messages that were queued while a peer was disconnected. Messages sent *to* the broker while *it* was down are simply lost — the sender gets an MqttError on `send`, not silent swallow.
 
 ### Peer host goes offline mid-conversation
 
-If the peer is running `agentbus start --persistent`, the broker queues QoS1 messages for that peer's agent-id. When the peer reconnects, they redeliver. Bodies are capped at 64KB, so there's no unbounded memory risk; mosquitto will discard old queued messages per its persistence config if a peer is offline for very long.
+If the peer is running `swarmbus start --persistent`, the broker queues QoS1 messages for that peer's agent-id. When the peer reconnects, they redeliver. Bodies are capped at 64KB, so there's no unbounded memory risk; mosquitto will discard old queued messages per its persistence config if a peer is offline for very long.
 
 ### Laptop goes to sleep
 
-Tailscale tears down the WireGuard tunnel when the host sleeps. agentbus daemon on the laptop disconnects from the broker. On wake, Tailscale reconnects (a few seconds) and the agentbus reconnect-backoff fires. No action needed.
+Tailscale tears down the WireGuard tunnel when the host sleeps. swarmbus daemon on the laptop disconnects from the broker. On wake, Tailscale reconnects (a few seconds) and the swarmbus reconnect-backoff fires. No action needed.
 
 ### MagicDNS resolves the wrong host
 
@@ -232,12 +232,12 @@ If you legitimately want "reach me at whichever machine I happen to be on," use 
 
 ## Extending beyond Tailscale
 
-If you outgrow the tailnet model — e.g. opening agentbus to a collaborator's tailnet, or to a host that can't install Tailscale — switch to mosquitto with TLS + username/password. `scripts/setup-mosquitto.sh` doesn't cover that today. The mosquitto docs are the canonical source: https://mosquitto.org/documentation/authentication-methods/.
+If you outgrow the tailnet model — e.g. opening swarmbus to a collaborator's tailnet, or to a host that can't install Tailscale — switch to mosquitto with TLS + username/password. `scripts/setup-mosquitto.sh` doesn't cover that today. The mosquitto docs are the canonical source: https://mosquitto.org/documentation/authentication-methods/.
 
-The agentbus CLI doesn't expose TLS flags yet. Two options in the meantime:
+The swarmbus CLI doesn't expose TLS flags yet. Two options in the meantime:
 
 - Use the Python API, which hands through to aiomqtt and supports TLS natively.
-- Run `agentbus` behind a local mosquitto client config (`default.conf`) that does the TLS wrap, and point agentbus at a localhost bridge.
+- Run `swarmbus` behind a local mosquitto client config (`default.conf`) that does the TLS wrap, and point swarmbus at a localhost bridge.
 
 Neither is quite as clean as the Tailscale path. If you need proper TLS + auth on the CLI, open an issue.
 
@@ -245,12 +245,12 @@ Neither is quite as clean as the Tailscale path. If you need proper TLS + auth o
 
 ## Quick checklist
 
-Before considering cross-machine agentbus "set up":
+Before considering cross-machine swarmbus "set up":
 
 - [ ] `tailscale status` on all hosts shows each other as online.
 - [ ] Broker host has a `--tailscale` listener (`ss -tlnp | grep :1883` shows both `127.0.0.1` and the tailnet IP).
 - [ ] `mosquitto_pub`/`mosquitto_sub` work between two tailnet hosts using the broker's tailnet hostname.
-- [ ] `agentbus list --broker <tailnet-host>` from a peer returns the expected agent-ids.
-- [ ] `agentbus send` from a peer and verify it arrives in the recipient's inbox file.
-- [ ] All peers have `AGENTBUS_OUTBOX` set (scoped or `{agent_id}` template) so outbound messages archive cleanly.
+- [ ] `swarmbus list --broker <tailnet-host>` from a peer returns the expected agent-ids.
+- [ ] `swarmbus send` from a peer and verify it arrives in the recipient's inbox file.
+- [ ] All peers have `SWARMBUS_OUTBOX` set (scoped or `{agent_id}` template) so outbound messages archive cleanly.
 - [ ] Every real agent identity runs under exactly one host — one daemon per agent-id across the whole tailnet.

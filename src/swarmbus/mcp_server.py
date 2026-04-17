@@ -1,10 +1,10 @@
-"""MCP sidecar — exposes agentbus as MCP tools for CC/LLM integration.
+"""MCP sidecar — exposes swarmbus as MCP tools for CC/LLM integration.
 
-Usage: agentbus mcp-server --agent-id planner --broker localhost
+Usage: swarmbus mcp-server --agent-id planner --broker localhost
 Register in .claude/settings.json:
   "mcpServers": {
-    "agentbus": {
-      "command": "agentbus",
+    "swarmbus": {
+      "command": "swarmbus",
       "args": ["mcp-server", "--agent-id", "planner", "--broker", "localhost"]
     }
   }
@@ -93,15 +93,15 @@ def create_mcp_app(agent_id: str, broker: str = "localhost", port: int = 1883) -
 
 
 def run_mcp_server(agent_id: str, broker: str = "localhost", port: int = 1883) -> None:
-    """Start the MCP sidecar. Called by CLI `agentbus mcp-server`."""
+    """Start the MCP sidecar. Called by CLI `swarmbus mcp-server`."""
     if not _MCP_AVAILABLE:
         raise RuntimeError(
-            "mcp package not installed. Run: uv pip install 'agentbus[mcp]'"
+            "mcp package not installed. Run: uv pip install 'swarmbus[mcp]''"
         )
 
     from mcp.server.fastmcp import FastMCP
 
-    mcp = FastMCP("agentbus")
+    mcp = FastMCP("swarmbus")
     app = create_mcp_app(agent_id=agent_id, broker=broker, port=port)
 
     # Register tool functions with the real FastMCP instance

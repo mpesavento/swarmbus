@@ -20,13 +20,13 @@ from pathlib import Path
 import aiomqtt
 import pytest
 
-from agentbus.archive import SQLiteArchive
-from agentbus.bus import AgentBus
-from agentbus.handlers.base import BaseHandler
-from agentbus.handlers.direct_invoke import DirectInvocationHandler
-from agentbus.handlers.file_bridge import FileBridgeHandler
-from agentbus.mcp_server import create_mcp_app
-from agentbus.message import AgentMessage
+from swarmbus.archive import SQLiteArchive
+from swarmbus.bus import AgentBus
+from swarmbus.handlers.base import BaseHandler
+from swarmbus.handlers.direct_invoke import DirectInvocationHandler
+from swarmbus.handlers.file_bridge import FileBridgeHandler
+from swarmbus.mcp_server import create_mcp_app
+from swarmbus.message import AgentMessage
 
 
 class CollectingHandler(BaseHandler):
@@ -378,7 +378,7 @@ async def test_direct_invocation_handler_fires_subprocess(mosquitto_broker, tmp_
     script = tmp_path / "capture.sh"
     script.write_text(
         "#!/bin/bash\n"
-        f'echo "FROM=$AGENTBUS_FROM SUBJECT=$AGENTBUS_SUBJECT" >> "{out_file}"\n'
+        f'echo "FROM=$SWARMBUS_FROM SUBJECT=$SWARMBUS_SUBJECT" >> "{out_file}"\n'
         f'cat >> "{out_file}"\n'
         f'echo >> "{out_file}"\n'
     )

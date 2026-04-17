@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
-from agentbus.handlers.direct_invoke import DirectInvocationHandler
-from agentbus.message import AgentMessage
+from swarmbus.handlers.direct_invoke import DirectInvocationHandler
+from swarmbus.message import AgentMessage
 
 
 @pytest.fixture
@@ -23,7 +23,7 @@ async def test_calls_command_with_body_as_stdin(msg):
         return MagicMock(returncode=0)
 
     handler = DirectInvocationHandler(command=["echo"])
-    with patch("agentbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
         await handler.handle(msg)
 
     assert captured["cmd"] == ["echo"]
@@ -39,14 +39,14 @@ async def test_env_vars_set(msg):
         return MagicMock(returncode=0)
 
     handler = DirectInvocationHandler(command=["true"])
-    with patch("agentbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
         await handler.handle(msg)
 
-    assert captured["env"]["AGENTBUS_FROM"] == "wren"
-    assert captured["env"]["AGENTBUS_TO"] == "sparrow"
-    assert captured["env"]["AGENTBUS_SUBJECT"] == "task"
-    assert captured["env"]["AGENTBUS_CONTENT_TYPE"] == "text/plain"
-    assert captured["env"]["AGENTBUS_PRIORITY"] == "normal"
+    assert captured["env"]["SWARMBUS_FROM"] == "wren"
+    assert captured["env"]["SWARMBUS_TO"] == "sparrow"
+    assert captured["env"]["SWARMBUS_SUBJECT"] == "task"
+    assert captured["env"]["SWARMBUS_CONTENT_TYPE"] == "text/plain"
+    assert captured["env"]["SWARMBUS_PRIORITY"] == "normal"
 
 
 @pytest.mark.asyncio
@@ -59,7 +59,7 @@ async def test_no_shell_equals_true(msg):
         return MagicMock(returncode=0)
 
     handler = DirectInvocationHandler(command=["echo"])
-    with patch("agentbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
         await handler.handle(msg)
 
     assert called_with["shell"] is False
@@ -72,7 +72,7 @@ async def test_nonzero_exit_does_not_raise(msg):
         return MagicMock(returncode=1)
 
     handler = DirectInvocationHandler(command=["false"])
-    with patch("agentbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
         await handler.handle(msg)  # must not raise
 
 
@@ -92,7 +92,7 @@ async def test_markdown_body_passed_verbatim(msg):
         return MagicMock(returncode=0)
 
     handler = DirectInvocationHandler(command=["cat"])
-    with patch("agentbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
         await handler.handle(md_msg)
 
     assert b"```python" in captured["input"]

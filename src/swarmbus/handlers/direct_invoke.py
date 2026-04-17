@@ -20,16 +20,16 @@ class DirectInvocationHandler(BaseHandler):
     async def handle(self, msg: AgentMessage) -> None:
         env = {
             **os.environ,
-            "AGENTBUS_FROM": msg.from_agent,
-            "AGENTBUS_TO": msg.to,
-            "AGENTBUS_ID": msg.id,
-            "AGENTBUS_SUBJECT": msg.subject,
-            "AGENTBUS_CONTENT_TYPE": msg.content_type,
-            "AGENTBUS_PRIORITY": msg.priority,
-            "AGENTBUS_TS": msg.ts.isoformat(),
+            "SWARMBUS_FROM": msg.from_agent,
+            "SWARMBUS_TO": msg.to,
+            "SWARMBUS_ID": msg.id,
+            "SWARMBUS_SUBJECT": msg.subject,
+            "SWARMBUS_CONTENT_TYPE": msg.content_type,
+            "SWARMBUS_PRIORITY": msg.priority,
+            "SWARMBUS_TS": msg.ts.isoformat(),
         }
         if msg.reply_to:
-            env["AGENTBUS_REPLY_TO"] = msg.reply_to
+            env["SWARMBUS_REPLY_TO"] = msg.reply_to
 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(

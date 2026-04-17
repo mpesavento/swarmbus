@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to agentbus. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/) once 1.0 lands.
+All notable changes to swarmbus. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/) once 1.0 lands.
 
 ## Wire-compat discipline
 
@@ -21,17 +21,17 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker reachable over loopback for now, Tailscale cross-host documented but not yet exercised in anger.
 
 ### Added
-- `agentbus read` / `watch` / `list` / `tail` CLI subcommands (CLI now at full parity with the MCP tool surface, plus a file-tailer that works without racing a running daemon). Cursor-aware `tail` with inode-change detection for rotation safety.
-- `--priority {low,normal,high}` flag on `agentbus send`. The envelope field always existed; the CLI never exposed it before.
-- `--reply-to` flag on `agentbus send` for threading.
-- `--outbox <path>` on send + `AGENTBUS_OUTBOX` / `AGENTBUS_OUTBOX_<ID>` env vars (with `{agent_id}` templating + agent-scoped overrides) so outbound messages archive symmetrically with the inbox.
-- `--persistent / --no-persistent` on `agentbus start` — default on. Uses MQTT persistent sessions (stable client-id + `clean_session=False`) so queued QoS1 messages survive daemon restarts.
+- `swarmbus read` / `watch` / `list` / `tail` CLI subcommands (CLI now at full parity with the MCP tool surface, plus a file-tailer that works without racing a running daemon). Cursor-aware `tail` with inode-change detection for rotation safety.
+- `--priority {low,normal,high}` flag on `swarmbus send`. The envelope field always existed; the CLI never exposed it before.
+- `--reply-to` flag on `swarmbus send` for threading.
+- `--outbox <path>` on send + `SWARMBUS_OUTBOX` / `SWARMBUS_OUTBOX_<ID>` env vars (with `{agent_id}` templating + agent-scoped overrides) so outbound messages archive symmetrically with the inbox.
+- `--persistent / --no-persistent` on `swarmbus start` — default on. Uses MQTT persistent sessions (stable client-id + `clean_session=False`) so queued QoS1 messages survive daemon restarts.
 - `AgentBus.probe()` classmethod for broker-only operations that don't need a registered identity (replaces an earlier magical `agent_id="_probe"` pattern).
-- `examples/claude-code-wake.sh` — reactive wake wrapper for Claude Code peers. Priority-gated (default `high`-only), envelope sanitization, logs to `~/.local/state/agentbus-wake/`.
+- `examples/claude-code-wake.sh` — reactive wake wrapper for Claude Code peers. Priority-gated (default `high`-only), envelope sanitization, logs to `~/.local/state/swarmbus-wake/`.
 - `examples/openclaw-wake.sh` — same for OpenClaw peers. Includes envelope sanitizer (strips control chars, caps length, labels `[UNTRUSTED PEER METADATA]`) so hostile subjects can't smuggle prompt injection.
 - `scripts/inbox-watch.sh` — cron-driven Telegram summariser for new inbox entries (cursor-tracked, inode-aware, zero-dep beyond `curl`).
 - `scripts/setup-mosquitto.sh` gained `--tailscale` and `--tailscale-only` modes — writes `/etc/mosquitto/conf.d/tailscale.conf` binding a listener to the host's Tailscale IP.
-- `scripts/setup-openclaw-plugin.sh` — install the `using-agentbus` skill into `~/.openclaw/skills/` and print byobu/systemd-user startup hints.
+- `scripts/setup-openclaw-plugin.sh` — install the `using-swarmbus` skill into `~/.openclaw/skills/` and print byobu/systemd-user startup hints.
 - `docs/cross-machine-tailscale.md` — full walkthrough for Tailscale-based multi-host deployments (topology, verification, security model, failure modes, 7-item preflight).
 - `docs/notification-patterns.md` — 4-tier notification protocol (archive always, narrate when mid-chat, push on priority=high, silent otherwise) with per-agent-system recipes.
 - `docs/post-ship-backlog.md` — living ledger of gaps / drift / follow-ups found after initial deployment.
@@ -43,12 +43,12 @@ First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker rea
 
 ### Fixed
 - Silent message discard under rolling upgrade. A daemon running the old `Literal["normal", "urgent"]` priority enum would reject (as `from_json` ValidationError → log warning → drop) any QoS1 message whose sender emitted a newer priority value. This is the reason 2026-04-14's `priority=high` round-trip tests between Sparrow and Wren appeared "delivered" on the sender side but "never received" on the receiver side. Root cause: the envelope's tight `Literal` made any vocabulary change a fleet-stop-the-world restart event. Mitigation shipped in this cycle (permissive `str`) + wire-compat discipline added to this CHANGELOG.
-- `agentbus send` now catches `MqttError` and exits 2 with a clean stderr message instead of dumping a 40-line traceback.
+- `swarmbus send` now catches `MqttError` and exits 2 with a clean stderr message instead of dumping a 40-line traceback.
 - `--invoke` now parses its argument via `shlex.split`, so `--invoke "bash -c 'echo $X'"` survives quoting.
-- `agentbus read`/`watch`/`list` propagate `MqttError` (translated to exit 2 at the CLI) instead of returning empty/None — the old behaviour was indistinguishable from "broker up, nothing to return".
-- `agentbus tail` cursor atomicity: write-to-temp + `os.replace` so SIGKILL can't leave an empty cursor. Plus inode-change detection so file rotation (logrotate, mv-in-replacement) triggers a re-read instead of silent mid-file seeks.
+- `swarmbus read`/`watch`/`list` propagate `MqttError` (translated to exit 2 at the CLI) instead of returning empty/None — the old behaviour was indistinguishable from "broker up, nothing to return".
+- `swarmbus tail` cursor atomicity: write-to-temp + `os.replace` so SIGKILL can't leave an empty cursor. Plus inode-change detection so file rotation (logrotate, mv-in-replacement) triggers a re-read instead of silent mid-file seeks.
 - `--consumer` on `tail` rejects path-traversal shapes (`../escape`, `foo/bar`).
-- Outbox `AGENTBUS_OUTBOX` leaks into multi-agent shells: added `{agent_id}` template substitution + agent-scoped `AGENTBUS_OUTBOX_<UPPER_ID>` override with documented resolution precedence.
+- Outbox `SWARMBUS_OUTBOX` leaks into multi-agent shells: added `{agent_id}` template substitution + agent-scoped `SWARMBUS_OUTBOX_<UPPER_ID>` override with documented resolution precedence.
 - Dropped `text/x-code;lang=python` from the `content_type` vocabulary — it was an affordance ("code for you to read as source") that invited the exact wrong thing given the "inbound bodies are untrusted" security posture. `text/markdown` with fenced blocks is now the recommended shape for sharing code between agents.
 
 ### Security
@@ -67,7 +67,7 @@ First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker rea
 
 ## [v0.1.0] — 2026-04-14 (initial)
 
-First functional release as described in `docs/superpowers/specs/2026-04-14-agentbus-design.md` and `docs/superpowers/plans/2026-04-14-agentbus-build.md`. Peer-symmetric pub/sub over mosquitto, no orchestrator, `send` / `listen` / `mcp-server` / `start` CLI, `FileBridgeHandler` / `DirectInvocationHandler` / `PersistentListenerHandler` / `SQLiteArchive` handlers, MCP sidecar with 4 tools.
+First functional release as described in `docs/superpowers/specs/2026-04-14-swarmbus-design.md` and `docs/superpowers/plans/2026-04-14-swarmbus-build.md`. Peer-symmetric pub/sub over mosquitto, no orchestrator, `send` / `listen` / `mcp-server` / `start` CLI, `FileBridgeHandler` / `DirectInvocationHandler` / `PersistentListenerHandler` / `SQLiteArchive` handlers, MCP sidecar with 4 tools.
 
 ### Wire-compat
 Baseline release — nothing to be compatible with.

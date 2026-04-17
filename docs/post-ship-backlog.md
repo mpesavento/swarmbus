@@ -1,8 +1,8 @@
 # Post-ship backlog
 
 Living record of gaps, drift, and follow-up work found **after** the v1.0
-spec + plan (`docs/superpowers/specs/2026-04-14-agentbus-design.md`,
-`docs/superpowers/plans/2026-04-14-agentbus-build.md`) were executed.
+spec + plan (`docs/superpowers/specs/2026-04-14-swarmbus-design.md`,
+`docs/superpowers/plans/2026-04-14-swarmbus-build.md`) were executed.
 The superpowers/ folder captures what we planned to build; this file
 captures what we discovered once it was in use.
 
@@ -14,7 +14,7 @@ in-progress, `[>]` deferred to a future milestone with the rationale.
 ## 2026-04-14 — round one
 
 Surfaced after Sparrow + Wren both deployed on the RPi and we started
-exchanging real agentbus traffic. The "daemon runs, presence retained,
+exchanging real swarmbus traffic. The "daemon runs, presence retained,
 messages still disappear" incident was the instigating event; we caught
 a priority-validation regression during diagnosis and then ran a
 specs-vs-implementation audit.
@@ -22,9 +22,9 @@ specs-vs-implementation audit.
 ### Real gaps (shipped without what the spec promised)
 
 - [ ] **Config file support missing.** Spec §206-231 called for
-      `~/.agentbus/config.toml` + per-project `.agentbus.toml` (agent_id,
+      `~/.swarmbus/config.toml` + per-project `.swarmbus.toml` (agent_id,
       broker, bind_host, MCP settings). Zero config parsing in
-      `src/agentbus/cli.py` today — everything is CLI flags and env
+      `src/swarmbus/cli.py` today — everything is CLI flags and env
       vars. Real scope; probably its own session. Would remove a lot of
       `--broker`/`--agent-id` repetition in systemd units and scripts.
 
@@ -32,8 +32,8 @@ specs-vs-implementation audit.
       aiomqtt.Client accepts `username=`/`password=` kwargs; AgentBus
       never forwards them. Fine for tailnet-only deployments (Tailscale
       is the auth layer there), blocking for anything else. Expose as
-      `--username/--password` (or env vars) on `agentbus start` and
-      `agentbus send`.
+      `--username/--password` (or env vars) on `swarmbus start` and
+      `swarmbus send`.
 
 - [ ] **TLS flags not exposed.** `--tls`/`--ca-certs`/`--tls-insecure`
       all missing. Same story — the spec implied cross-machine
@@ -100,9 +100,9 @@ specs-vs-implementation audit.
 
 ### Scope creep — shipped beyond spec, all fine, just flagging
 
-- [x] `agentbus read` / `watch` / `list` / `tail` subcommands (CLI was
+- [x] `swarmbus read` / `watch` / `list` / `tail` subcommands (CLI was
       meant to be `send`/`listen`/`mcp-server`/`start` only).
-- [x] `--outbox` flag + `AGENTBUS_OUTBOX` / `AGENTBUS_OUTBOX_<ID>`
+- [x] `--outbox` flag + `SWARMBUS_OUTBOX` / `SWARMBUS_OUTBOX_<ID>`
       resolution for outbound archive. Goes beyond the `SQLiteArchive`
       handler the spec mentioned.
 - [x] `examples/openclaw-wake.sh`, `examples/claude-code-wake.sh` —
@@ -117,7 +117,7 @@ reader doesn't think they were skipped.
 ### Operational / protocol gotchas (behavioural findings, not code bugs)
 
 - [x] **Rolling-upgrade discipline.** Closed via `CHANGELOG.md` with a
-      "Wire-compat" bullet per release (commit `cec46aa`) + `agentbus
+      "Wire-compat" bullet per release (commit `cec46aa`) + `swarmbus
       doctor` subcommand (commit `eab328e`) that includes a "daemon
       library fresh" check — compares running daemon start time to
       source-on-disk mtime and flags stale in-memory Python as
@@ -140,22 +140,22 @@ reader doesn't think they were skipped.
 ## 2026-04-16 — competitive landscape review
 
 Surfaced after comparing against Kanevry/agentbus (webhook router, TypeScript, early-stage)
-and agentbus.org (SaaS REST polling, agent registry). Different products, same name.
+and agentbus.org (SaaS REST polling, agent registry). Different products, former name.
 Our key technical gap vs the SaaS:
 
-- [ ] **Persistent agent registry.** `agentbus list` only shows currently-online peers
+- [ ] **Persistent agent registry.** `swarmbus list` only shows currently-online peers
       (MQTT retained presence). If Wren is offline, she's invisible. agentbus.org
       maintains a persistent directory queryable regardless of online status. Fix:
-      SQLite table in `~/.agentbus/registry.db` written on `agentbus start` (upsert
-      agent_id + last_seen + broker), queryable via `agentbus registry list`/`show`.
-      `agentbus doctor` could also check registry health. Low code lift; high UX value
+      SQLite table in `~/.swarmbus/registry.db` written on `swarmbus start` (upsert
+      agent_id + last_seen + broker), queryable via `swarmbus registry list`/`show`.
+      `swarmbus doctor` could also check registry health. Low code lift; high UX value
       for multi-agent fleets.
 
 - [ ] **Zero-friction setup script ("one command to bus").** Current onboarding requires:
-      install mosquitto, pip install, run setup script, configure systemd, `agentbus doctor`.
-      That's 4-5 distinct human steps. A single `curl | bash` (or `agentbus init`) that
+      install mosquitto, pip install, run setup script, configure systemd, `swarmbus doctor`.
+      That's 4-5 distinct human steps. A single `curl | bash` (or `swarmbus init`) that
       detects the platform, installs mosquitto, configures it, installs the Python package,
-      and prints the `agentbus start` command would cut onboarding to 1 human step.
+      and prints the `swarmbus start` command would cut onboarding to 1 human step.
       Critical for any public adoption play.
 
 - [>] **Human-facing web UI.** agentbus.org has a browser UI for conversation threads.

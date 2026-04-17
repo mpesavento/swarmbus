@@ -1,12 +1,12 @@
 from unittest.mock import patch, AsyncMock
 from click.testing import CliRunner
 import aiomqtt
-from agentbus.cli import main
+from swarmbus.cli import main
 
 
 def test_send_inline_body(tmp_path):
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -27,7 +27,7 @@ def test_send_inline_body(tmp_path):
 
 def test_send_outbox_flag_passed_through():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -41,23 +41,23 @@ def test_send_outbox_flag_passed_through():
 
 def test_send_outbox_from_shared_env_var():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(
             main,
             ["send", "--agent-id", "sparrow", "--to", "wren",
              "--subject", "x", "--body", "y"],
-            env={"AGENTBUS_OUTBOX": "/tmp/env-outbox.md"},
+            env={"SWARMBUS_OUTBOX": "/tmp/env-outbox.md"},
         )
     assert result.exit_code == 0, result.output
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/env-outbox.md"
 
 
 def test_send_outbox_agent_scoped_env_wins_over_shared():
-    """AGENTBUS_OUTBOX_<ID> must take precedence over AGENTBUS_OUTBOX."""
+    """SWARMBUS_OUTBOX_<ID> must take precedence over SWARMBUS_OUTBOX."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(
@@ -65,8 +65,8 @@ def test_send_outbox_agent_scoped_env_wins_over_shared():
             ["send", "--agent-id", "sparrow", "--to", "wren",
              "--subject", "x", "--body", "y"],
             env={
-                "AGENTBUS_OUTBOX": "/tmp/shared.md",
-                "AGENTBUS_OUTBOX_SPARROW": "/tmp/sparrow-specific.md",
+                "SWARMBUS_OUTBOX": "/tmp/shared.md",
+                "SWARMBUS_OUTBOX_SPARROW": "/tmp/sparrow-specific.md",
             },
         )
     assert result.exit_code == 0, result.output
@@ -76,7 +76,7 @@ def test_send_outbox_agent_scoped_env_wins_over_shared():
 def test_send_outbox_explicit_flag_wins_over_env():
     """--outbox must take precedence over any env var."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(
@@ -85,8 +85,8 @@ def test_send_outbox_explicit_flag_wins_over_env():
              "--subject", "x", "--body", "y",
              "--outbox", "/tmp/flag.md"],
             env={
-                "AGENTBUS_OUTBOX": "/tmp/shared.md",
-                "AGENTBUS_OUTBOX_SPARROW": "/tmp/scoped.md",
+                "SWARMBUS_OUTBOX": "/tmp/shared.md",
+                "SWARMBUS_OUTBOX_SPARROW": "/tmp/scoped.md",
             },
         )
     assert result.exit_code == 0, result.output
@@ -94,32 +94,32 @@ def test_send_outbox_explicit_flag_wins_over_env():
 
 
 def test_send_outbox_agent_id_with_hyphens_in_env_var():
-    """wren-beta → AGENTBUS_OUTBOX_WREN_BETA (hyphen -> underscore, upper)."""
+    """wren-beta → SWARMBUS_OUTBOX_WREN_BETA (hyphen -> underscore, upper)."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(
             main,
             ["send", "--agent-id", "wren-beta", "--to", "sparrow",
              "--subject", "x", "--body", "y"],
-            env={"AGENTBUS_OUTBOX_WREN_BETA": "/tmp/wren-beta.md"},
+            env={"SWARMBUS_OUTBOX_WREN_BETA": "/tmp/wren-beta.md"},
         )
     assert result.exit_code == 0, result.output
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/wren-beta.md"
 
 
 def test_send_outbox_template_substitution_via_env():
-    """`{agent_id}` in shared AGENTBUS_OUTBOX survives to the bus call (substitution happens in AgentBus.send)."""
+    """`{agent_id}` in shared SWARMBUS_OUTBOX survives to the bus call (substitution happens in AgentBus.send)."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(
             main,
             ["send", "--agent-id", "sparrow", "--to", "wren",
              "--subject", "x", "--body", "y"],
-            env={"AGENTBUS_OUTBOX": "/tmp/{agent_id}-outbox.md"},
+            env={"SWARMBUS_OUTBOX": "/tmp/{agent_id}-outbox.md"},
         )
     assert result.exit_code == 0, result.output
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/{agent_id}-outbox.md"
@@ -131,7 +131,7 @@ def test_send_priority_roundtrips_cli_to_envelope():
     flag at all — priority=high claims in docs and wake wrappers were
     untestable from the shell. Never again."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -145,7 +145,7 @@ def test_send_priority_roundtrips_cli_to_envelope():
 
 def test_send_priority_default_is_normal():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -173,7 +173,7 @@ def test_send_priority_rejects_unknown_at_cli():
 
 def test_send_content_type_roundtrips():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         runner.invoke(main, [
@@ -186,7 +186,7 @@ def test_send_content_type_roundtrips():
 
 def test_send_reply_to_roundtrips():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -205,7 +205,7 @@ def test_send_body_file(tmp_path):
     report = tmp_path / "report.md"
     report.write_text("# Report\nsome content")
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -222,7 +222,7 @@ def test_send_body_file(tmp_path):
 
 def test_send_body_file_stdin():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock()
         result = runner.invoke(main, [
@@ -276,7 +276,7 @@ def test_help():
     runner = CliRunner()
     result = runner.invoke(main, ["--help"])
     assert result.exit_code == 0
-    assert "agentbus" in result.output
+    assert "swarmbus" in result.output
 
 
 def test_send_help():
@@ -291,7 +291,7 @@ def test_send_help():
 
 def test_read_empty_inbox():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.read_inbox = AsyncMock(return_value=[])
         result = runner.invoke(main, ["read", "--agent-id", "sparrow"])
@@ -306,7 +306,7 @@ def test_read_pretty_output():
         "ts": "2026-04-14T05:00:00Z", "subject": "hi", "body": "hello there",
         "content_type": "text/plain", "priority": "normal", "reply_to": None,
     }
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.read_inbox = AsyncMock(return_value=[msg])
         result = runner.invoke(main, ["read", "--agent-id", "sparrow"])
@@ -319,7 +319,7 @@ def test_read_pretty_output():
 def test_read_json_output():
     runner = CliRunner()
     msg = {"id": "abc", "from": "wren", "subject": "hi", "body": "x"}
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.read_inbox = AsyncMock(return_value=[msg])
         result = runner.invoke(main, ["read", "--agent-id", "sparrow", "--json"])
@@ -331,7 +331,7 @@ def test_read_json_output():
 
 def test_watch_timeout_exits_1():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.watch_inbox = AsyncMock(return_value=None)
         result = runner.invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
@@ -346,7 +346,7 @@ def test_watch_returns_message():
         "ts": "2026-04-14T05:00:00Z", "subject": "pong", "body": "got it",
         "content_type": "text/plain", "priority": "normal", "reply_to": "wren",
     }
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.watch_inbox = AsyncMock(return_value=msg)
         result = runner.invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
@@ -357,7 +357,7 @@ def test_watch_returns_message():
 
 def test_list_empty():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus.probe") as MockProbe:
+    with patch("swarmbus.cli.AgentBus.probe") as MockProbe:
         instance = MockProbe.return_value
         instance.list_agents = AsyncMock(return_value=[])
         result = runner.invoke(main, ["list"])
@@ -367,7 +367,7 @@ def test_list_empty():
 
 def test_list_prints_agents():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus.probe") as MockProbe:
+    with patch("swarmbus.cli.AgentBus.probe") as MockProbe:
         instance = MockProbe.return_value
         instance.list_agents = AsyncMock(return_value=["sparrow", "wren"])
         result = runner.invoke(main, ["list"])
@@ -594,7 +594,7 @@ def test_tail_handles_file_truncation(tmp_path):
 
 def test_read_broker_unreachable_exits_2():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.read_inbox = AsyncMock(side_effect=aiomqtt.MqttError("Connection refused"))
         result = runner.invoke(main, ["read", "--agent-id", "sparrow"])
@@ -605,7 +605,7 @@ def test_read_broker_unreachable_exits_2():
 
 def test_watch_broker_unreachable_exits_2():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.watch_inbox = AsyncMock(side_effect=aiomqtt.MqttError("Connection refused"))
         result = runner.invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
@@ -615,7 +615,7 @@ def test_watch_broker_unreachable_exits_2():
 
 def test_list_broker_unreachable_exits_2():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus.probe") as MockProbe:
+    with patch("swarmbus.cli.AgentBus.probe") as MockProbe:
         instance = MockProbe.return_value
         instance.list_agents = AsyncMock(side_effect=aiomqtt.MqttError("Connection refused"))
         result = runner.invoke(main, ["list"])
@@ -626,7 +626,7 @@ def test_list_broker_unreachable_exits_2():
 def test_send_broker_unreachable_clean_error():
     """MqttError → friendly stderr message, exit 2, no traceback."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus:
+    with patch("swarmbus.cli.AgentBus") as MockBus:
         instance = MockBus.return_value
         instance.send = AsyncMock(side_effect=aiomqtt.MqttError("Connection refused"))
         result = runner.invoke(main, [
@@ -642,22 +642,22 @@ def test_send_broker_unreachable_clean_error():
 def test_start_invoke_uses_shlex_split():
     """--invoke must tokenize with shlex so quoted args survive."""
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus") as MockBus, \
-         patch("agentbus.cli.DirectInvocationHandler") as MockHandler:
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.DirectInvocationHandler") as MockHandler:
         instance = MockBus.return_value
         instance.run = lambda: None  # no-op so start returns
         runner.invoke(main, [
             "start", "--agent-id", "t",
-            "--invoke", "bash -c 'echo $AGENTBUS_FROM'",
+            "--invoke", "bash -c 'echo $SWARMBUS_FROM'",
         ])
         MockHandler.assert_called_once_with(
-            command=["bash", "-c", "echo $AGENTBUS_FROM"]
+            command=["bash", "-c", "echo $SWARMBUS_FROM"]
         )
 
 
 def test_list_json():
     runner = CliRunner()
-    with patch("agentbus.cli.AgentBus.probe") as MockProbe:
+    with patch("swarmbus.cli.AgentBus.probe") as MockProbe:
         instance = MockProbe.return_value
         instance.list_agents = AsyncMock(return_value=["sparrow", "wren"])
         result = runner.invoke(main, ["list", "--json"])

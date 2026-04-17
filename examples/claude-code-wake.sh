@@ -2,23 +2,23 @@
 # examples/claude-code-wake.sh
 #
 # DirectInvocationHandler wrapper that wakes a real Claude Code agent turn
-# in response to an inbound agentbus message. Analog to openclaw-wake.sh
+# in response to an inbound swarmbus message. Analog to openclaw-wake.sh
 # but for Claude Code hosts instead of OpenClaw.
 #
 # Wire it in via --invoke on the listener daemon:
 #
-#   agentbus start \
+#   swarmbus start \
 #     --agent-id <me> \
 #     --inbox ~/sync/<me>-inbox.md \
-#     --invoke "$HOME/projects/agentbus/examples/claude-code-wake.sh <me>"
+#     --invoke "$HOME/projects/swarmbus/examples/claude-code-wake.sh <me>"
 #
 # Arguments:
 #   $1  Agent id (used to locate session state + archive wake events).
 #       Required.
 #
 # Env vars (set by DirectInvocationHandler):
-#   AGENTBUS_FROM, AGENTBUS_SUBJECT, AGENTBUS_REPLY_TO,
-#   AGENTBUS_CONTENT_TYPE, AGENTBUS_PRIORITY, AGENTBUS_TS, AGENTBUS_ID
+#   SWARMBUS_FROM, SWARMBUS_SUBJECT, SWARMBUS_REPLY_TO,
+#   SWARMBUS_CONTENT_TYPE, SWARMBUS_PRIORITY, SWARMBUS_TS, SWARMBUS_ID
 #
 # Gating policy (default: B — priority=high only).
 #   Claude Code sessions are comparatively expensive to spawn — a fresh
@@ -31,8 +31,8 @@
 #   FileBridgeHandler (Tier 1). They'll be picked up when the operator
 #   next prompts the agent directly (via the chat surface / portal).
 #
-#   Override AGENTBUS_WAKE_POLICY=all to spawn on every message.
-#   Override AGENTBUS_WAKE_POLICY=none to disable spawning entirely
+#   Override SWARMBUS_WAKE_POLICY=all to spawn on every message.
+#   Override SWARMBUS_WAKE_POLICY=none to disable spawning entirely
 #     (useful when testing to stop runaway loops).
 #
 # SECURITY.
@@ -53,7 +53,7 @@
 set -euo pipefail
 
 AGENT_ID="${1:?Usage: claude-code-wake.sh <agent-id>}"
-LOG_DIR="$HOME/.local/state/agentbus-wake"
+LOG_DIR="$HOME/.local/state/swarmbus-wake"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/${AGENT_ID}.log"
 
@@ -62,12 +62,12 @@ _log() {
 }
 
 # Policy gate
-POLICY="${AGENTBUS_WAKE_POLICY:-priority-high}"
-PRIORITY="${AGENTBUS_PRIORITY:-normal}"
+POLICY="${SWARMBUS_WAKE_POLICY:-priority-high}"
+PRIORITY="${SWARMBUS_PRIORITY:-normal}"
 
 case "$POLICY" in
   none)
-    _log "policy=none; dropping ${AGENTBUS_ID:-?} from=${AGENTBUS_FROM:-?}"
+    _log "policy=none; dropping ${SWARMBUS_ID:-?} from=${SWARMBUS_FROM:-?}"
     cat > /dev/null  # drain stdin so the daemon's subprocess.run completes
     exit 0
     ;;
@@ -99,9 +99,9 @@ sanitize() {
     | head -c "$max"
 }
 
-safe_from=$(sanitize "${AGENTBUS_FROM:-?}" 64)
-safe_subject=$(sanitize "${AGENTBUS_SUBJECT:-?}" 200)
-safe_reply_to=$(sanitize "${AGENTBUS_REPLY_TO:-}" 64)
+safe_from=$(sanitize "${SWARMBUS_FROM:-?}" 64)
+safe_subject=$(sanitize "${SWARMBUS_SUBJECT:-?}" 200)
+safe_reply_to=$(sanitize "${SWARMBUS_REPLY_TO:-}" 64)
 safe_priority=$(sanitize "${PRIORITY}" 16)
 
 prompt=$(cat <<PROMPT
@@ -115,12 +115,12 @@ priority: ${safe_priority}
 ${body}
 
 ---
-You have just received this message from a peer agent via agentbus (priority=high,
+You have just received this message from a peer agent via swarmbus (priority=high,
 so the wake wrapper spawned you to handle it live). Your own identity is
 "${AGENT_ID}". Decide whether/how to respond.
 
 Options:
-  • Reply via \`agentbus send --agent-id ${AGENT_ID} --to <reply_to> ...\`
+  • Reply via \`swarmbus send --agent-id ${AGENT_ID} --to <reply_to> ...\`
     if the peer expects an answer (reply_to is set above).
   • Notify the human operator on their configured surface (Telegram,
     Slack, portal) if the content warrants their attention.
@@ -144,7 +144,7 @@ else
   exit 1
 fi
 
-_log "wake spawning for ${AGENTBUS_ID:-?} from=${safe_from} subject=\"${safe_subject}\""
+_log "wake spawning for ${SWARMBUS_ID:-?} from=${safe_from} subject=\"${safe_subject}\""
 
 # Pipe the prompt to claude --print so the model sees it as a user turn.
 # bypassPermissions because we're running unattended; the wake turn's own

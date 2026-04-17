@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/install-systemd.sh
-# Render systemd/agentbus-agent.service.template for <agent-id> and
-# install it at ~/.config/systemd/user/agentbus-<agent-id>.service.
+# Render systemd/swarmbus-agent.service.template for <agent-id> and
+# install it at ~/.config/systemd/user/swarmbus-<agent-id>.service.
 #
 # Usage:
 #   install-systemd.sh <agent-id> [--invoke <path>] [--broker <host>] [--inbox <path>]
@@ -12,7 +12,7 @@
 #   --invoke (none — bare file-bridge daemon; no reactive wake)
 #
 # After install, the script runs `systemctl --user daemon-reload`, enables
-# the unit, starts it, and runs `agentbus doctor` to verify.
+# the unit, starts it, and runs `swarmbus doctor` to verify.
 
 set -euo pipefail
 
@@ -34,17 +34,17 @@ done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEMPLATE="$REPO_ROOT/systemd/agentbus-agent.service.template"
+TEMPLATE="$REPO_ROOT/systemd/swarmbus-agent.service.template"
 UNIT_DIR="$HOME/.config/systemd/user"
-UNIT_PATH="$UNIT_DIR/agentbus-${AGENT_ID}.service"
+UNIT_PATH="$UNIT_DIR/swarmbus-${AGENT_ID}.service"
 
-if ! command -v agentbus >/dev/null 2>&1; then
-  echo "ERROR: 'agentbus' not on PATH. Install it first:"
-  echo "  pip install agentbus          # or"
+if ! command -v swarmbus >/dev/null 2>&1; then
+  echo "ERROR: 'swarmbus' not on PATH. Install it first:"
+  echo "  pip install swarmbus          # or"
   echo "  pip install -e ${REPO_ROOT}   # editable install"
   exit 1
 fi
-AGENTBUS_PATH=$(command -v agentbus)
+SWARMBUS_PATH=$(command -v swarmbus)
 
 mkdir -p "$UNIT_DIR" "$HOME/logs" "$(dirname "$INBOX")"
 
@@ -58,7 +58,7 @@ if [ -z "$INVOKE" ]; then
       -e "s|@HOME@|$HOME|g" \
       -e "s|@BROKER@|$BROKER|g" \
       -e "s|@INBOX@|$INBOX|g" \
-      -e "s|@AGENTBUS_PATH@|$AGENTBUS_PATH|g" \
+      -e "s|@SWARMBUS_PATH@|$SWARMBUS_PATH|g" \
       -e '/--invoke/d' \
       -e 's| \\$||' \
       "$TEMPLATE" > "$UNIT_PATH"
@@ -69,7 +69,7 @@ else
       -e "s|@BROKER@|$BROKER|g" \
       -e "s|@INBOX@|$INBOX|g" \
       -e "s|@INVOKE@|$INVOKE|g" \
-      -e "s|@AGENTBUS_PATH@|$AGENTBUS_PATH|g" \
+      -e "s|@SWARMBUS_PATH@|$SWARMBUS_PATH|g" \
       "$TEMPLATE" > "$UNIT_PATH"
 fi
 
@@ -82,16 +82,16 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
 
 systemctl --user daemon-reload
-systemctl --user enable "agentbus-${AGENT_ID}.service"
-systemctl --user restart "agentbus-${AGENT_ID}.service"
+systemctl --user enable "swarmbus-${AGENT_ID}.service"
+systemctl --user restart "swarmbus-${AGENT_ID}.service"
 
 sleep 2
 echo ""
 echo "[install-systemd] status:"
-systemctl --user --no-pager --lines=3 status "agentbus-${AGENT_ID}.service" | head -8
+systemctl --user --no-pager --lines=3 status "swarmbus-${AGENT_ID}.service" | head -8
 echo ""
 echo "[install-systemd] running doctor:"
-agentbus doctor --agent-id "$AGENT_ID" --broker "$BROKER" || true
+swarmbus doctor --agent-id "$AGENT_ID" --broker "$BROKER" || true
 
 echo ""
 echo "[install-systemd] next step: loginctl enable-linger \$(whoami)"

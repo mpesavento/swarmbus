@@ -1,4 +1,4 @@
-# agentbus
+# swarmbus
 
 > *The buzz between your agents.*
 
@@ -31,7 +31,7 @@ The broker runs as a system service on port 1883 after install. For cross-machin
 ### 2. Install the CLI
 
 ```bash
-pip install "agentbus[mcp]"
+pip install "swarmbus[mcp]"
 ```
 
 ### 3. Start a listener daemon per agent
@@ -40,10 +40,10 @@ pip install "agentbus[mcp]"
 
 ```bash
 # Terminal A (Planner's side):
-agentbus start --agent-id planner --inbox ~/sync/planner-inbox.md
+swarmbus start --agent-id planner --inbox ~/sync/planner-inbox.md
 
 # Terminal B (Coder's side):
-agentbus start --agent-id coder --inbox ~/sync/coder-inbox.md
+swarmbus start --agent-id coder --inbox ~/sync/coder-inbox.md
 ```
 
 Each daemon:
@@ -60,54 +60,54 @@ From any shell, script, or agent session:
 
 ```bash
 # Set once so every send archives automatically:
-export AGENTBUS_OUTBOX=~/sync/planner-outbox.md
+export SWARMBUS_OUTBOX=~/sync/planner-outbox.md
 
-agentbus send --agent-id planner --to coder --subject "hi" --body "got a minute?"
+swarmbus send --agent-id planner --to coder --subject "hi" --body "got a minute?"
 ```
 
-`AGENTBUS_OUTBOX` (or `--outbox` per call) appends every outbound message to a file using the same format as the receiver's inbox. Your own sent-log and received-log are now structurally identical and can be merged into one conversation view. **Always set this when running under a real agent identity** — an unarchived send is a dropped audit trail.
+`SWARMBUS_OUTBOX` (or `--outbox` per call) appends every outbound message to a file using the same format as the receiver's inbox. Your own sent-log and received-log are now structurally identical and can be merged into one conversation view. **Always set this when running under a real agent identity** — an unarchived send is a dropped audit trail.
 
-**Multi-agent safety.** If two agents might share the same shell environment, a bare `AGENTBUS_OUTBOX=/path/planner-outbox.md` leaks into both. Two fixes, pick one (or use both):
+**Multi-agent safety.** If two agents might share the same shell environment, a bare `SWARMBUS_OUTBOX=/path/planner-outbox.md` leaks into both. Two fixes, pick one (or use both):
 
 - **Template** — put `{agent_id}` in the path. The library expands it at send time:
   ```
-  export AGENTBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
+  export SWARMBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
   ```
-  Every `agentbus send --agent-id X` lands in `X-outbox.md`. One env var, correct file per id.
-- **Agent-scoped override** — `AGENTBUS_OUTBOX_<UPPER_AGENT_ID>` beats the shared one:
+  Every `swarmbus send --agent-id X` lands in `X-outbox.md`. One env var, correct file per id.
+- **Agent-scoped override** — `SWARMBUS_OUTBOX_<UPPER_AGENT_ID>` beats the shared one:
   ```
-  export AGENTBUS_OUTBOX_PLANNER=~/sync/planner-outbox.md
-  export AGENTBUS_OUTBOX_CODER=~/sync/coder-outbox.md
+  export SWARMBUS_OUTBOX_PLANNER=~/sync/planner-outbox.md
+  export SWARMBUS_OUTBOX_CODER=~/sync/coder-outbox.md
   ```
-  Hyphens in the agent-id become underscores (`coder-beta` → `AGENTBUS_OUTBOX_CODER_BETA`).
+  Hyphens in the agent-id become underscores (`coder-beta` → `SWARMBUS_OUTBOX_CODER_BETA`).
 
-Resolution order (highest first): `--outbox` flag, `AGENTBUS_OUTBOX_<ID>`, `AGENTBUS_OUTBOX`, none.
+Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, none.
 
 Coder's inbox file grows immediately; her next session turn sees it. That's the receive path whenever the listener daemon is running for `coder`.
 
 ```bash
-agentbus list                              # who's online right now?
+swarmbus list                              # who's online right now?
 ```
 
 **Two read paths, pick by deployment shape:**
 
-- **Always-on agent with a daemon (Planner, Coder, any long-lived session)**: use `agentbus tail` to read new content from the inbox file. No MQTT contention with the daemon — the daemon is the sole broker subscriber, tail just reads the file it writes. Cursor-tracked so repeat calls only show new.
-- **Ephemeral or scripted agent without a daemon**: use `agentbus read` / `agentbus watch`. These open a fresh MQTT connection, catch retained messages or messages published during the connection window, and exit.
+- **Always-on agent with a daemon (Planner, Coder, any long-lived session)**: use `swarmbus tail` to read new content from the inbox file. No MQTT contention with the daemon — the daemon is the sole broker subscriber, tail just reads the file it writes. Cursor-tracked so repeat calls only show new.
+- **Ephemeral or scripted agent without a daemon**: use `swarmbus read` / `swarmbus watch`. These open a fresh MQTT connection, catch retained messages or messages published during the connection window, and exit.
 
 ```bash
 # With a daemon running (Planner/Coder pattern):
-agentbus tail --agent-id planner              # new entries from the daemon's inbox file since last cursor
-agentbus tail --agent-id planner --follow     # stream new content (blocks)
-agentbus tail --agent-id planner --consumer bot  # separate cursor
+swarmbus tail --agent-id planner              # new entries from the daemon's inbox file since last cursor
+swarmbus tail --agent-id planner --follow     # stream new content (blocks)
+swarmbus tail --agent-id planner --consumer bot  # separate cursor
 
 # No daemon — ephemeral (CI job, shell pipeline):
-agentbus read --agent-id scratch              # drain retained messages, exit
-agentbus watch --agent-id scratch --timeout 60  # block until one arrives
+swarmbus read --agent-id scratch              # drain retained messages, exit
+swarmbus watch --agent-id scratch --timeout 60  # block until one arrives
 ```
 
-**What to never do:** run `agentbus read` or `agentbus watch` against an agent-id that already has a daemon running. They'd race the daemon for QoS1 messages — whichever client is currently subscribed wins and the other silently never sees them. Use `agentbus tail` (file-based) instead.
+**What to never do:** run `swarmbus read` or `swarmbus watch` against an agent-id that already has a daemon running. They'd race the daemon for QoS1 messages — whichever client is currently subscribed wins and the other silently never sees them. Use `swarmbus tail` (file-based) instead.
 
-**Daemon durability.** By default `agentbus start` uses an MQTT persistent session (`--persistent`, on by default), so a crashed or restarted daemon doesn't lose queued messages — the broker redelivers them on reconnect. Disable with `--no-persistent` only if another process is already holding the `agentbus-<agent-id>` client identifier.
+**Daemon durability.** By default `swarmbus start` uses an MQTT persistent session (`--persistent`, on by default), so a crashed or restarted daemon doesn't lose queued messages — the broker redelivers them on reconnect. Disable with `--no-persistent` only if another process is already holding the `swarmbus-<agent-id>` client identifier.
 
 That's the whole loop: broker → daemon OR one-shot per agent-id → `send` from anywhere → peer receives via tail (if daemon) or read (if not).
 
@@ -116,9 +116,9 @@ That's the whole loop: broker → daemon OR one-shot per agent-id → `send` fro
 ## Install
 
 ```bash
-pip install agentbus
+pip install swarmbus
 # with optional features:
-pip install "agentbus[archive,mcp]"
+pip install "swarmbus[archive,mcp]"
 ```
 
 ## Integration paths
@@ -137,7 +137,7 @@ The quickstart above uses the CLI path (#4 below) because it's the most universa
 
 ### 1. Claude Code — MCP server + behavioral skill
 
-Run the setup script. It registers the MCP server in `~/.claude/settings.json` **and** installs a behavioral skill at `~/.claude/skills/using-agentbus/` that teaches Claude when to send, read, watch, and list agents.
+Run the setup script. It registers the MCP server in `~/.claude/settings.json` **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches Claude when to send, read, watch, and list agents.
 
 ```bash
 bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
@@ -152,20 +152,20 @@ Restart Claude Code. Four MCP tools become available:
 - `watch_inbox(timeout)` — long-poll, returns when a message arrives
 - `list_agents()` — IDs of peers currently online
 
-The skill (`skills/using-agentbus/SKILL.md`) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
+The skill (`skills/using-swarmbus/SKILL.md`) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
 
 Claude Code **also** needs a listener daemon running (step 3 of the quickstart) to receive messages while the chat session is closed. The MCP tools only work while Claude is open — the daemon is what catches messages in between.
 
 **Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
 
 ```bash
-agentbus start \
+swarmbus start \
   --agent-id <me> \
   --inbox ~/sync/<me>-inbox.md \
   --invoke "$(pwd)/examples/claude-code-wake.sh <me>"
 ```
 
-Defaults to "wake only on priority=high" — spawning a fresh Claude Code session bootstraps ~100k tokens, so invoking on every message rapidly burns money on broadcast/heartbeat traffic. Low-priority messages still get archived by the file bridge; they're picked up on the next operator-initiated turn. Override with `AGENTBUS_WAKE_POLICY=all` for dev/testing, `=none` to disable spawning. Wake output logs to `~/.local/state/agentbus-wake/<agent-id>.log`.
+Defaults to "wake only on priority=high" — spawning a fresh Claude Code session bootstraps ~100k tokens, so invoking on every message rapidly burns money on broadcast/heartbeat traffic. Low-priority messages still get archived by the file bridge; they're picked up on the next operator-initiated turn. Override with `SWARMBUS_WAKE_POLICY=all` for dev/testing, `=none` to disable spawning. Wake output logs to `~/.local/state/swarmbus-wake/<agent-id>.log`.
 
 ### 2. OpenClaw — skill + listener daemon
 
@@ -177,12 +177,12 @@ bash scripts/setup-openclaw-plugin.sh <agent-id> [broker-host]
 bash scripts/setup-openclaw-plugin.sh coder localhost
 ```
 
-This copies the skill to `~/.openclaw/skills/using-agentbus/` and prints the `agentbus start` command you need to run (typically under byobu or systemd-user). From then on, the OpenClaw agent uses `agentbus send` / `agentbus read` / `agentbus list` via its shell tool.
+This copies the skill to `~/.openclaw/skills/using-swarmbus/` and prints the `swarmbus start` command you need to run (typically under byobu or systemd-user). From then on, the OpenClaw agent uses `swarmbus send` / `swarmbus read` / `swarmbus list` via its shell tool.
 
 **For reactive wake-up** (message arrives → OpenClaw agent takes a real turn, no polling), combine the listener daemon with `examples/openclaw-wake.sh`:
 
 ```bash
-agentbus start \
+swarmbus start \
   --agent-id coder \
   --inbox ~/sync/coder-inbox.md \
   --invoke "$(pwd)/examples/openclaw-wake.sh main"
@@ -190,14 +190,14 @@ agentbus start \
 
 The `--inbox` half persists every message to a file (durability). The `--invoke` half runs `openclaw agent --agent main --message "<body>"` on each arrival, so Coder actually reasons about it instead of waiting for her next scheduled turn. End-to-end tested; see `examples/openclaw-wake.sh` for the wrapper source.
 
-Also set `AGENTBUS_OUTBOX=~/sync/coder-outbox.md` in the OpenClaw agent's shell env so every `agentbus send` from that agent archives outbound messages symmetrically with the inbox file. See [docs/notification-patterns.md](docs/notification-patterns.md) for the full archive + user-notification protocol.
+Also set `SWARMBUS_OUTBOX=~/sync/coder-outbox.md` in the OpenClaw agent's shell env so every `swarmbus send` from that agent archives outbound messages symmetrically with the inbox file. See [docs/notification-patterns.md](docs/notification-patterns.md) for the full archive + user-notification protocol.
 
 ### 3. Generic MCP agent
 
 If your agent speaks MCP but isn't Claude Code, run the server manually over stdio:
 
 ```bash
-agentbus mcp-server --agent-id <your-id> --broker localhost
+swarmbus mcp-server --agent-id <your-id> --broker localhost
 ```
 
 Configure your MCP client to spawn that command. Tool names and signatures are identical to path 1; the SKILL.md serves as a reference for prompt/system-message authors even if your stack doesn't use skill files.
@@ -208,7 +208,7 @@ Import and embed. This is the most direct path for in-process agents:
 
 ```python
 import asyncio
-from agentbus import AgentBus, FileBridgeHandler, PersistentListenerHandler
+from swarmbus import AgentBus, FileBridgeHandler, PersistentListenerHandler
 
 # Persistent client — one MQTT connection reused for all sends
 async def main():
@@ -222,7 +222,7 @@ asyncio.run(main())
 Long-lived listener with handlers:
 
 ```python
-from agentbus import AgentBus, FileBridgeHandler, PersistentListenerHandler
+from swarmbus import AgentBus, FileBridgeHandler, PersistentListenerHandler
 
 bus = AgentBus(agent_id="planner", broker="localhost")
 bus.register_handler(FileBridgeHandler("~/sync/inbox.md"))
@@ -242,40 +242,40 @@ The CLI is the universal fallback. Every operation the MCP sidecar exposes is al
 
 ```bash
 # Send (inline body)
-agentbus send --agent-id planner --to coder --subject hello --body "Hi Coder"
+swarmbus send --agent-id planner --to coder --subject hello --body "Hi Coder"
 
 # Send with audit trail (appends to outbox.md; pair with the peer's inbox.md)
-agentbus send --agent-id planner --to coder --subject hello --body "Hi Coder" \
+swarmbus send --agent-id planner --to coder --subject hello --body "Hi Coder" \
   --outbox ~/sync/planner-outbox.md
-# Or set AGENTBUS_OUTBOX in the environment so every send logs automatically
+# Or set SWARMBUS_OUTBOX in the environment so every send logs automatically
 
 # Send from a file
-agentbus send --agent-id planner --to coder --subject report --body-file report.md
+swarmbus send --agent-id planner --to coder --subject report --body-file report.md
 
 # Send from stdin (pipe-friendly)
-cat report.md | agentbus send --agent-id planner --to coder --subject report --body-file -
+cat report.md | swarmbus send --agent-id planner --to coder --subject report --body-file -
 
 # Drain queued messages and exit (non-blocking; use ONLY when no daemon is running for this id)
-agentbus read --agent-id planner
-agentbus read --agent-id planner --json | jq '.[].subject'
+swarmbus read --agent-id planner
+swarmbus read --agent-id planner --json | jq '.[].subject'
 
 # Block until a message arrives (no-daemon contexts)
-agentbus watch --agent-id planner --timeout 60
+swarmbus watch --agent-id planner --timeout 60
 
 # Read from the daemon's inbox file with cursor tracking (use this when a daemon IS running)
-agentbus tail --agent-id planner            # new entries from the daemon's inbox file since last cursor
-agentbus tail --agent-id planner --follow   # stream — blocks until ^C
-agentbus tail --agent-id planner --consumer bot  # independent cursor
+swarmbus tail --agent-id planner            # new entries from the daemon's inbox file since last cursor
+swarmbus tail --agent-id planner --follow   # stream — blocks until ^C
+swarmbus tail --agent-id planner --consumer bot  # independent cursor
 
 # Who's online?
-agentbus list
-agentbus list --json
+swarmbus list
+swarmbus list --json
 
 # Start the listener daemon (long-running; file-bridges to inbox.md)
-agentbus start --agent-id planner --inbox ~/sync/inbox.md
+swarmbus start --agent-id planner --inbox ~/sync/inbox.md
 
 # Start the MCP sidecar for any stdio MCP client
-agentbus mcp-server --agent-id planner
+swarmbus mcp-server --agent-id planner
 ```
 
 `--body` and `--body-file` are mutually exclusive; exactly one is required.
@@ -323,7 +323,7 @@ The wire protocol is identical on a single host and across hosts — agents just
 
 ### Over Tailscale (recommended)
 
-Tailscale gives you WireGuard-encrypted, peer-authenticated connectivity between hosts with zero public exposure. agentbus needs no TLS or auth configuration on the broker because the tailnet itself is authenticated. This is the path we use between an always-on Pi (Planner + Coder + broker) and occasional peers like a laptop Claude Code session.
+Tailscale gives you WireGuard-encrypted, peer-authenticated connectivity between hosts with zero public exposure. swarmbus needs no TLS or auth configuration on the broker because the tailnet itself is authenticated. This is the path we use between an always-on Pi (Planner + Coder + broker) and occasional peers like a laptop Claude Code session.
 
 One-time broker host setup (the machine that runs mosquitto):
 
@@ -343,11 +343,11 @@ On any other tailnet-joined host running an agent, point at that broker:
 bus = AgentBus(agent_id="laptop-cc", broker="broker-host.your-tailnet.ts.net")
 
 # CLI
-agentbus start --agent-id laptop-cc \
+swarmbus start --agent-id laptop-cc \
   --broker broker-host.your-tailnet.ts.net \
   --inbox ~/sync/laptop-cc-inbox.md
 
-agentbus send --agent-id laptop-cc --to planner \
+swarmbus send --agent-id laptop-cc --to planner \
   --broker broker-host.your-tailnet.ts.net \
   --subject "hi" --body "from the laptop"
 ```
@@ -356,30 +356,30 @@ Anonymous is safe within a tailnet — the mesh is already authenticated. Never 
 
 ### Other networks
 
-If you can't use Tailscale, run mosquitto with TLS + username/password auth. The agentbus CLI doesn't yet expose TLS flags; supply them via a mosquitto client config file or use the Python API with the aiomqtt TLS parameters directly. This is out of scope for the bundled setup scripts.
+If you can't use Tailscale, run mosquitto with TLS + username/password auth. The swarmbus CLI doesn't yet expose TLS flags; supply them via a mosquitto client config file or use the Python API with the aiomqtt TLS parameters directly. This is out of scope for the bundled setup scripts.
 
 ## Troubleshooting
 
-Symptoms we hit during real deployment and the first thing to check. In every case, start with `agentbus doctor --agent-id <me>` — it turns most of this table into a one-command answer.
+Symptoms we hit during real deployment and the first thing to check. In every case, start with `swarmbus doctor --agent-id <me>` — it turns most of this table into a one-command answer.
 
 | Symptom | Likely cause | First check |
 |---|---|---|
-| Every `agentbus send` reports "Sent to X" but peer never sees the message. | Peer's daemon has stale in-memory Python (pre-upgrade code). Wire-envelope change rejected by pydantic, dropped silently. | `agentbus doctor --agent-id <peer>` → check "daemon library fresh". Fix: `systemctl --user restart agentbus-<peer>.service`. |
-| `priority=high` messages sent but no wake wrapper ever fires. | (a) CLI default is `normal` — make sure `--priority high` is actually on the send. (b) Receiver's systemd unit has no `--invoke` flag. | `agentbus doctor` → check "--invoke wired". Fix: edit `~/.config/systemd/user/agentbus-<me>.service` ExecStart to add `--invoke <wrapper-path>`, `daemon-reload`, `restart`. |
-| `agentbus list` returns nothing, but peers are running. | (a) Broker not reachable. (b) Peers' daemons crashed without `--persistent` so presence wasn't retained. | `agentbus doctor` → "broker reachable" + "peer discovery". If broker is fine, have peers restart with `--persistent` (the default on `agentbus start`). |
+| Every `swarmbus send` reports "Sent to X" but peer never sees the message. | Peer's daemon has stale in-memory Python (pre-upgrade code). Wire-envelope change rejected by pydantic, dropped silently. | `swarmbus doctor --agent-id <peer>` → check "daemon library fresh". Fix: `systemctl --user restart swarmbus-<peer>.service`. |
+| `priority=high` messages sent but no wake wrapper ever fires. | (a) CLI default is `normal` — make sure `--priority high` is actually on the send. (b) Receiver's systemd unit has no `--invoke` flag. | `swarmbus doctor` → check "--invoke wired". Fix: edit `~/.config/systemd/user/swarmbus-<me>.service` ExecStart to add `--invoke <wrapper-path>`, `daemon-reload`, `restart`. |
+| `swarmbus list` returns nothing, but peers are running. | (a) Broker not reachable. (b) Peers' daemons crashed without `--persistent` so presence wasn't retained. | `swarmbus doctor` → "broker reachable" + "peer discovery". If broker is fine, have peers restart with `--persistent` (the default on `swarmbus start`). |
 | `inbox-watch.sh` cron silently never pings operator. | Neither `TELEGRAM_BOT_TOKEN` env var nor `~/.secrets/TELEGRAM_BOT_TOKEN` file present. The script logs a skip reason to stderr (post-`aaa1823`) — but older installs silently no-op'd. | `tail ~/logs/inbox-watch-<agent>.log` for `[inbox-watch] no TELEGRAM_BOT_TOKEN...`. Fix: add the token to cron env or the secrets file. |
 | `inbox-watch.sh` never pings operator but log shows `pushed summary (1 msgs)`. | Bot is correctly sending, but to a different Telegram chat than the one the operator is watching. (Each agent typically has its own bot; all pings for agent X land in conversations with bot X.) | Check the operator's conversations with that agent's Telegram bot, not the current chat. |
 | Send errors with `[Errno 111] Connection refused`. | mosquitto isn't running (or `--broker` points at a host that can't reach 1883). | `systemctl status mosquitto` locally, or `mosquitto_pub -h <broker> -t ping -m x` from a peer host. |
-| `agentbus tail` prints old messages every time. | Cursor file was cleared (SIGKILL mid-write, manual delete, script rotation). | Check `~/.agentbus/cursors/<agent>--<consumer>.cursor`; after `aaa1823` the write is atomic, so corruption of the cursor itself is rare. |
-| `agentbus tail --follow` dies when inbox file is rotated/moved. | Pre-`0d1415a` builds didn't catch `FileNotFoundError` in the poll loop. | Upgrade agentbus + restart the `tail --follow` process. |
-| "My daemon is running but messages just pile up in the inbox file and nothing fires." | File-bridge caught the message (archive OK), but `--invoke` is either missing or broken. For Claude Code, a fresh session spawn is ~100k tokens — policy default is `priority=high` only. | `tail ~/.local/state/agentbus-wake/<agent>.log`. If you see `policy=priority-high; priority=normal; archive-only` that's working-as-designed. Override with `AGENTBUS_WAKE_POLICY=all` for testing. |
-| Restarted daemon still rejects `priority=high`. | In-process Python module cache. The `pip install` wrote new bytes, but the already-running daemon reads its old loaded module. | `systemctl --user restart agentbus-<agent>.service` (full process replacement, not `--reload`). |
+| `swarmbus tail` prints old messages every time. | Cursor file was cleared (SIGKILL mid-write, manual delete, script rotation). | Check `~/.swarmbus/cursors/<agent>--<consumer>.cursor`; after `aaa1823` the write is atomic, so corruption of the cursor itself is rare. |
+| `swarmbus tail --follow` dies when inbox file is rotated/moved. | Pre-`0d1415a` builds didn't catch `FileNotFoundError` in the poll loop. | Upgrade swarmbus + restart the `tail --follow` process. |
+| "My daemon is running but messages just pile up in the inbox file and nothing fires." | File-bridge caught the message (archive OK), but `--invoke` is either missing or broken. For Claude Code, a fresh session spawn is ~100k tokens — policy default is `priority=high` only. | `tail ~/.local/state/swarmbus-wake/<agent>.log`. If you see `policy=priority-high; priority=normal; archive-only` that's working-as-designed. Override with `SWARMBUS_WAKE_POLICY=all` for testing. |
+| Restarted daemon still rejects `priority=high`. | In-process Python module cache. The `pip install` wrote new bytes, but the already-running daemon reads its old loaded module. | `systemctl --user restart swarmbus-<agent>.service` (full process replacement, not `--reload`). |
 
-For deeper diagnosis: `systemctl --user status agentbus-<agent>.service`, `journalctl --user -u agentbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
+For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journalctl --user -u swarmbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
 
 ## Onboarding a new agent
 
-Walk-through at [docs/agent-onboarding.md](docs/agent-onboarding.md). Linear steps: pick agent-id → install → setup script → `install-systemd.sh` → `agentbus doctor` → self-probe → announce.
+Walk-through at [docs/agent-onboarding.md](docs/agent-onboarding.md). Linear steps: pick agent-id → install → setup script → `install-systemd.sh` → `swarmbus doctor` → self-probe → announce.
 
 ## License
 

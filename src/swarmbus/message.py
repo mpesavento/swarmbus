@@ -1,4 +1,4 @@
-# src/agentbus/message.py
+# src/swarmbus/message.py
 from __future__ import annotations
 
 import json
@@ -54,7 +54,7 @@ class AgentMessage(BaseModel):
     # Known values are "low", "normal", "high" (the wake wrappers gate on
     # "high"). Any other string passes through — callers may log a warning
     # if they don't recognise it, but MUST NOT drop the message. See
-    # https://github.com/mpesavento/agentbus — historical gotcha: an earlier
+    # https://github.com/mpesavento/swarmbus — historical gotcha: an earlier
     # version used Literal["normal", "urgent"], which meant priority="high"
     # from a newer peer was silently discarded by older daemons.
     priority: str = "normal"

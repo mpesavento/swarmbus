@@ -2,9 +2,9 @@
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from agentbus.bus import AgentBus
-from agentbus.message import AgentMessage
-from agentbus.handlers.base import BaseHandler
+from swarmbus.bus import AgentBus
+from swarmbus.message import AgentMessage
+from swarmbus.handlers.base import BaseHandler
 
 
 class RecordingHandler(BaseHandler):
@@ -51,7 +51,7 @@ async def test_send_publishes_to_correct_topic():
         async def publish(self, topic, payload, qos=0, retain=False):
             published.append((topic, payload))
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.send(to="wren", subject="hello", body="world")
 
     assert len(published) == 1
@@ -81,7 +81,7 @@ async def test_async_context_manager_reuses_single_client():
         async def publish(self, topic, payload, qos=0, retain=False):
             publish_calls.append(topic)
 
-    with patch("agentbus.bus.aiomqtt.Client", side_effect=lambda *a, **kw: FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", side_effect=lambda *a, **kw: FakeClient()):
         async with bus as b:
             await b.send(to="wren", subject="one", body="x")
             await b.send(to="wren", subject="two", body="y")
@@ -106,7 +106,7 @@ async def test_one_shot_send_without_context_opens_its_own_client():
         async def publish(self, *args, **kwargs):
             pass
 
-    with patch("agentbus.bus.aiomqtt.Client", side_effect=lambda *a, **kw: FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", side_effect=lambda *a, **kw: FakeClient()):
         await bus.send(to="wren", subject="hi", body="x")
         await bus.send(to="wren", subject="hi", body="x")
 
@@ -134,7 +134,7 @@ async def test_send_default_retain_is_false():
         async def publish(self, topic, payload, qos=0, retain=False):
             captured["retain"] = retain
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.send(to="wren", subject="hi", body="x")
 
     assert captured["retain"] is False
@@ -168,7 +168,7 @@ async def test_listen_retains_online_presence():
         will_args["retain"] = will.retain if will else None
         return FakeClient()
 
-    with patch("agentbus.bus.aiomqtt.Client", side_effect=_capture_client):
+    with patch("swarmbus.bus.aiomqtt.Client", side_effect=_capture_client):
         await bus.listen()
 
     online = [p for p in published if p["topic"] == "agents/sparrow/presence"]
@@ -190,7 +190,7 @@ async def test_send_broadcast_uses_correct_topic():
         async def publish(self, topic, payload, qos=0, retain=False):
             published.append(topic)
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.send(to="broadcast", subject="all", body="hello everyone")
 
     assert published[0] == "agents/broadcast"  # not agents/broadcast/inbox
@@ -222,7 +222,7 @@ async def test_listen_dispatches_to_handlers():
                 yield FakeMessage()
             return _gen()
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.listen()
 
     assert len(handler.received) == 1
@@ -254,7 +254,7 @@ async def test_listen_skips_invalid_envelope():
                 yield FakeBadMessage()
             return _gen()
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.listen()  # must not raise
 
     assert handler.received == []  # invalid message discarded
@@ -299,8 +299,8 @@ async def test_listen_reconnects_on_mqtt_error():
     def _client_factory(*args, **kwargs):
         return call_sequence.pop(0)
 
-    with patch("agentbus.bus.aiomqtt.Client", side_effect=_client_factory), \
-         patch("agentbus.bus.asyncio.sleep", new=AsyncMock()):  # don't actually wait
+    with patch("swarmbus.bus.aiomqtt.Client", side_effect=_client_factory), \
+         patch("swarmbus.bus.asyncio.sleep", new=AsyncMock()):  # don't actually wait
         await bus.listen(reconnect_initial=0.01)
 
     assert len(handler.received) == 1
@@ -339,7 +339,7 @@ async def test_listen_continues_after_handler_exception():
                 yield FakeMessage()
             return _gen()
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.listen()  # must not raise
 
     assert len(ok_handler.received) == 1  # ok_handler still ran
@@ -380,7 +380,7 @@ async def test_listen_preserves_handler_registration_order():
                 yield FakeMessage()
             return _gen()
 
-    with patch("agentbus.bus.aiomqtt.Client", return_value=FakeClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
         await bus.listen()
 
     assert order_recorded == ["A", "B", "C"]

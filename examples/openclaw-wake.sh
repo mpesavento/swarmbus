@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # examples/openclaw-wake.sh
 #
-# DirectInvocationHandler wrapper that turns an agentbus message into a
+# DirectInvocationHandler wrapper that turns an swarmbus message into a
 # real OpenClaw agent turn. Use this to get reactive push delivery:
 # every inbound message wakes the agent, no polling, no cron.
 #
 # Wire it in via --invoke on the listener daemon:
 #
-#   agentbus start \
+#   swarmbus start \
 #     --agent-id coder \
 #     --inbox ~/sync/coder-inbox.md \
-#     --invoke "$HOME/projects/agentbus/examples/openclaw-wake.sh coder"
+#     --invoke "$HOME/projects/swarmbus/examples/openclaw-wake.sh coder"
 #
 # Arguments:
 #   $1  OpenClaw agent id (e.g. "main", "coder", "ops"). Required.
 #
 # Env vars (set by DirectInvocationHandler):
-#   AGENTBUS_FROM, AGENTBUS_SUBJECT, AGENTBUS_REPLY_TO, AGENTBUS_CONTENT_TYPE, …
+#   SWARMBUS_FROM, SWARMBUS_SUBJECT, SWARMBUS_REPLY_TO, SWARMBUS_CONTENT_TYPE, …
 #
 # SECURITY NOTE. Envelope fields and body both come from peer agents and
 # must be treated as untrusted. The header below is explicitly labelled so
@@ -38,9 +38,9 @@ sanitize() {
 }
 
 body=$(cat)
-safe_from=$(sanitize "${AGENTBUS_FROM:-?}" 64)
-safe_subject=$(sanitize "${AGENTBUS_SUBJECT:-?}" 200)
-safe_reply_to=$(sanitize "${AGENTBUS_REPLY_TO:-}" 64)
+safe_from=$(sanitize "${SWARMBUS_FROM:-?}" 64)
+safe_subject=$(sanitize "${SWARMBUS_SUBJECT:-?}" 200)
+safe_reply_to=$(sanitize "${SWARMBUS_REPLY_TO:-}" 64)
 
 # Build the prompt as a single here-doc for clarity.
 prompt=$(cat <<PROMPT

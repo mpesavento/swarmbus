@@ -1,7 +1,7 @@
 import asyncio
 import pytest
-from agentbus.handlers.persistent import PersistentListenerHandler
-from agentbus.message import AgentMessage
+from swarmbus.handlers.persistent import PersistentListenerHandler
+from swarmbus.message import AgentMessage
 
 
 @pytest.fixture

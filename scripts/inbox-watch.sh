@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/inbox-watch.sh
 #
-# Cron-driven watcher for an agentbus inbox. When new entries have appeared
+# Cron-driven watcher for an swarmbus inbox. When new entries have appeared
 # since the last run, push a short summary to the human operator via
 # Telegram. Does NOT wake the agent itself — that's what the reactive
 # wake wrappers (examples/claude-code-wake.sh, examples/openclaw-wake.sh)
@@ -91,7 +91,7 @@ if [ ! -f "$INBOX" ]; then
   exit 0
 fi
 
-# Cursor format: "<offset> <inode>" — shared with agentbus tail.
+# Cursor format: "<offset> <inode>" — shared with swarmbus tail.
 cursor=0
 stored_inode=""
 if [ -f "$CURSOR_FILE" ]; then
@@ -134,7 +134,7 @@ if [ "$n_messages" -gt 5 ]; then
   more=$(printf '\n... and %d more' "$((n_messages - 5))")
 fi
 msg=$(cat <<END
-🪶 ${AGENT_ID} inbox: ${n_messages} new from agentbus peers since last check
+🪶 ${AGENT_ID} inbox: ${n_messages} new from swarmbus peers since last check
 
 ${head_block}${more}
 

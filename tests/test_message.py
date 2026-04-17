@@ -1,7 +1,7 @@
 # tests/test_message.py
 import json
 import pytest
-from agentbus.message import AgentMessage
+from swarmbus.message import AgentMessage
 
 def test_create_sets_id_and_ts():
     msg = AgentMessage.create(

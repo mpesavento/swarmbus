@@ -1,4 +1,4 @@
-# src/agentbus/__init__.py
+# src/swarmbus/__init__.py
 __version__ = "0.1.0"
 
 from .bus import AgentBus

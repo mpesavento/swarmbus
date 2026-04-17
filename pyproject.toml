@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentbus"
+name = "swarmbus"
 version = "0.1.0"
 description = "Reactive pub/sub messaging for AI agents via MQTT"
 readme = "README.md"
@@ -39,14 +39,14 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mpesavento/agentbus"
-Repository = "https://github.com/mpesavento/agentbus"
+Homepage = "https://github.com/mpesavento/swarmbus"
+Repository = "https://github.com/mpesavento/swarmbus"
 
 [project.scripts]
-agentbus = "agentbus.cli:main"
+swarmbus = "swarmbus.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentbus"]
+packages = ["src/swarmbus"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

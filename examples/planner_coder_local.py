@@ -9,9 +9,9 @@ Run in two terminals:
 """
 import asyncio
 import sys
-from agentbus import AgentBus, FileBridgeHandler, PersistentListenerHandler
-from agentbus.handlers.base import BaseHandler
-from agentbus.message import AgentMessage
+from swarmbus import AgentBus, FileBridgeHandler, PersistentListenerHandler
+from swarmbus.handlers.base import BaseHandler
+from swarmbus.message import AgentMessage
 
 
 class PrintHandler(BaseHandler):
@@ -41,7 +41,7 @@ async def run_agent(agent_id: str, peer_id: str) -> None:
     await bus.send(
         to=peer_id,
         subject="code sample",
-        body="Here's a snippet:\n```python\nprint('hello from agentbus')\n```",
+        body="Here's a snippet:\n```python\nprint('hello from swarmbus')\n```",
         content_type="text/markdown",
     )
 

@@ -11,9 +11,9 @@ Usage:
 import asyncio
 import os
 import sys
-from agentbus import AgentBus, PersistentListenerHandler
-from agentbus.handlers.base import BaseHandler
-from agentbus.message import AgentMessage
+from swarmbus import AgentBus, PersistentListenerHandler
+from swarmbus.handlers.base import BaseHandler
+from swarmbus.message import AgentMessage
 
 BROKER = os.environ.get("BROKER", "localhost")
 

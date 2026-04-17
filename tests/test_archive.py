@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
-from agentbus.archive import SQLiteArchive
-from agentbus.message import AgentMessage
+from swarmbus.archive import SQLiteArchive
+from swarmbus.message import AgentMessage
 
 
 @pytest.fixture

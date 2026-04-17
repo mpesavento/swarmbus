@@ -12,8 +12,8 @@ from unittest.mock import patch
 
 import aiomqtt
 
-from agentbus.bus import AgentBus
-from agentbus.message import AgentMessage
+from swarmbus.bus import AgentBus
+from swarmbus.message import AgentMessage
 
 
 class _FakeMsg:
@@ -70,7 +70,7 @@ def _envelope(**overrides) -> bytes:
 @pytest.mark.asyncio
 async def test_read_inbox_returns_valid_envelopes():
     payloads = [_envelope(subject="one"), _envelope(subject="two")]
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus(agent_id="me")
         result = await bus.read_inbox(drain_timeout=0.1)
     assert len(result) == 2
@@ -81,7 +81,7 @@ async def test_read_inbox_returns_valid_envelopes():
 @pytest.mark.asyncio
 async def test_read_inbox_respects_max_messages():
     payloads = [_envelope(subject=f"m{i}") for i in range(5)]
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus(agent_id="me")
         result = await bus.read_inbox(max_messages=3, drain_timeout=0.2)
     assert len(result) == 3
@@ -90,7 +90,7 @@ async def test_read_inbox_respects_max_messages():
 @pytest.mark.asyncio
 async def test_read_inbox_skips_malformed_envelopes():
     payloads = [b"not even json", _envelope(subject="good"), b'{"partial": 1}']
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus(agent_id="me")
         result = await bus.read_inbox(drain_timeout=0.1)
     assert len(result) == 1
@@ -102,7 +102,7 @@ async def test_read_inbox_broker_error_raises():
     """CLI contract depends on this: MqttError must propagate so the CLI
     layer can print a clean error and exit 2 (instead of confusing broker-down
     with empty-inbox). MCP callers catch it at the tool boundary."""
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_BadClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_BadClient()):
         bus = AgentBus(agent_id="me")
         with pytest.raises(aiomqtt.MqttError):
             await bus.read_inbox(drain_timeout=0.1)
@@ -111,7 +111,7 @@ async def test_read_inbox_broker_error_raises():
 @pytest.mark.asyncio
 async def test_read_inbox_timeout_returns_what_it_has():
     payloads: list[bytes] = []  # nothing to yield → hits timeout
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus(agent_id="me")
         result = await bus.read_inbox(drain_timeout=0.05)
     assert result == []
@@ -125,7 +125,7 @@ async def test_read_inbox_timeout_returns_what_it_has():
 @pytest.mark.asyncio
 async def test_watch_inbox_returns_first_valid_envelope():
     payloads = [_envelope(subject="first"), _envelope(subject="second")]
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus(agent_id="me")
         result = await bus.watch_inbox(timeout=0.2)
     assert result is not None
@@ -135,7 +135,7 @@ async def test_watch_inbox_returns_first_valid_envelope():
 @pytest.mark.asyncio
 async def test_watch_inbox_skips_malformed_then_returns_good():
     payloads = [b"garbage", _envelope(subject="good")]
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus(agent_id="me")
         result = await bus.watch_inbox(timeout=0.2)
     assert result is not None
@@ -144,7 +144,7 @@ async def test_watch_inbox_skips_malformed_then_returns_good():
 
 @pytest.mark.asyncio
 async def test_watch_inbox_timeout_returns_none():
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient([])):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient([])):
         bus = AgentBus(agent_id="me")
         result = await bus.watch_inbox(timeout=0.05)
     assert result is None
@@ -153,7 +153,7 @@ async def test_watch_inbox_timeout_returns_none():
 @pytest.mark.asyncio
 async def test_watch_inbox_broker_error_raises():
     """Same contract as read_inbox: MqttError propagates."""
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_BadClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_BadClient()):
         bus = AgentBus(agent_id="me")
         with pytest.raises(aiomqtt.MqttError):
             await bus.watch_inbox(timeout=0.1)
@@ -161,7 +161,7 @@ async def test_watch_inbox_broker_error_raises():
 
 @pytest.mark.asyncio
 async def test_list_agents_broker_error_raises():
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_BadClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_BadClient()):
         bus = AgentBus.probe()
         with pytest.raises(aiomqtt.MqttError):
             await bus.list_agents(collect_window=0.1)
@@ -179,7 +179,7 @@ async def test_list_agents_filters_offline():
         json.dumps({"agent": "wren", "status": "online"}).encode(),
         json.dumps({"agent": "ghost", "status": "offline"}).encode(),
     ]
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
         bus = AgentBus.probe()
         result = await bus.list_agents(collect_window=0.1)
     assert result == ["sparrow", "wren"]
@@ -213,7 +213,7 @@ class _NullPublishClient:
 @pytest.mark.asyncio
 async def test_send_appends_to_outbox(tmp_path):
     outbox = tmp_path / "outbox.md"
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
         bus = AgentBus(agent_id="sparrow")
         await bus.send(
             to="wren",
@@ -230,7 +230,7 @@ async def test_send_appends_to_outbox(tmp_path):
 @pytest.mark.asyncio
 async def test_send_outbox_creates_parent_dirs(tmp_path):
     outbox = tmp_path / "nested" / "sparrow-outbox.md"
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
         bus = AgentBus(agent_id="sparrow")
         await bus.send(to="wren", subject="x", body="y", outbox_path=str(outbox))
     assert outbox.exists()
@@ -240,7 +240,7 @@ async def test_send_outbox_creates_parent_dirs(tmp_path):
 async def test_send_outbox_disabled_when_unset(tmp_path):
     """No outbox_path → no file written; confirms the append is opt-in."""
     outbox = tmp_path / "should_not_exist.md"
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
         bus = AgentBus(agent_id="sparrow")
         await bus.send(to="wren", subject="x", body="y")
     assert not outbox.exists()
@@ -269,10 +269,10 @@ async def test_listen_persistent_passes_stable_identifier_and_clean_session():
                     yield  # make generator
             return _empty()
 
-    with patch("agentbus.bus.aiomqtt.Client", _ClientStub):
+    with patch("swarmbus.bus.aiomqtt.Client", _ClientStub):
         bus = AgentBus(agent_id="sparrow", persistent=True)
         await bus.listen()
-    assert captured_kwargs.get("identifier") == "agentbus-sparrow"
+    assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
     assert captured_kwargs.get("clean_session") is False
 
 
@@ -298,7 +298,7 @@ async def test_listen_non_persistent_omits_identifier():
                     yield
             return _empty()
 
-    with patch("agentbus.bus.aiomqtt.Client", _ClientStub):
+    with patch("swarmbus.bus.aiomqtt.Client", _ClientStub):
         bus = AgentBus(agent_id="sparrow", persistent=False)
         await bus.listen()
     assert "identifier" not in captured_kwargs
@@ -309,7 +309,7 @@ async def test_listen_non_persistent_omits_identifier():
 async def test_send_outbox_agent_id_template_substitutes(tmp_path):
     """`{agent_id}` in outbox_path → replaced with the bus's agent_id."""
     template = str(tmp_path / "{agent_id}-outbox.md")
-    with patch("agentbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
         bus_s = AgentBus(agent_id="sparrow")
         await bus_s.send(to="wren", subject="s", body="b1", outbox_path=template)
         bus_w = AgentBus(agent_id="wren")

@@ -1,27 +1,27 @@
-# agentbus systemd user unit — TEMPLATE
+# swarmbus systemd user unit — TEMPLATE
 #
 # Render with scripts/install-systemd.sh <agent-id> [<wake-wrapper-path>]
-# or by hand: copy to ~/.config/systemd/user/agentbus-<agent-id>.service
-# and replace @AGENT_ID@, @HOME@, @BROKER@, @INBOX@, @INVOKE@, @AGENTBUS_PATH@.
+# or by hand: copy to ~/.config/systemd/user/swarmbus-<agent-id>.service
+# and replace @AGENT_ID@, @HOME@, @BROKER@, @INBOX@, @INVOKE@, @SWARMBUS_PATH@.
 #
 # After installing:
 #   export XDG_RUNTIME_DIR=/run/user/$(id -u)
 #   export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
 #   systemctl --user daemon-reload
-#   systemctl --user enable agentbus-<agent-id>.service
-#   systemctl --user start agentbus-<agent-id>.service
+#   systemctl --user enable swarmbus-<agent-id>.service
+#   systemctl --user start swarmbus-<agent-id>.service
 #   loginctl enable-linger $(whoami)   # survive logout / reboot
-#   agentbus doctor --agent-id <agent-id>   # verify
+#   swarmbus doctor --agent-id <agent-id>   # verify
 
 [Unit]
-Description=agentbus listener daemon for @AGENT_ID@ (file bridge + reactive wake on priority=high)
+Description=swarmbus listener daemon for @AGENT_ID@ (file bridge + reactive wake on priority=high)
 After=network.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 
-# PATH needs to reach the `agentbus` CLI + (if --invoke) the wake wrapper's
+# PATH needs to reach the `swarmbus` CLI + (if --invoke) the wake wrapper's
 # dependencies (`claude`, `openclaw`, …). systemd's default user env is
 # minimal; put ~/.local/bin at the front.
 Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
@@ -29,9 +29,9 @@ Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Outbox env — the daemon itself doesn't emit, but any child process the
 # --invoke wrapper spawns inherits this. Set here once so individual
 # agent sessions don't have to.
-Environment=AGENTBUS_OUTBOX_@AGENT_ID_UPPER@=@HOME@/sync/@AGENT_ID@-outbox.md
+Environment=SWARMBUS_OUTBOX_@AGENT_ID_UPPER@=@HOME@/sync/@AGENT_ID@-outbox.md
 
-ExecStart=@AGENTBUS_PATH@ start \
+ExecStart=@SWARMBUS_PATH@ start \
   --agent-id @AGENT_ID@ \
   --broker @BROKER@ \
   --inbox @INBOX@ \
@@ -42,8 +42,8 @@ RestartSec=5s
 
 # Logs to the operator's chosen location. Default: ~/sparrow-workspace/logs
 # or wherever the agent's own log dir is. Override via rendering.
-StandardOutput=append:@HOME@/logs/agentbus-@AGENT_ID@.log
-StandardError=append:@HOME@/logs/agentbus-@AGENT_ID@.log
+StandardOutput=append:@HOME@/logs/swarmbus-@AGENT_ID@.log
+StandardError=append:@HOME@/logs/swarmbus-@AGENT_ID@.log
 
 [Install]
 WantedBy=default.target

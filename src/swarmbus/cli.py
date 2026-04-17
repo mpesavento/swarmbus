@@ -17,28 +17,28 @@ from .handlers.persistent import PersistentListenerHandler
 
 @click.group()
 def main() -> None:
-    """agentbus — reactive MQTT messaging for AI agents."""
+    """swarmbus — reactive MQTT messaging for AI agents."""
 
 
 def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
     """Resolve the outbox path with this precedence:
 
     1. `--outbox` flag (passed in `explicit`) — highest.
-    2. `AGENTBUS_OUTBOX_<UPPER_AGENT_ID>` — agent-scoped env var. Hyphens in
-       the agent-id become underscores so `coder-beta` → `AGENTBUS_OUTBOX_CODER_BETA`.
-    3. `AGENTBUS_OUTBOX` — shared env var. Supports `{agent_id}` template.
+    2. `SWARMBUS_OUTBOX_<UPPER_AGENT_ID>` — agent-scoped env var. Hyphens in
+       the agent-id become underscores so `coder-beta` → `SWARMBUS_OUTBOX_CODER_BETA`.
+    3. `SWARMBUS_OUTBOX` — shared env var. Supports `{agent_id}` template.
     4. None — no archive.
 
-    The agent-scoped form exists so shells that leak a plain `AGENTBUS_OUTBOX`
+    The agent-scoped form exists so shells that leak a plain `SWARMBUS_OUTBOX`
     to multiple agent processes can still pin each agent to its own file.
     """
     if explicit is not None:
         return explicit
-    scoped_key = "AGENTBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
+    scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
     scoped = os.environ.get(scoped_key)
     if scoped is not None:
         return scoped
-    return os.environ.get("AGENTBUS_OUTBOX")
+    return os.environ.get("SWARMBUS_OUTBOX")
 
 
 @main.command()
@@ -77,7 +77,7 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
     default=None,
     help="Append each sent message to this file (audit trail). Supports "
          "`{agent_id}` template. Resolution order: --outbox > "
-         "AGENTBUS_OUTBOX_<UPPER_AGENT_ID> > AGENTBUS_OUTBOX.",
+         "SWARMBUS_OUTBOX_<UPPER_AGENT_ID> > SWARMBUS_OUTBOX.",
 )
 @click.pass_context
 def send(
@@ -100,10 +100,10 @@ def send(
     Use '--body-file -' to read from stdin:
 
     \b
-    agentbus send --agent-id planner --to coder --subject report --body "short text"
-    agentbus send --agent-id planner --to coder --subject report --body-file report.md
-    agentbus send --agent-id planner --to coder --subject report --body-file -
-    cat report.md | agentbus send --agent-id planner --to coder --subject report --body-file -
+    swarmbus send --agent-id planner --to coder --subject report --body "short text"
+    swarmbus send --agent-id planner --to coder --subject report --body-file report.md
+    swarmbus send --agent-id planner --to coder --subject report --body-file -
+    cat report.md | swarmbus send --agent-id planner --to coder --subject report --body-file -
     """
     if body is not None and body_file is not None:
         raise click.UsageError("--body and --body-file are mutually exclusive")
@@ -126,7 +126,7 @@ def send(
             outbox_path=resolved_outbox,
         ))
     except aiomqtt.MqttError as exc:
-        click.echo(f"[agentbus] broker unreachable ({broker}:{port}): {exc}", err=True)
+        click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
         sys.exit(2)
     click.echo(f"Sent to {to_agent}")
 
@@ -143,7 +143,7 @@ def send(
     show_default=True,
     help="Use an MQTT persistent session so queued QoS1 messages survive "
          "daemon restarts. Disable only if another process holds the same "
-         "`agentbus-<id>` client identifier.",
+         "`swarmbus-<id>` client identifier.",
 )
 def start(
     agent_id: str,
@@ -153,7 +153,7 @@ def start(
     invoke_cmd: str | None,
     persistent: bool,
 ) -> None:
-    """Start the agentbus listener daemon."""
+    """Start the swarmbus listener daemon."""
     from . import __version__
 
     bus = AgentBus(agent_id=agent_id, broker=broker, port=port, persistent=persistent)
@@ -169,19 +169,19 @@ def start(
     # diagnose "why didn't my agent react" mysteries without a manual
     # inspection of the systemd unit. Pulled from the same args the
     # daemon was actually launched with.
-    click.echo(f"[agentbus] {agent_id} ready")
+    click.echo(f"[swarmbus] {agent_id} ready")
     click.echo(f"  version:     {__version__}")
     click.echo(f"  broker:      {broker}:{port}")
     click.echo(f"  persistent:  {'yes' if persistent else 'no'}")
     click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
     click.echo(f"  invoke:      {invoke_cmd or '(unset — no reactive wake)'}")
-    scoped_key = "AGENTBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
-    outbox_env = os.environ.get(scoped_key) or os.environ.get("AGENTBUS_OUTBOX") or "(unset)"
+    scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
+    outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX") or "(unset)"
     click.echo(f"  outbox env:  {outbox_env}")
     try:
         bus.run()
     except KeyboardInterrupt:
-        click.echo("\n[agentbus] shutting down")
+        click.echo("\n[swarmbus] shutting down")
 
 
 @main.command()
@@ -197,25 +197,25 @@ def read(agent_id: str, broker: str, port: int, max_messages: int, as_json: bool
     only messages sent with `retain=True` — non-retained directed sends
     (the default) that arrived while no subscriber was connected are
     already gone. For durable delivery, keep a listener daemon up:
-    `agentbus start --agent-id <me> --inbox <path>`.
+    `swarmbus start --agent-id <me> --inbox <path>`.
 
     Exit 0 always (empty inbox is not an error).
 
     \b
-    agentbus read --agent-id planner
-    agentbus read --agent-id planner --json | jq '.[] | .subject'
+    swarmbus read --agent-id planner
+    swarmbus read --agent-id planner --json | jq '.[] | .subject'
     """
     bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
     try:
         messages = asyncio.run(bus.read_inbox(max_messages=max_messages))
     except aiomqtt.MqttError as exc:
-        click.echo(f"[agentbus] broker unreachable ({broker}:{port}): {exc}", err=True)
+        click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
         sys.exit(2)
     if as_json:
         click.echo(json.dumps(messages, indent=2))
         return
     if not messages:
-        click.echo(f"[agentbus] {agent_id}: inbox empty")
+        click.echo(f"[swarmbus] {agent_id}: inbox empty")
         return
     for m in messages:
         click.echo(f"--- from {m['from']} @ {m['ts']} ---")
@@ -245,16 +245,16 @@ def watch(agent_id: str, broker: str, port: int, timeout: float, as_json: bool) 
     shell pipelines when you want to wait for a specific reply.
 
     \b
-    agentbus watch --agent-id planner --timeout 60
+    swarmbus watch --agent-id planner --timeout 60
     """
     bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
     except aiomqtt.MqttError as exc:
-        click.echo(f"[agentbus] broker unreachable ({broker}:{port}): {exc}", err=True)
+        click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
         sys.exit(2)
     if msg is None:
-        click.echo(f"[agentbus] {agent_id}: timeout after {timeout}s", err=True)
+        click.echo(f"[swarmbus] {agent_id}: timeout after {timeout}s", err=True)
         sys.exit(1)
     if as_json:
         click.echo(json.dumps(msg, indent=2))
@@ -275,20 +275,20 @@ def list_agents_cmd(broker: str, port: int, as_json: bool) -> None:
     """List agent IDs currently online on the broker.
 
     \b
-    agentbus list
-    agentbus list --json
+    swarmbus list
+    swarmbus list --json
     """
     bus = AgentBus.probe(broker=broker, port=port)
     try:
         agents = asyncio.run(bus.list_agents())
     except aiomqtt.MqttError as exc:
-        click.echo(f"[agentbus] broker unreachable ({broker}:{port}): {exc}", err=True)
+        click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
         sys.exit(2)
     if as_json:
         click.echo(json.dumps(agents))
         return
     if not agents:
-        click.echo("[agentbus] no agents online")
+        click.echo("[swarmbus] no agents online")
         return
     for a in agents:
         click.echo(a)
@@ -313,7 +313,7 @@ def list_agents_cmd(broker: str, port: int, as_json: bool) -> None:
 @click.option(
     "--cursor-dir",
     default=None,
-    help="Directory for cursor files. Defaults to ~/.agentbus/cursors/.",
+    help="Directory for cursor files. Defaults to ~/.swarmbus/cursors/.",
 )
 @click.option(
     "--follow", "-f",
@@ -335,10 +335,10 @@ def tail(
 ) -> None:
     """Read new entries from the daemon's inbox file, advancing a cursor.
 
-    Companion to `agentbus start --inbox`: the daemon is the sole MQTT
-    subscriber, `agentbus tail` reads the file it produces. This is how
+    Companion to `swarmbus start --inbox`: the daemon is the sole MQTT
+    subscriber, `swarmbus tail` reads the file it produces. This is how
     you read messages when a daemon is already running — avoids the
-    race that `agentbus read` would create by subscribing to the same
+    race that `swarmbus read` would create by subscribing to the same
     topic as the daemon.
 
     Polling-based --follow (0.5s interval) is intentional: we stay
@@ -348,9 +348,9 @@ def tail(
     sub-100ms UI refresh.
 
     \b
-    agentbus tail --agent-id planner              # read new lines since last call
-    agentbus tail --agent-id planner --follow     # block; stream new content
-    agentbus tail --agent-id planner --consumer bot   # separate cursor
+    swarmbus tail --agent-id planner              # read new lines since last call
+    swarmbus tail --agent-id planner --follow     # block; stream new content
+    swarmbus tail --agent-id planner --consumer bot   # separate cursor
     """
     import os
     import re
@@ -361,19 +361,19 @@ def tail(
     # callers might pass user-derived strings; cheap defence in depth.
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", consumer):
         click.echo(
-            f"[agentbus] invalid --consumer {consumer!r}: must match "
+            f"[swarmbus] invalid --consumer {consumer!r}: must match "
             f"[A-Za-z0-9_-]{{1,64}}",
             err=True,
         )
         sys.exit(2)
 
     inbox_path = Path(inbox).expanduser() if inbox else Path.home() / "sync" / f"{agent_id}-inbox.md"
-    cursors_root = Path(cursor_dir).expanduser() if cursor_dir else Path.home() / ".agentbus" / "cursors"
+    cursors_root = Path(cursor_dir).expanduser() if cursor_dir else Path.home() / ".swarmbus" / "cursors"
     cursors_root.mkdir(parents=True, exist_ok=True)
     cursor_file = cursors_root / f"{agent_id}--{consumer}.cursor"
 
     if not inbox_path.exists():
-        click.echo(f"[agentbus] inbox does not exist: {inbox_path}", err=True)
+        click.echo(f"[swarmbus] inbox does not exist: {inbox_path}", err=True)
         sys.exit(2)
 
     def _read_cursor() -> tuple[int, int | None]:
@@ -392,7 +392,7 @@ def tail(
             # Corrupt/empty cursor — re-emit from start. Loud enough to notice
             # if it happens, quiet enough not to crash a follower loop.
             click.echo(
-                f"[agentbus] cursor {cursor_file} unreadable; restarting from offset 0",
+                f"[swarmbus] cursor {cursor_file} unreadable; restarting from offset 0",
                 err=True,
             )
             return 0, None
@@ -429,14 +429,14 @@ def tail(
         start, stored_inode = _read_cursor()
         if stored_inode is not None and stored_inode != current_inode:
             click.echo(
-                f"[agentbus] inbox inode changed "
+                f"[swarmbus] inbox inode changed "
                 f"({stored_inode} → {current_inode}); re-reading from 0",
                 err=True,
             )
             start = 0
         elif size < start:
             # Same inode but file was truncated in place (copytruncate style).
-            click.echo(f"[agentbus] inbox shrank ({size} < cursor {start}); resetting", err=True)
+            click.echo(f"[swarmbus] inbox shrank ({size} < cursor {start}); resetting", err=True)
             start = 0
         if size == start:
             # Still update the cursor to record the current inode in case this
@@ -472,7 +472,7 @@ def tail(
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
 def doctor(agent_id: str | None, broker: str, port: int) -> None:
-    """Run a self-diagnosis of the local agentbus install + daemon state.
+    """Run a self-diagnosis of the local swarmbus install + daemon state.
 
     Prints a checklist of 7 probes: CLI version, broker reachability, my
     systemd unit state, daemon library freshness (catches stale in-memory
@@ -502,16 +502,16 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
 
     # 1. CLI version
     try:
-        import agentbus as _ab
+        import swarmbus as _ab
         pkg_path = Path(_ab.__file__).parent
         results.append((
-            f"agentbus CLI version.... {__version__} at {pkg_path}",
+            f"swarmbus CLI version.... {__version__} at {pkg_path}",
             "ok",
             None,
         ))
     except Exception as exc:
-        results.append((f"agentbus CLI version.... ERROR {exc}", "fail",
-                        "pip install -e /path/to/agentbus (editable install recommended)"))
+        results.append((f"swarmbus CLI version.... ERROR {exc}", "fail",
+                        "pip install -e /path/to/swarmbus (editable install recommended)"))
 
     # 2. Broker reachability
     try:
@@ -526,7 +526,7 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
                         f"systemctl status mosquitto  (or point --broker at a reachable host)"))
 
     # 3. Systemd daemon state
-    unit_name = f"agentbus-{agent_id_resolved}.service"
+    unit_name = f"swarmbus-{agent_id_resolved}.service"
     try:
         env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
                "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
@@ -635,8 +635,8 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
         results.append(("--invoke wired.......... (no unit to inspect)", "skip", None))
 
     # 6. Outbox env var resolvable
-    scoped_key = "AGENTBUS_OUTBOX_" + agent_id_resolved.replace("-", "_").upper()
-    outbox_env = os.environ.get(scoped_key) or os.environ.get("AGENTBUS_OUTBOX")
+    scoped_key = "SWARMBUS_OUTBOX_" + agent_id_resolved.replace("-", "_").upper()
+    outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX")
     if outbox_env:
         resolved = outbox_env.replace("{agent_id}", agent_id_resolved)
         try:
@@ -657,8 +657,8 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
         results.append((
             "outbox env resolvable... (unset)",
             "warn",
-            f"export AGENTBUS_OUTBOX_{agent_id_resolved.upper()}=~/sync/"
-            f"{agent_id_resolved}-outbox.md   (or AGENTBUS_OUTBOX with "
+            f"export SWARMBUS_OUTBOX_{agent_id_resolved.upper()}=~/sync/"
+            f"{agent_id_resolved}-outbox.md   (or SWARMBUS_OUTBOX with "
             f"{{agent_id}} template)",
         ))
 
@@ -685,7 +685,7 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
         results.append((f"peer discovery.......... ERROR {exc}", "fail", None))
 
     # Render
-    click.echo(f"\n[doctor] agentbus health check for agent-id={agent_id_resolved}\n")
+    click.echo(f"\n[doctor] swarmbus health check for agent-id={agent_id_resolved}\n")
     icon = {"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·"}
     fails = warns = 0
     for i, (label, status, hint) in enumerate(results, 1):
@@ -710,25 +710,25 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
 
 def _detect_agent_id() -> str:
     """Best-effort agent-id detection: look for an active systemd user
-    unit named agentbus-*.service. Error out if ambiguous or none."""
+    unit named swarmbus-*.service. Error out if ambiguous or none."""
     import subprocess
     env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
            "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
     res = subprocess.run(
         ["systemctl", "--user", "list-units", "--type=service", "--no-legend",
-         "--no-pager", "agentbus-*.service"],
+         "--no-pager", "swarmbus-*.service"],
         capture_output=True, text=True, env=env, timeout=3,
     )
     units = [line.split()[0] for line in res.stdout.strip().splitlines() if line.strip()]
     candidates = []
     for u in units:
-        if u.startswith("agentbus-") and u.endswith(".service"):
-            candidates.append(u[len("agentbus-"):-len(".service")])
+        if u.startswith("swarmbus-") and u.endswith(".service"):
+            candidates.append(u[len("swarmbus-"):-len(".service")])
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
-        raise RuntimeError(f"multiple agentbus units running ({candidates}); pass --agent-id")
-    raise RuntimeError("no agentbus-*.service unit detected")
+        raise RuntimeError(f"multiple swarmbus units running ({candidates}); pass --agent-id")
+    raise RuntimeError("no swarmbus-*.service unit detected")
 
 
 @main.command("mcp-server")

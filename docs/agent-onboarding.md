@@ -1,8 +1,8 @@
-# Agent onboarding — bringing a new agent onto agentbus
+# Agent onboarding — bringing a new agent onto swarmbus
 
-This is the linear walk-through for getting a new agent (Claude Code, OpenClaw, or a custom shell/Python agent) fully wired into agentbus: receiving messages, archiving both directions, and waking reactively on `priority=high`.
+This is the linear walk-through for getting a new agent (Claude Code, OpenClaw, or a custom shell/Python agent) fully wired into swarmbus: receiving messages, archiving both directions, and waking reactively on `priority=high`.
 
-Follow the steps in order. After each step, either run `agentbus doctor --agent-id <me>` for the automated checklist, or do the verification shown inline.
+Follow the steps in order. After each step, either run `swarmbus doctor --agent-id <me>` for the automated checklist, or do the verification shown inline.
 
 If any step fails, jump to the README's [Troubleshooting](../README.md#troubleshooting) section.
 
@@ -28,18 +28,18 @@ AGENT_ID=my-agent    # change me
 
 ---
 
-## 2. Install agentbus
+## 2. Install swarmbus
 
 ```bash
-pip install "agentbus[mcp]"              # or
-pip install -e /path/to/agentbus         # editable, for contributors
+pip install "swarmbus[mcp]"              # or
+pip install -e /path/to/swarmbus         # editable, for contributors
 ```
 
 Verify:
 
 ```bash
-agentbus --help
-# expect: Usage: agentbus [OPTIONS] COMMAND [ARGS]...
+swarmbus --help
+# expect: Usage: swarmbus [OPTIONS] COMMAND [ARGS]...
 ```
 
 ---
@@ -72,18 +72,18 @@ Don't use `nohup` — it dies on SIGHUP when your shell closes. Use the shipped 
 
 ```bash
 bash scripts/install-systemd.sh "$AGENT_ID" \
-  --invoke "$HOME/projects/agentbus/examples/claude-code-wake.sh $AGENT_ID"
+  --invoke "$HOME/projects/swarmbus/examples/claude-code-wake.sh $AGENT_ID"
 #   for OpenClaw, use:
-#   --invoke "$HOME/projects/agentbus/examples/openclaw-wake.sh <openclaw-agent-name>"
+#   --invoke "$HOME/projects/swarmbus/examples/openclaw-wake.sh <openclaw-agent-name>"
 #   omit --invoke entirely to run as archive-only (no reactive wake)
 ```
 
 The script:
 1. Renders the systemd template with your paths.
-2. Installs at `~/.config/systemd/user/agentbus-<id>.service`.
+2. Installs at `~/.config/systemd/user/swarmbus-<id>.service`.
 3. `systemctl --user daemon-reload && enable && restart`.
 4. Prints the unit status.
-5. Runs `agentbus doctor` automatically for verification.
+5. Runs `swarmbus doctor` automatically for verification.
 
 If `loginctl show-user $(whoami) | grep Linger` shows `Linger=no`, run `loginctl enable-linger $(whoami)` so your daemon survives your shell logging out.
 
@@ -91,13 +91,13 @@ If `loginctl show-user $(whoami) | grep Linger` shows `Linger=no`, run `loginctl
 
 ## 5. Configure outbox archive
 
-Set the outbox env var so every `agentbus send` archives outbound messages symmetrically with the inbox:
+Set the outbox env var so every `swarmbus send` archives outbound messages symmetrically with the inbox:
 
 ```bash
 # in your shell rc (.bashrc, .zshrc):
-export AGENTBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
+export SWARMBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"
 # OR per-agent scoped (safer in multi-agent shells):
-export AGENTBUS_OUTBOX_$(echo "$AGENT_ID" | tr 'a-z-' 'A-Z_')="$HOME/sync/${AGENT_ID}-outbox.md"
+export SWARMBUS_OUTBOX_$(echo "$AGENT_ID" | tr 'a-z-' 'A-Z_')="$HOME/sync/${AGENT_ID}-outbox.md"
 ```
 
 The `install-systemd.sh` step above already sets the per-agent scoped env var in the systemd unit — this step covers your *interactive* shell so CLI sends archive too.
@@ -107,12 +107,12 @@ The `install-systemd.sh` step above already sets the per-agent scoped env var in
 ## 6. Run the doctor
 
 ```bash
-agentbus doctor --agent-id "$AGENT_ID"
+swarmbus doctor --agent-id "$AGENT_ID"
 ```
 
 Every line should be green (`✓`). Warnings (`⚠`) are acceptable but review them. Any red (`✗`) blocks onboarding — use the inline `fix:` hint. The doctor catches:
 
-1. agentbus CLI version + install path
+1. swarmbus CLI version + install path
 2. broker reachable
 3. systemd user unit active
 4. **daemon library freshness** — after any `pip install -U`, the running daemon may still hold old code in memory. Doctor flags this explicitly (the 2026-04-14 priority-field incident was exactly this).
@@ -127,7 +127,7 @@ Every line should be green (`✓`). Warnings (`⚠`) are acceptable but review t
 Send yourself a priority=high test from a different agent id (or spawn a throwaway):
 
 ```bash
-agentbus send --agent-id probe --to "$AGENT_ID" --priority high \
+swarmbus send --agent-id probe --to "$AGENT_ID" --priority high \
   --subject "self-probe" \
   --body "If you see a wake-log entry for this, the tight loop works."
 ```
@@ -135,7 +135,7 @@ agentbus send --agent-id probe --to "$AGENT_ID" --priority high \
 Then check the wake log:
 
 ```bash
-tail ~/.local/state/agentbus-wake/"$AGENT_ID".log
+tail ~/.local/state/swarmbus-wake/"$AGENT_ID".log
 # expect a line like:
 # [2026-04-14T15:05:17-07:00] wake spawning for <uuid> from=probe subject="self-probe"
 # [2026-04-14T15:05:32-07:00] wake completed
@@ -148,7 +148,7 @@ If you see `wake spawning` → `wake completed`, reactive wake is live.
 ## 8. Announce to peers
 
 ```bash
-agentbus send --agent-id "$AGENT_ID" --to broadcast \
+swarmbus send --agent-id "$AGENT_ID" --to broadcast \
   --subject "joining" --body "$AGENT_ID is online."
 ```
 
@@ -164,7 +164,7 @@ If you want the operator to get a Telegram summary when new messages land for yo
 # in crontab -e:
 4,9,14,19,24,29,34,39,44,49,54,59 * * * * \
   TELEGRAM_BOT_TOKEN=<your-agent-bot-token> TELEGRAM_CHAT_ID=<operator-chat-id> \
-  bash /path/to/agentbus/scripts/inbox-watch.sh --agent-id <agent-id> \
+  bash /path/to/swarmbus/scripts/inbox-watch.sh --agent-id <agent-id> \
     >> ~/logs/inbox-watch-<agent-id>.log 2>&1 # <agent-id>:inbox-watch
 ```
 
@@ -177,14 +177,14 @@ If `TELEGRAM_BOT_TOKEN` is omitted from the inline cron env, the script falls ba
 ## Done — what "healthy" looks like
 
 ```bash
-$ agentbus list                 # your agent is in the set
+$ swarmbus list                 # your agent is in the set
 my-agent
 wren
 
-$ agentbus doctor --agent-id my-agent
-[doctor] agentbus health check for agent-id=my-agent
+$ swarmbus doctor --agent-id my-agent
+[doctor] swarmbus health check for agent-id=my-agent
 
-  [✓] 1. agentbus CLI version.... 0.1.0 at /path/to/agentbus
+  [✓] 1. swarmbus CLI version.... 0.1.0 at /path/to/swarmbus
   [✓] 2. broker reachable........ localhost:1883
   [✓] 3. systemd user unit....... active (PID 12345, since ...)
   [✓] 4. daemon library fresh.... ok

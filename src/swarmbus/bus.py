@@ -1,4 +1,4 @@
-# src/agentbus/bus.py
+# src/swarmbus/bus.py
 from __future__ import annotations
 
 import asyncio
@@ -221,7 +221,7 @@ class AgentBus:
         # is offline, and redelivers them on reconnect.
         client_kwargs: dict[str, Any] = {"will": will}
         if self.persistent:
-            client_kwargs["identifier"] = f"agentbus-{self.agent_id}"
+            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
         backoff = reconnect_initial
         while True:
@@ -272,7 +272,7 @@ class AgentBus:
         messages sent with `retain=True` are visible — ordinary directed
         sends (our default, `retain=False`) that arrived while no subscriber
         was connected are already gone. For durable delivery of non-retained
-        sends, keep a listener daemon up: `agentbus start --agent-id <me>`.
+        sends, keep a listener daemon up: `swarmbus start --agent-id <me>`.
 
         Returns a list of message dicts (up to `max_messages`). Malformed
         envelopes are skipped. Raises `aiomqtt.MqttError` if the broker is

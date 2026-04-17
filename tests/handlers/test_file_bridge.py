@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
-from agentbus.handlers.file_bridge import FileBridgeHandler
-from agentbus.message import AgentMessage
+from swarmbus.handlers.file_bridge import FileBridgeHandler
+from swarmbus.message import AgentMessage
 
 
 @pytest.fixture
