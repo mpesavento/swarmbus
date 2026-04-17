@@ -91,6 +91,26 @@ esac
 
 body=$(cat)
 
+# Tier 3: fire Telegram push immediately, before spawning any Claude session.
+# This ensures priority=high reaches the operator even if the Claude turn
+# is slow, fails, or triggers a security refusal. Bot token + chat_id read
+# from ~/.secrets/ so they're never hardcoded or logged.
+TG_TOKEN_FILE="$HOME/.secrets/TELEGRAM_BOT_TOKEN"
+TG_CHAT_FILE="$HOME/.secrets/TELEGRAM_CHAT_ID"
+if [ -f "$TG_TOKEN_FILE" ] && [ -f "$TG_CHAT_FILE" ]; then
+  TG_TOKEN=$(cat "$TG_TOKEN_FILE")
+  TG_CHAT=$(cat "$TG_CHAT_FILE")
+  TG_MSG="⚡ priority:high from ${SWARMBUS_FROM:-?}: ${SWARMBUS_SUBJECT:-?}"
+  curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+    -d "chat_id=${TG_CHAT}" \
+    --data-urlencode "text=${TG_MSG}" \
+    > /dev/null 2>&1 \
+    && _log "tier3 TG push sent" \
+    || _log "tier3 TG push failed (curl error)"
+else
+  _log "tier3 TG push skipped: missing $TG_TOKEN_FILE or $TG_CHAT_FILE"
+fi
+
 sanitize() {
   local max="${2:-200}"
   printf '%s' "$1" \
