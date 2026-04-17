@@ -159,7 +159,7 @@ def test_send_priority_default_is_normal():
 def test_send_priority_rejects_unknown_at_cli():
     """CLI level accepts only the canonical set — prevents typos. The
     wire envelope accepts any string for forward-compat, but operators
-    typing agentbus send on the command line shouldn't silently send
+    typing swarmbus send on the command line shouldn't silently send
     'hight' and have the wake gate miss it."""
     runner = CliRunner()
     result = runner.invoke(main, [

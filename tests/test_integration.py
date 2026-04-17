@@ -521,7 +521,7 @@ async def test_send_receive_large_body_at_limit(mosquitto_broker):
 @pytest.mark.asyncio
 async def test_mcp_tools_expose_expected_signatures():
     """MCP tool signatures are a public contract — anything consuming
-    agentbus via MCP (Claude Code sidecar, Cursor, custom clients) breaks
+    swarmbus via MCP (Claude Code sidecar, Cursor, custom clients) breaks
     if a tool name or parameter name changes. Assert the full tool shape."""
     app = create_mcp_app(agent_id="sig-check", broker="localhost", port=1883)
 
