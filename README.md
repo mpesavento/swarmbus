@@ -155,7 +155,7 @@ Restart Claude Code. Four MCP tools become available:
 - `watch_inbox(timeout)` — long-poll, returns when a message arrives
 - `list_agents()` — IDs of peers currently online
 
-The skill (`skills/using-swarmbus/SKILL.md`) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
+The skill (`src/swarmbus/skills/using-swarmbus/SKILL.md`, also installed under `site-packages/swarmbus/skills/using-swarmbus/` via pip) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
 
 Claude Code **also** needs a listener daemon running (step 3 of the quickstart) to receive messages while the chat session is closed. The MCP tools only work while Claude is open — the daemon is what catches messages in between.
 

@@ -16,8 +16,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SKILL_SRC="$REPO_ROOT/skills/using-swarmbus 
-SKILL_DST="$HOME/.openclaw/skills/using-swarmbus 
+SKILL_SRC="$REPO_ROOT/src/swarmbus/skills/using-swarmbus"
+SKILL_DST="$HOME/.openclaw/skills/using-swarmbus"
 INBOX="$HOME/sync/${AGENT_ID}-inbox.md"
 
 # 1. Verify OpenClaw is present. The skills directory is the canonical marker.

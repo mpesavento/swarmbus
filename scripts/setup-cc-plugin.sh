@@ -16,8 +16,8 @@ fi
 SETTINGS_FILE="${HOME}/.claude/settings.json"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SKILL_SRC="$REPO_ROOT/skills/using-swarmbus 
-SKILL_DST="$HOME/.claude/skills/using-swarmbus 
+SKILL_SRC="$REPO_ROOT/src/swarmbus/skills/using-swarmbus"
+SKILL_DST="$HOME/.claude/skills/using-swarmbus"
 
 if [ ! -f "$SETTINGS_FILE" ]; then
   mkdir -p "$(dirname "$SETTINGS_FILE")"
@@ -33,8 +33,8 @@ with open(settings_path) as f:
     settings = json.load(f)
 
 settings.setdefault("mcpServers", {})
-settings["mcpServers"]["swarmbus ] = {
-    "command": "swarmbus ,
+settings["mcpServers"]["swarmbus"] = {
+    "command": "swarmbus",
     "args": ["mcp-server", "--agent-id", agent_id, "--broker", broker]
 }
 
