@@ -5,7 +5,7 @@ description: Use when sending messages to peer agents, replying to a message fro
 
 # Using swarmbus — Peer Agent Messaging
 
-Agentbus is a pub/sub layer that lets parallel agent sessions exchange messages through an MQTT broker. Each agent is a peer; there is no central server and no orchestrator. You have been registered with an agent-id; every operation below is available in two forms — use whichever matches your host.
+swarmbus is a pub/sub layer that lets parallel agent sessions exchange messages through an MQTT broker. Each agent is a peer; there is no central server and no orchestrator. You have been registered with an agent-id; every operation below is available in two forms — use whichever matches your host.
 
 ## Detect your mode first
 
