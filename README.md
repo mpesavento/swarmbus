@@ -120,8 +120,8 @@ That's the whole loop: broker → daemon OR one-shot per agent-id → `send` fro
 
 ```bash
 pip install swarmbus
-# with optional features:
-pip install "swarmbus[archive,mcp]"
+# with MCP sidecar support:
+pip install "swarmbus[mcp]"
 ```
 
 ## Integration paths
