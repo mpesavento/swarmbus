@@ -489,6 +489,14 @@ def test_tail_detects_inode_change_and_rereads(tmp_path):
     # exceed the old cursor size.
     os.remove(inbox)
     inbox.write_text("replacement A\nreplacement B\nreplacement C\n")
+
+    # Some containerised filesystems (CI, tmpfs) reuse inodes immediately on
+    # rm + create.  Force a cursor mismatch so the inode-change detection path
+    # is always exercised regardless of OS allocation behaviour.
+    cursor_file = cursors / "sparrow--default.cursor"
+    stored_offset = cursor_file.read_text().split()[0]
+    cursor_file.write_text(f"{stored_offset} {inbox.stat().st_ino + 1}")
+
     result = runner.invoke(main, [
         "tail", "--agent-id", "sparrow",
         "--inbox", str(inbox), "--cursor-dir", str(cursors),
