@@ -23,6 +23,7 @@ import pytest
 from swarmbus.archive import SQLiteArchive
 from swarmbus.bus import AgentBus
 from swarmbus.handlers.base import BaseHandler
+from swarmbus._compat import asyncio_timeout
 from swarmbus.handlers.direct_invoke import DirectInvocationHandler
 from swarmbus.handlers.file_bridge import FileBridgeHandler
 from swarmbus.mcp_server import create_mcp_app
@@ -255,7 +256,7 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
         async with aiomqtt.Client(host, port=port) as client:
             await client.subscribe("agents/+/presence", qos=0)
             try:
-                async with asyncio.timeout(1.0):
+                async with asyncio_timeout(1.0):
                     async for msg in client.messages:
                         data = json.loads(msg.payload)
                         seen[data["agent"]] = data["status"]
@@ -426,7 +427,7 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
         async with aiomqtt.Client(host, port=port) as client:
             await client.subscribe("agents/presence-tester/presence", qos=0)
             try:
-                async with asyncio.timeout(0.5):
+                async with asyncio_timeout(0.5):
                     async for mqtt_msg in client.messages:
                         return json.loads(mqtt_msg.payload)
             except asyncio.TimeoutError:

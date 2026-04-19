@@ -10,6 +10,7 @@ import aiomqtt
 
 from .message import AgentMessage, _validate_registered_agent_id
 from .handlers.base import BaseHandler
+from ._compat import asyncio_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +284,7 @@ class AgentBus:
         async with aiomqtt.Client(self.broker, port=self.port) as client:
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             try:
-                async with asyncio.timeout(drain_timeout):
+                async with asyncio_timeout(drain_timeout):
                     async for mqtt_msg in client.messages:
                         try:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
@@ -312,7 +313,7 @@ class AgentBus:
         async with aiomqtt.Client(self.broker, port=self.port) as client:
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             try:
-                async with asyncio.timeout(timeout):
+                async with asyncio_timeout(timeout):
                     async for mqtt_msg in client.messages:
                         try:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
@@ -334,7 +335,7 @@ class AgentBus:
         async with aiomqtt.Client(self.broker, port=self.port) as client:
             await client.subscribe("agents/+/presence", qos=0)
             try:
-                async with asyncio.timeout(collect_window):
+                async with asyncio_timeout(collect_window):
                     async for mqtt_msg in client.messages:
                         try:
                             payload = json.loads(mqtt_msg.payload)
