@@ -1,5 +1,5 @@
 # src/swarmbus/__init__.py
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .bus import AgentBus
 from .message import AgentMessage
