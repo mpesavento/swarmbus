@@ -1,5 +1,10 @@
 # src/swarmbus/__init__.py
-__version__ = "0.1.2"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("swarmbus-py")
+except PackageNotFoundError:
+    __version__ = "unknown"
 
 from .bus import AgentBus
 from .message import AgentMessage
