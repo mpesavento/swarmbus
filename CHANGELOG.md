@@ -16,6 +16,18 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [0.1.3] — 2026-04-23
+
+### Changed
+- CI now runs tests on the `dev` branch in addition to `main`.
+
+### Internal
+- Wired PyPI trusted publisher (OIDC) — future `v*` tag pushes auto-publish without an API token.
+
+**Wire-compat:** No envelope, topic, QoS, or MCP tool changes. Safe to upgrade in place.
+
+---
+
 ## [Unreleased] — 2026-04-14
 
 First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker reachable over loopback for now, Tailscale cross-host documented but not yet exercised in anger.
