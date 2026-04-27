@@ -69,16 +69,21 @@ PROMPT
 HELPER="$(dirname "$0")/openclaw-bridge.mjs"
 if [ ! -f "$HELPER" ]; then
   _log "ERROR: helper not found at $HELPER"
-  exit 1
+  exit 2
 fi
 
 _log "wake bridge spawning for ${SWARMBUS_ID:-?} from=${safe_from} subject=\"${safe_subject}\""
 
+# `set -e` + `pipefail` would exit before we logged the failure. Disable
+# them around the pipeline so we always record the exit code and elapsed
+# time before propagating the status.
+set +e
 start=$(date +%s%3N)
 printf '%s' "$prompt" \
   | node "$HELPER" "$OPENCLAW_AGENT" \
   >> "$LOG" 2>&1
 status=$?
 end=$(date +%s%3N)
+set -e
 _log "wake bridge exit=${status} elapsed_ms=$((end - start))"
 exit "$status"

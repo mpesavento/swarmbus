@@ -136,7 +136,7 @@ async function main() {
     idempotencyKey,
     agentId,
     deliver: false,
-    timeout: Math.floor(timeoutMs / 1000),
+    timeout: Math.max(1, Math.floor(timeoutMs / 1000)),
   };
 
   // Forward the swarmbus envelope as a label so it shows up in run history.
@@ -155,6 +155,11 @@ async function main() {
       else resolveCall(value);
     };
 
+    // Note: deviceIdentity is intentionally omitted. GatewayClient's constructor
+    // calls loadOrCreateDeviceIdentity() when the field is `undefined`, which
+    // is what binds the operator scopes. Passing `null` would explicitly
+    // disable auto-load and the gateway would strip "operator.write" via
+    // clearUnboundScopes(), rejecting the request.
     const client = new GatewayClient({
       url,
       token,

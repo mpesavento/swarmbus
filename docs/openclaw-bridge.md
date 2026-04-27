@@ -5,13 +5,18 @@ for delivering swarmbus messages to a running OpenClaw agent. Both
 scripts are drop-in `--invoke` handlers; they differ only in how they
 hand the message to OpenClaw.
 
-| Wake path | How | Cold-start budget |
+| Wake path | How | Dispatch overhead |
 |-----------|-----|-------------------|
 | `openclaw-wake.sh` | shells out to `openclaw agent --message ...` | ~24s on RPi 5 |
 | `openclaw-bridge-wake.sh` | speaks the gateway WebSocket protocol directly | ~0.8s on RPi 5 |
 
-On a Raspberry Pi 5 the bridge saves ~23 s of wake latency per message
-(measured with `scripts/bench_wake.py` against an idle gateway).
+"Dispatch overhead" is the time the wake script spends *before* the
+receiving agent starts its turn — CLI bootstrap and gateway dispatch
+in the CLI path; gateway-runtime import and WS handshake in the bridge
+path. The agent turn itself runs identically under both paths, so the
+~23s savings show up directly in time-to-first-token (measured with
+`scripts/bench_wake.py` against a deliberately bogus agent id, so no
+real model is invoked).
 
 ## When to use which
 
@@ -53,8 +58,10 @@ The helper:
    resolution order below) and dynamically imports `GatewayClient`.
 3. Reads `gateway.port` and `gateway.auth.token` from
    `~/.openclaw/openclaw.json`.
-4. Auto-loads the OpenClaw device identity via
-   `loadOrCreateDeviceIdentity()` (so operator scopes bind correctly).
+4. Lets `GatewayClient` auto-load the OpenClaw device identity via
+   `loadOrCreateDeviceIdentity()` — this happens implicitly when the
+   `deviceIdentity` constructor option is omitted, and is required for
+   operator scopes to bind to the connection.
 5. Connects, sends `agent` JSON-RPC, prints a one-line summary, exits.
 
 ## Setup
