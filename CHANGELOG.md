@@ -16,6 +16,22 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [0.1.4] — 2026-04-27
+
+### Added
+- `examples/openclaw-bridge.mjs` — Node helper that delivers swarmbus messages to a running OpenClaw agent by speaking the gateway WebSocket protocol directly via plugin-sdk's `GatewayClient`. Skips the ~24 s `openclaw agent` CLI cold-start.
+- `OPENCLAW_WAKE_USE_CLI=1` env flag on `examples/openclaw-wake.sh` to force the legacy CLI path on hosts without a running gateway daemon.
+- `scripts/bench_wake.py` — bench harness comparing both wake paths against a deliberately bogus agent id (no real agent woken, no tokens spent).
+- `docs/openclaw-wake.md` — wake-path design reference and troubleshooting.
+
+### Changed
+- `examples/openclaw-wake.sh` now bridges the gateway WebSocket by default (~840 ms of dispatch overhead on a Raspberry Pi 5, ~30× faster than the CLI path). The CLI path remains as opt-in fallback via `OPENCLAW_WAKE_USE_CLI=1`.
+- `swarmbus init --host-type openclaw` wires the new wake script.
+
+**Wire-compat:** No envelope, topic, QoS, or MCP tool changes. The `--invoke` script's command-line interface is unchanged. Safe to upgrade in place.
+
+---
+
 ## [0.1.3] — 2026-04-23
 
 ### Changed
