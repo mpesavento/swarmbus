@@ -196,7 +196,7 @@ swarmbus start \
   --invoke "$(pwd)/examples/openclaw-wake.sh main"
 ```
 
-The `--inbox` half persists every message to a file (durability). The `--invoke` half runs `openclaw agent --agent main --message "<body>"` on each arrival, so Coder actually reasons about it instead of waiting for her next scheduled turn. End-to-end tested; see `examples/openclaw-wake.sh` for the wrapper source.
+The `--inbox` half persists every message to a file (durability). The `--invoke` half dispatches the prompt directly to the OpenClaw gateway over its WebSocket protocol — ~0.8 s of dispatch overhead on a Raspberry Pi 5, vs ~24 s for the legacy CLI cold-start. Set `OPENCLAW_WAKE_USE_CLI=1` to fall back to the legacy `openclaw agent --message` path on hosts without a running gateway daemon. See [docs/openclaw-wake.md](docs/openclaw-wake.md) for the full design and troubleshooting.
 
 Also set `SWARMBUS_OUTBOX=~/sync/coder-outbox.md` in the OpenClaw agent's shell env so every `swarmbus send` from that agent archives outbound messages symmetrically with the inbox file. See [docs/notification-patterns.md](docs/notification-patterns.md) for the full archive + user-notification protocol.
 
