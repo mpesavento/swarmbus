@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Bench wake-script latency: openclaw CLI vs gateway-bridge.
+"""Bench wake-script latency: gateway-bridge default vs CLI fallback.
 
-Measures the time spent in the wake script *before* the receiving agent
-starts producing output. Both wake paths are invoked against an agent
-id that does not exist in the OpenClaw config — the gateway/CLI rejects
-the call early, so we measure bootstrap + handshake + dispatch overhead
-without spending tokens or waking a real agent.
+Measures the time spent in `openclaw-wake.sh` *before* the receiving
+agent starts producing output. Both wake paths (default bridge and
+`OPENCLAW_WAKE_USE_CLI=1` fallback) are invoked against an agent id
+that does not exist in the OpenClaw config — the gateway/CLI rejects
+the call early, so we measure bootstrap + handshake + dispatch
+overhead without spending tokens or waking a real agent.
 
 Usage:
     python scripts/bench_wake.py [--runs N] [--bogus-agent ID]
 
 Prereqs:
     - OpenClaw gateway daemon running (~/.openclaw/openclaw.json present).
-    - Both wake scripts present under examples/.
+    - examples/openclaw-wake.sh + examples/openclaw-bridge.mjs present.
 """
 from __future__ import annotations
 
@@ -29,8 +30,9 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def run_once(script: Path, agent_id: str, timeout_s: int = 30) -> float:
-    """Invoke a wake script with a small body; return elapsed seconds.
+def run_once(script: Path, agent_id: str, *, use_cli: bool = False,
+             timeout_s: int = 30) -> float:
+    """Invoke the wake script with a small body; return elapsed seconds.
 
     Exit codes are ignored — the bench measures wall time regardless
     of whether the wake path accepts or rejects the (deliberately bogus)
@@ -48,6 +50,8 @@ def run_once(script: Path, agent_id: str, timeout_s: int = 30) -> float:
         "SWARMBUS_REPLY_TO": "",
         "OPENCLAW_BRIDGE_TIMEOUT_MS": str(timeout_s * 1000),
     })
+    if use_cli:
+        env["OPENCLAW_WAKE_USE_CLI"] = "1"
     t0 = time.perf_counter()
     subprocess.run(
         [str(script), agent_id],
@@ -80,24 +84,26 @@ def main() -> int:
     args = p.parse_args()
 
     root = repo_root()
-    cli_script = root / "examples" / "openclaw-wake.sh"
-    bridge_script = root / "examples" / "openclaw-bridge-wake.sh"
-    for s in (cli_script, bridge_script):
+    wake_script = root / "examples" / "openclaw-wake.sh"
+    bridge_helper = root / "examples" / "openclaw-bridge.mjs"
+    for s in (wake_script, bridge_helper):
         if not s.exists():
-            print(f"missing wake script: {s}", file=sys.stderr)
+            print(f"missing wake artifact: {s}", file=sys.stderr)
             return 2
 
     print(f"bench: bogus agent='{args.bogus_agent}', runs={args.runs}\n")
 
     print("warmup (1 run each, discarded)")
-    run_once(cli_script, args.bogus_agent)
-    run_once(bridge_script, args.bogus_agent)
+    run_once(wake_script, args.bogus_agent, use_cli=True)
+    run_once(wake_script, args.bogus_agent, use_cli=False)
     print()
 
-    cli_samples = [run_once(cli_script, args.bogus_agent) for _ in range(args.runs)]
-    bridge_samples = [run_once(bridge_script, args.bogus_agent) for _ in range(args.runs)]
+    cli_samples = [run_once(wake_script, args.bogus_agent, use_cli=True)
+                   for _ in range(args.runs)]
+    bridge_samples = [run_once(wake_script, args.bogus_agent, use_cli=False)
+                      for _ in range(args.runs)]
 
-    summarise("openclaw CLI", cli_samples)
+    summarise("CLI fallback", cli_samples)
     summarise("bridge (WS)", bridge_samples)
 
     cli_med = statistics.median(cli_samples)

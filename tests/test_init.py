@@ -70,14 +70,6 @@ class TestDeriveInvoke:
         result = _derive_invoke("openclaw", "wren", "/home/user/swarmbus")
         assert result == "/home/user/swarmbus/examples/openclaw-wake.sh wren"
 
-    def test_openclaw_bridge_with_repo_root(self):
-        result = _derive_invoke("openclaw-bridge", "wren", "/home/user/swarmbus")
-        assert result == "/home/user/swarmbus/examples/openclaw-bridge-wake.sh wren"
-
-    def test_no_repo_root_openclaw_bridge_returns_none(self):
-        result = _derive_invoke("openclaw-bridge", "wren", None)
-        assert result is None
-
     def test_none_host_type_returns_none(self):
         result = _derive_invoke("none", "test", "/home/user/swarmbus")
         assert result is None
@@ -155,14 +147,6 @@ class TestHostTypeChoices:
              patch("swarmbus.cli.detect_platform", return_value="debian"), \
              patch("swarmbus.cli.find_repo_root", return_value=None):
             result = runner.invoke(main, ["init", "--agent-id", "test", "--host-type", "openclaw", "--dry-run", "--skip-broker"])
-        assert result.exit_code == 0
-
-    def test_openclaw_bridge_accepted(self):
-        runner = CliRunner()
-        with patch("swarmbus.cli.resolve_broker_addr", return_value="localhost"), \
-             patch("swarmbus.cli.detect_platform", return_value="debian"), \
-             patch("swarmbus.cli.find_repo_root", return_value=None):
-            result = runner.invoke(main, ["init", "--agent-id", "test", "--host-type", "openclaw-bridge", "--dry-run", "--skip-broker"])
         assert result.exit_code == 0
 
     def test_none_accepted(self):

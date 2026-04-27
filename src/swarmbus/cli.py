@@ -772,8 +772,6 @@ def _derive_invoke(host_type: str, agent_id: str, repo_root: str | None) -> str 
         return f"{repo_root}/examples/claude-code-wake.sh {agent_id}"
     if host_type == "openclaw":
         return f"{repo_root}/examples/openclaw-wake.sh {agent_id}"
-    if host_type == "openclaw-bridge":
-        return f"{repo_root}/examples/openclaw-bridge-wake.sh {agent_id}"
     return None
 
 
@@ -993,11 +991,10 @@ def _step_doctor(agent_id: str, dry_run: bool) -> bool:
               help="Agent identifier (lowercase alphanumeric, hyphens, underscores)")
 @click.option(
     "--host-type",
-    type=click.Choice(["cc", "openclaw", "openclaw-bridge", "none"], case_sensitive=False),
+    type=click.Choice(["cc", "openclaw", "none"], case_sensitive=False),
     default="none",
     show_default=True,
-    help="Host type: cc (Claude Code), openclaw (CLI cold-start ~30s), "
-         "openclaw-bridge (gateway WS, ~700ms), none (archive-only).",
+    help="Host type: cc (Claude Code), openclaw, none (archive-only).",
 )
 @click.option("--broker", default="localhost", show_default=True,
               help="Broker address. Use 'tailscale' to auto-resolve Tailscale IP.")
