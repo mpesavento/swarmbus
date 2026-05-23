@@ -23,6 +23,59 @@ def main() -> None:
     """swarmbus — reactive MQTT messaging for AI agents."""
 
 
+# ---------------------------------------------------------------------------
+
+
+def _broker_auth_options(func):
+    """Apply --username / --password / --ca-cert / --client-cert /
+    --client-key / --tls to a Click command.
+
+    Stacked in reverse so the rendered --help order matches the listing
+    above (Click decorators apply bottom-up).
+    """
+    func = click.option(
+        "--tls/--no-tls",
+        default=False,
+        envvar="SWARMBUS_BROKER_TLS",
+        help="Enable TLS without mTLS (CA from system trust unless "
+             "--ca-cert is set). [env: SWARMBUS_BROKER_TLS]",
+    )(func)
+    func = click.option(
+        "--client-key",
+        default=None,
+        envvar="SWARMBUS_BROKER_CLIENT_KEY",
+        help="Path to client TLS key for mTLS. Set with --client-cert. "
+             "[env: SWARMBUS_BROKER_CLIENT_KEY]",
+    )(func)
+    func = click.option(
+        "--client-cert",
+        default=None,
+        envvar="SWARMBUS_BROKER_CLIENT_CERT",
+        help="Path to client TLS certificate for mTLS. Set with "
+             "--client-key. [env: SWARMBUS_BROKER_CLIENT_CERT]",
+    )(func)
+    func = click.option(
+        "--ca-cert",
+        default=None,
+        envvar="SWARMBUS_BROKER_CA_CERT",
+        help="Path to a CA bundle that signs the broker certificate. "
+             "Implies TLS. [env: SWARMBUS_BROKER_CA_CERT]",
+    )(func)
+    func = click.option(
+        "--password",
+        default=None,
+        envvar="SWARMBUS_BROKER_PASSWORD",
+        help="Broker password. [env: SWARMBUS_BROKER_PASSWORD]",
+    )(func)
+    func = click.option(
+        "--username",
+        default=None,
+        envvar="SWARMBUS_BROKER_USERNAME",
+        help="Broker username. [env: SWARMBUS_BROKER_USERNAME]",
+    )(func)
+    return func
+
+
 def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
     """Resolve the outbox path with this precedence:
 
@@ -82,6 +135,7 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
          "`{agent_id}` template. Resolution order: --outbox > "
          "SWARMBUS_OUTBOX_<UPPER_AGENT_ID> > SWARMBUS_OUTBOX.",
 )
+@_broker_auth_options
 @click.pass_context
 def send(
     ctx: click.Context,
@@ -96,6 +150,12 @@ def send(
     priority: str,
     reply_to: str | None,
     outbox: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
 ) -> None:
     """Send a message to another agent.
 
@@ -116,7 +176,17 @@ def send(
     if body_file is not None:
         body = body_file.read()
 
-    bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
+    bus = AgentBus(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
     resolved_outbox = _resolve_outbox(outbox, agent_id)
     try:
         asyncio.run(bus.send(
@@ -148,6 +218,7 @@ def send(
          "daemon restarts. Disable only if another process holds the same "
          "`swarmbus-<id>` client identifier.",
 )
+@_broker_auth_options
 def start(
     agent_id: str,
     broker: str,
@@ -155,11 +226,28 @@ def start(
     inbox: str | None,
     invoke_cmd: str | None,
     persistent: bool,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
 ) -> None:
     """Start the swarmbus listener daemon."""
     from . import __version__
 
-    bus = AgentBus(agent_id=agent_id, broker=broker, port=port, persistent=persistent)
+    bus = AgentBus(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        persistent=persistent,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
 
     if inbox:
         bus.register_handler(FileBridgeHandler(inbox))
@@ -193,7 +281,20 @@ def start(
 @click.option("--port", default=1883, show_default=True)
 @click.option("--max", "max_messages", default=10, show_default=True, help="Max messages to drain")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON array (default: pretty)")
-def read(agent_id: str, broker: str, port: int, max_messages: int, as_json: bool) -> None:
+@_broker_auth_options
+def read(
+    agent_id: str,
+    broker: str,
+    port: int,
+    max_messages: int,
+    as_json: bool,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
     """Drain retained messages from your inbox and exit.
 
     Non-blocking: returns immediately with whatever's waiting. Catches
@@ -208,7 +309,17 @@ def read(agent_id: str, broker: str, port: int, max_messages: int, as_json: bool
     swarmbus read --agent-id planner
     swarmbus read --agent-id planner --json | jq '.[] | .subject'
     """
-    bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
+    bus = AgentBus(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
     try:
         messages = asyncio.run(bus.read_inbox(max_messages=max_messages))
     except aiomqtt.MqttError as exc:
@@ -237,7 +348,20 @@ def read(agent_id: str, broker: str, port: int, max_messages: int, as_json: bool
 @click.option("--port", default=1883, show_default=True)
 @click.option("--timeout", default=30.0, show_default=True, help="Seconds to wait")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON (default: pretty)")
-def watch(agent_id: str, broker: str, port: int, timeout: float, as_json: bool) -> None:
+@_broker_auth_options
+def watch(
+    agent_id: str,
+    broker: str,
+    port: int,
+    timeout: float,
+    as_json: bool,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
     """Block until one message arrives, print it, exit.
 
     Catches messages published while this call is active. If a listener
@@ -250,7 +374,17 @@ def watch(agent_id: str, broker: str, port: int, timeout: float, as_json: bool) 
     \b
     swarmbus watch --agent-id planner --timeout 60
     """
-    bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
+    bus = AgentBus(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
     except aiomqtt.MqttError as exc:
@@ -274,14 +408,34 @@ def watch(agent_id: str, broker: str, port: int, timeout: float, as_json: bool) 
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON array")
-def list_agents_cmd(broker: str, port: int, as_json: bool) -> None:
+@_broker_auth_options
+def list_agents_cmd(
+    broker: str,
+    port: int,
+    as_json: bool,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
     """List agent IDs currently online on the broker.
 
     \b
     swarmbus list
     swarmbus list --json
     """
-    bus = AgentBus.probe(broker=broker, port=port)
+    bus = AgentBus.probe(
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
     try:
         agents = asyncio.run(bus.list_agents())
     except aiomqtt.MqttError as exc:
@@ -474,7 +628,18 @@ def tail(
 @click.option("--agent-id", default=None, help="Agent id to audit. Defaults to auto-detect from systemd unit or env.")
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
-def doctor(agent_id: str | None, broker: str, port: int) -> None:
+@_broker_auth_options
+def doctor(
+    agent_id: str | None,
+    broker: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
     """Run a self-diagnosis of the local swarmbus install + daemon state.
 
     Prints a checklist of 7 probes: CLI version, broker reachability, my
@@ -518,8 +683,18 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
 
     # 2. Broker reachability
     try:
+        _probe = AgentBus.probe(
+            broker=broker, port=port,
+            username=username, password=password,
+            tls=tls, ca_cert=ca_cert,
+            client_cert=client_cert, client_key=client_key,
+        )
+
         async def _probe_broker():
-            async with aiomqtt.Client(broker, port=port, timeout=2.0):
+            async with aiomqtt.Client(
+                broker, port=port, timeout=2.0,
+                **_probe._aiomqtt_kwargs(),
+            ):
                 return True
         asyncio.run(_probe_broker())
         results.append((f"broker reachable........ {broker}:{port}", "ok", None))
@@ -667,7 +842,16 @@ def doctor(agent_id: str | None, broker: str, port: int) -> None:
 
     # 7. Peer discovery
     try:
-        bus = AgentBus.probe(broker=broker, port=port)
+        bus = AgentBus.probe(
+            broker=broker,
+            port=port,
+            username=username,
+            password=password,
+            tls=tls,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
         peers = asyncio.run(bus.list_agents())
         if agent_id_resolved in peers:
             others = [p for p in peers if p != agent_id_resolved]
@@ -742,10 +926,31 @@ def _detect_agent_id() -> str:
 @click.option("--agent-id", required=True, help="This agent's ID")
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
-def mcp_server(agent_id: str, broker: str, port: int) -> None:
+@_broker_auth_options
+def mcp_server(
+    agent_id: str,
+    broker: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
     """Start the MCP sidecar for this agent."""
     from .mcp_server import run_mcp_server
-    run_mcp_server(agent_id=agent_id, broker=broker, port=port)
+    run_mcp_server(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -891,14 +1096,38 @@ def _step_systemd(
     invoke: str | None,
     scripts_dir: str,
     dry_run: bool,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    ca_cert: str | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
+    tls: bool = False,
 ) -> bool:
-    """Step 3: install the systemd user unit via install-systemd.sh."""
+    """Step 3: install the systemd user unit via install-systemd.sh.
+
+    Auth + TLS args, if supplied, persist into a ``<unit>.service.d/auth.conf``
+    drop-in so the credentials survive re-runs of install-systemd.sh and
+    don't crowd the unit's ExecStart line.
+    """
     label = "Systemd unit"
     cmd = [f"{scripts_dir}/install-systemd.sh", agent_id,
            "--broker", broker_addr,
            "--inbox", inbox]
     if invoke:
         cmd += ["--invoke", invoke]
+    if username:
+        cmd += ["--username", username]
+    if password:
+        cmd += ["--password", password]
+    if ca_cert:
+        cmd += ["--ca-cert", ca_cert]
+    if client_cert:
+        cmd += ["--client-cert", client_cert]
+    if client_key:
+        cmd += ["--client-key", client_key]
+    if tls:
+        cmd += ["--tls"]
     return _run_step(label, cmd, dry_run)
 
 
@@ -1006,6 +1235,7 @@ def _step_doctor(agent_id: str, dry_run: bool) -> bool:
 @click.option("--skip-plugin", is_flag=True, help="Skip host plugin install.")
 @click.option("--dry-run", is_flag=True, help="Print what would run without executing.")
 @click.option("--yes", is_flag=True, help="Non-interactive; accept all prompts.")
+@_broker_auth_options
 def init(
     agent_id: str,
     host_type: str,
@@ -1016,6 +1246,12 @@ def init(
     skip_plugin: bool,
     dry_run: bool,
     yes: bool,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
 ) -> None:
     """One-command agent setup: broker, daemon, plugin, doctor.
 
@@ -1118,7 +1354,12 @@ def init(
         click.echo(click.style("⚠ skipped (no scripts dir; PyPI install)", fg="yellow"))
         systemd_ok = True
     else:
-        systemd_ok = _step_systemd(agent_id, broker_addr, resolved_inbox, invoke, scripts_dir, dry_run)
+        systemd_ok = _step_systemd(
+            agent_id, broker_addr, resolved_inbox, invoke, scripts_dir, dry_run,
+            username=username, password=password,
+            ca_cert=ca_cert, client_cert=client_cert, client_key=client_key,
+            tls=tls,
+        )
     results.append(("Systemd unit", systemd_ok))
 
     # --- Step 4: Wake wrapper
