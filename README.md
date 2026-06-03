@@ -362,9 +362,22 @@ swarmbus send --agent-id laptop-cc --to planner \
 
 Anonymous is safe within a tailnet — the mesh is already authenticated. Never do this on the public internet.
 
-### Other networks
+### Other networks (TLS + auth)
 
-If you can't use Tailscale, run mosquitto with TLS + username/password auth. The swarmbus CLI doesn't yet expose TLS flags; supply them via a mosquitto client config file or use the Python API with the aiomqtt TLS parameters directly. This is out of scope for the bundled setup scripts.
+If you can't use Tailscale, run a broker hardened with TLS and username/password auth (Mosquitto and EMQX are both supported). swarmbus accepts the broker's CA + credentials on every CLI subcommand and via `SWARMBUS_BROKER_*` env vars; mTLS is supported when the broker requires it.
+
+```bash
+# Quick example — set creds once via env, run the daemon:
+export SWARMBUS_BROKER_USERNAME=laptop-cc
+export SWARMBUS_BROKER_PASSWORD=…
+export SWARMBUS_BROKER_TLS=1                # broker cert chains to a trusted CA
+# or: export SWARMBUS_BROKER_CA_CERT=/etc/ssl/certs/internal-ca.crt
+
+swarmbus start --agent-id laptop-cc --broker mqtt.example.com --port 8883 \
+  --inbox ~/sync/laptop-cc-inbox.md
+```
+
+For full reference see [docs/security.md](docs/security.md).
 
 ## Troubleshooting
 

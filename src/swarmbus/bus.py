@@ -1,9 +1,9 @@
-# src/swarmbus/bus.py
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import ssl
 from typing import Any, List
 
 import aiomqtt
@@ -13,6 +13,38 @@ from .handlers.base import BaseHandler
 from ._compat import asyncio_timeout
 
 logger = logging.getLogger(__name__)
+
+
+def _build_tls_context(
+    *,
+    tls: bool,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+) -> ssl.SSLContext | None:
+    """Build the SSL context for a TLS broker connection, or None for
+    plaintext.
+
+    TLS is engaged when ``tls`` is True or any of ``ca_cert``,
+    ``client_cert``, ``client_key`` is set.
+
+    - ``ca_cert``: trust this CA bundle. When unset, system trust is used.
+    - ``client_cert`` + ``client_key``: enable mTLS. Both must be set
+      together (raises ValueError if only one is provided).
+    """
+    if not (tls or ca_cert or client_cert or client_key):
+        return None
+    if (client_cert is None) != (client_key is None):
+        raise ValueError(
+            "client_cert and client_key must be set together for mTLS"
+        )
+    if ca_cert:
+        context = ssl.create_default_context(cafile=ca_cert)
+    else:
+        context = ssl.create_default_context()
+    if client_cert and client_key:
+        context.load_cert_chain(certfile=client_cert, keyfile=client_key)
+    return context
 
 
 def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
@@ -46,6 +78,13 @@ class AgentBus:
         port: int = 1883,
         retain: bool = False,
         persistent: bool = False,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        tls: bool = False,
+        ca_cert: str | None = None,
+        client_cert: str | None = None,
+        client_key: str | None = None,
     ) -> None:
         """Construct an AgentBus.
 
@@ -66,6 +105,21 @@ class AgentBus:
             PUBACK was lost — handlers must be idempotent (this is the standard
             QoS1 "at least once" contract). Default False for backward
             compatibility; daemons should set True.
+
+        Auth + TLS (keyword-only):
+
+        - ``username``, ``password``: MQTT user credentials. Pass None to
+          connect anonymously.
+        - ``tls``: explicitly enable TLS without mTLS. Useful when the broker
+          cert chains to a CA already in the system trust store.
+        - ``ca_cert``: path to a CA bundle that signs the broker cert. Setting
+          this implies TLS.
+        - ``client_cert`` / ``client_key``: paths to a client cert + key for
+          mTLS. Must be set together; setting either implies TLS.
+
+        TLS engages when ``tls=True`` or any of ``ca_cert`` / ``client_cert``
+        / ``client_key`` is set; otherwise the broker connection is
+        plaintext.
         """
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -73,6 +127,21 @@ class AgentBus:
         self.port = port
         self.retain = retain
         self.persistent = persistent
+        self.username = username
+        self.password = password
+        self.tls = tls
+        self.ca_cert = ca_cert
+        self.client_cert = client_cert
+        self.client_key = client_key
+        # Eagerly build the TLS context so misconfigurations (e.g. unreadable
+        # cert files, mismatched client_cert/key) fail at construction time
+        # rather than on the first network call.
+        self._tls_context: ssl.SSLContext | None = _build_tls_context(
+            tls=tls,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -80,14 +149,44 @@ class AgentBus:
         self._client: aiomqtt.Client | None = None
         self._client_cm: Any = None
 
+    def _aiomqtt_kwargs(self) -> dict[str, Any]:
+        """Return aiomqtt.Client kwargs for username/password/TLS.
+
+        Centralised so every call site (connect, send fallback, listen,
+        read_inbox, watch_inbox, list_agents, disconnect) gets the same
+        auth surface. Per-call kwargs (will, identifier, clean_session)
+        are merged on top of the dict returned here.
+        """
+        kwargs: dict[str, Any] = {}
+        if self.username is not None:
+            kwargs["username"] = self.username
+        if self.password is not None:
+            kwargs["password"] = self.password
+        if self._tls_context is not None:
+            kwargs["tls_context"] = self._tls_context
+        return kwargs
+
     @classmethod
-    def probe(cls, broker: str = "localhost", port: int = 1883) -> "AgentBus":
+    def probe(
+        cls,
+        broker: str = "localhost",
+        port: int = 1883,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        tls: bool = False,
+        ca_cert: str | None = None,
+        client_cert: str | None = None,
+        client_key: str | None = None,
+    ) -> "AgentBus":
         """Construct a broker-only instance for operations that don't need a
         registered agent identity (e.g. `list_agents`).
 
         The returned bus bypasses agent-id validation; it never publishes
         presence, never subscribes to an inbox topic, and must not be used
         to send. Use only for presence/discovery queries.
+
+        Auth/TLS kwargs mirror ``__init__``.
         """
         self = cls.__new__(cls)
         self.agent_id = "_probe"
@@ -95,6 +194,18 @@ class AgentBus:
         self.port = port
         self.retain = False
         self.persistent = False
+        self.username = username
+        self.password = password
+        self.tls = tls
+        self.ca_cert = ca_cert
+        self.client_cert = client_cert
+        self.client_key = client_key
+        self._tls_context = _build_tls_context(
+            tls=tls,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
         self._handlers = []
         self._client = None
         self._client_cm = None
@@ -127,7 +238,7 @@ class AgentBus:
         """
         if self._client is not None:
             return
-        self._client_cm = aiomqtt.Client(self.broker, port=self.port)
+        self._client_cm = aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs())
         self._client = await self._client_cm.__aenter__()
 
     async def close(self) -> None:
@@ -186,7 +297,7 @@ class AgentBus:
         if self._client is not None:
             await self._client.publish(topic, payload, qos=1, retain=self.retain)
         else:
-            async with aiomqtt.Client(self.broker, port=self.port) as client:
+            async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
                 await client.publish(topic, payload, qos=1, retain=self.retain)
 
         if outbox_path:
@@ -220,7 +331,7 @@ class AgentBus:
         # Persistent session: stable client identifier + clean_session=False
         # so the broker queues QoS1 messages for this agent when the listener
         # is offline, and redelivers them on reconnect.
-        client_kwargs: dict[str, Any] = {"will": will}
+        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs(), "will": will}
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
@@ -281,7 +392,7 @@ class AgentBus:
         (e.g. the MCP tool surface) must catch it themselves.
         """
         messages: list[dict] = []
-        async with aiomqtt.Client(self.broker, port=self.port) as client:
+        async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             try:
                 async with asyncio_timeout(drain_timeout):
@@ -310,7 +421,7 @@ class AgentBus:
         unreachable; callers that want graceful None-on-error (e.g. the MCP
         tool surface) must catch it themselves.
         """
-        async with aiomqtt.Client(self.broker, port=self.port) as client:
+        async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             try:
                 async with asyncio_timeout(timeout):
@@ -332,7 +443,7 @@ class AgentBus:
         graceful empty-list fallback must catch it.
         """
         online: set[str] = set()
-        async with aiomqtt.Client(self.broker, port=self.port) as client:
+        async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
             await client.subscribe("agents/+/presence", qos=0)
             try:
                 async with asyncio_timeout(collect_window):
@@ -356,7 +467,7 @@ class AgentBus:
     async def disconnect(self) -> None:
         """Publish offline presence (retained). Call before process exit if
         not using listen()."""
-        async with aiomqtt.Client(self.broker, port=self.port) as client:
+        async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
             await client.publish(
                 f"agents/{self.agent_id}/presence",
                 json.dumps({"agent": self.agent_id, "status": "offline"}),
