@@ -28,14 +28,14 @@ specs-vs-implementation audit.
       vars. Real scope; probably its own session. Would remove a lot of
       `--broker`/`--agent-id` repetition in systemd units and scripts.
 
-- [ ] **Broker auth (username/password) has no CLI surface.**
+- [x] **Broker auth (username/password) has no CLI surface.**
       aiomqtt.Client accepts `username=`/`password=` kwargs; AgentBus
       never forwards them. Fine for tailnet-only deployments (Tailscale
       is the auth layer there), blocking for anything else. Expose as
       `--username/--password` (or env vars) on `swarmbus start` and
       `swarmbus send`.
 
-- [ ] **TLS flags not exposed.** `--tls`/`--ca-certs`/`--tls-insecure`
+- [x] **TLS flags not exposed.** `--tls`/`--ca-certs`/`--tls-insecure`
       all missing. Same story — the spec implied cross-machine
       security via Tailscale, so TLS got silently dropped. For any
       deployment outside a VPN this is a real blocker. Pair with the
