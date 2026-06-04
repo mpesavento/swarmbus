@@ -378,21 +378,32 @@ class AgentBus:
                 backoff = min(backoff * 2, reconnect_max)
 
     async def read_inbox(self, max_messages: int = 10, drain_timeout: float = 1.0) -> list[dict]:
-        """Non-blocking drain of **retained** messages for this agent.
+        """Non-blocking drain of queued messages for this agent.
 
-        Opens a fresh non-persistent MQTT session per call. That means only
-        messages sent with `retain=True` are visible — ordinary directed
-        sends (our default, `retain=False`) that arrived while no subscriber
-        was connected are already gone. For durable delivery of non-retained
-        sends, keep a listener daemon up: `swarmbus start --agent-id <me>`.
+        By default, opens a fresh non-persistent MQTT session per call —
+        only messages sent with ``retain=True`` are visible.
 
-        Returns a list of message dicts (up to `max_messages`). Malformed
-        envelopes are skipped. Raises `aiomqtt.MqttError` if the broker is
+        When ``self.persistent`` is True, connects with a stable client
+        identifier (``swarmbus-<agent_id>``) and ``clean_session=False``.
+        The broker queues QoS1 messages for this agent between calls and
+        redelivers them on reconnect — no listener daemon required for
+        durable delivery.  Only one client can hold a persistent session
+        at a time; do not run a daemon and persistent MCP server for the
+        same agent-id.
+
+        Returns a list of message dicts (up to ``max_messages``). Malformed
+        envelopes are skipped. Raises ``aiomqtt.MqttError`` if the broker is
         unreachable — callers that want graceful empty-on-error behaviour
         (e.g. the MCP tool surface) must catch it themselves.
         """
+        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
+        if self.persistent:
+            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["clean_session"] = False
         messages: list[dict] = []
-        async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
+        async with aiomqtt.Client(
+            self.broker, port=self.port, **client_kwargs
+        ) as client:
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             try:
                 async with asyncio_timeout(drain_timeout):
@@ -411,17 +422,27 @@ class AgentBus:
     async def watch_inbox(self, timeout: float = 30.0) -> dict | None:
         """Long-poll — blocks until a message arrives, returns it, or times out.
 
-        Opens a fresh non-persistent MQTT session. Only catches messages
-        **published while this call is active**, plus any with `retain=True`
-        on subscribe. If a durable listener daemon is already running for
-        this agent-id, it will race with you for the same message — use one
-        or the other, not both, for the same id.
+        By default, opens a fresh non-persistent MQTT session. Only catches
+        messages **published while this call is active**, plus any with
+        ``retain=True`` on subscribe.
 
-        Returns None on timeout. Raises `aiomqtt.MqttError` if the broker is
-        unreachable; callers that want graceful None-on-error (e.g. the MCP
-        tool surface) must catch it themselves.
+        When ``self.persistent`` is True, connects with a stable client
+        identifier and ``clean_session=False`` so queued QoS1 messages
+        from previous sessions are also delivered.  Same mutual-exclusion
+        caveat as ``read_inbox``: do not run a daemon and persistent MCP
+        server for the same agent-id.
+
+        Returns None on timeout. Raises ``aiomqtt.MqttError`` if the broker
+        is unreachable; callers that want graceful None-on-error (e.g. the
+        MCP tool surface) must catch it themselves.
         """
-        async with aiomqtt.Client(self.broker, port=self.port, **self._aiomqtt_kwargs()) as client:
+        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
+        if self.persistent:
+            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["clean_session"] = False
+        async with aiomqtt.Client(
+            self.broker, port=self.port, **client_kwargs
+        ) as client:
             await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
             try:
                 async with asyncio_timeout(timeout):

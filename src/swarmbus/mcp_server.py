@@ -11,6 +11,7 @@ Register in .claude/settings.json:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -46,6 +47,8 @@ def create_mcp_app(
     broker: str = "localhost",
     port: int = 1883,
     *,
+    persistent: bool = False,
+    presence: bool = False,
     username: str | None = None,
     password: str | None = None,
     tls: bool = False,
@@ -58,6 +61,7 @@ def create_mcp_app(
         agent_id=agent_id,
         broker=broker,
         port=port,
+        persistent=persistent,
         username=username,
         password=password,
         tls=tls,
@@ -85,7 +89,7 @@ def create_mcp_app(
 
     @app.tool(name="read_inbox")
     async def read_inbox() -> list[dict]:
-        """Poll for queued messages (retain=True). Returns up to 10 recent messages."""
+        """Poll for queued messages. Returns up to 10 recent messages."""
         try:
             return await bus.read_inbox()
         except aiomqtt.MqttError as exc:
@@ -118,6 +122,8 @@ def run_mcp_server(
     broker: str = "localhost",
     port: int = 1883,
     *,
+    persistent: bool = False,
+    presence: bool = False,
     username: str | None = None,
     password: str | None = None,
     tls: bool = False,
@@ -125,7 +131,13 @@ def run_mcp_server(
     client_cert: str | None = None,
     client_key: str | None = None,
 ) -> None:
-    """Start the MCP sidecar. Called by CLI `swarmbus mcp-server`."""
+    """Start the MCP sidecar. Called by CLI `swarmbus mcp-server`.
+
+    When ``presence`` is True, publishes a retained "online" message to
+    ``agents/<agent_id>/presence`` on startup and "offline" on shutdown.
+    This makes the agent visible to ``list_agents`` without requiring a
+    separate listener daemon.
+    """
     if not _MCP_AVAILABLE:
         raise RuntimeError(
             "mcp package not installed. Run: uv pip install 'swarmbus[mcp]''"
@@ -138,6 +150,8 @@ def run_mcp_server(
         agent_id=agent_id,
         broker=broker,
         port=port,
+        persistent=persistent,
+        presence=presence,
         username=username,
         password=password,
         tls=tls,
@@ -150,4 +164,33 @@ def run_mcp_server(
     for name, fn in app._tool_fns.items():
         mcp.tool(name=name)(fn)
 
-    mcp.run(transport="stdio")
+    # Presence lifecycle: announce online before serving, offline on exit.
+    bus: AgentBus | None = None
+    if presence:
+        bus = AgentBus(
+            agent_id=agent_id,
+            broker=broker,
+            port=port,
+            persistent=False,  # presence uses a separate ephemeral connection
+            username=username,
+            password=password,
+            tls=tls,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
+        try:
+            asyncio.run(bus.announce())
+            logger.info("Published online presence for %s", agent_id)
+        except Exception as exc:
+            logger.warning("Failed to publish online presence: %s", exc)
+
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        if bus is not None:
+            try:
+                asyncio.run(bus.disconnect())
+                logger.info("Published offline presence for %s", agent_id)
+            except Exception as exc:
+                logger.warning("Failed to publish offline presence: %s", exc)

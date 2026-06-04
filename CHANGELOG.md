@@ -55,6 +55,8 @@ First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker rea
 - `--reply-to` flag on `swarmbus send` for threading.
 - `--outbox <path>` on send + `SWARMBUS_OUTBOX` / `SWARMBUS_OUTBOX_<ID>` env vars (with `{agent_id}` templating + agent-scoped overrides) so outbound messages archive symmetrically with the inbox.
 - `--persistent / --no-persistent` on `swarmbus start` — default on. Uses MQTT persistent sessions (stable client-id + `clean_session=False`) so queued QoS1 messages survive daemon restarts.
+- `--persistent / --no-persistent` on `swarmbus mcp-server` — default off. When enabled, `read_inbox` and `watch_inbox` connect with a stable client identifier so the broker queues QoS1 messages between MCP server restarts. Replaces the listener daemon for MCP-based agents.
+- `--presence / --no-presence` on `swarmbus mcp-server` — default off. Publishes retained online/offline presence so `list_agents` works without a listener daemon.
 - `AgentBus.probe()` classmethod for broker-only operations that don't need a registered identity (replaces an earlier magical `agent_id="_probe"` pattern).
 - `examples/claude-code-wake.sh` — reactive wake wrapper for Claude Code peers. Priority-gated (default `high`-only), envelope sanitization, logs to `~/.local/state/swarmbus-wake/`.
 - `examples/openclaw-wake.sh` — same for OpenClaw peers. Includes envelope sanitizer (strips control chars, caps length, labels `[UNTRUSTED PEER METADATA]`) so hostile subjects can't smuggle prompt injection.

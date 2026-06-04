@@ -846,17 +846,52 @@ def _detect_agent_id() -> str:
 @click.option("--agent-id", required=True, help="This agent's ID")
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
+@click.option(
+    "--persistent/--no-persistent",
+    default=False,
+    show_default=True,
+    help="Use an MQTT persistent session so queued QoS1 messages survive "
+         "between MCP server restarts. Enables durable delivery without a "
+         "listener daemon. Only one client per agent-id can hold the "
+         "persistent session -- do not combine with a running daemon.",
+)
+@click.option(
+    "--presence/--no-presence",
+    default=False,
+    show_default=True,
+    help="Publish retained presence on startup (online) and shutdown "
+         "(offline). Makes this agent visible to `list_agents` without "
+         "a listener daemon.",
+)
 @_broker_auth_options
-def mcp_server(agent_id: str, broker: str, port: int,
-               username: str | None, password: str | None, tls: bool,
-               ca_cert: str | None, client_cert: str | None,
-               client_key: str | None) -> None:
+def mcp_server(
+    agent_id: str,
+    broker: str,
+    port: int,
+    persistent: bool,
+    presence: bool,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
     """Start the MCP sidecar for this agent."""
     from .mcp_server import run_mcp_server
-    run_mcp_server(agent_id=agent_id, broker=broker, port=port,
-                   username=username, password=password, tls=tls,
-                   ca_cert=ca_cert, client_cert=client_cert,
-                   client_key=client_key)
+    run_mcp_server(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        persistent=persistent,
+        presence=presence,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
 
 
 # ---------------------------------------------------------------------------

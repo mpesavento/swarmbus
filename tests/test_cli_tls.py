@@ -189,6 +189,28 @@ def test_mcp_server_picks_up_env_vars():
     assert kw["tls"] is True
 
 
+def test_mcp_server_persistent_flag_threads_through():
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb", "--persistent"],
+        )
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["persistent"] is True
+
+
+def test_mcp_server_no_persistent_is_default():
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb"],
+        )
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["persistent"] is False
+
+
 # ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
