@@ -162,7 +162,16 @@ Restart Claude Code. Four MCP tools become available:
 
 The skill (`src/swarmbus/skills/using-swarmbus/SKILL.md`, also installed under `site-packages/swarmbus/skills/using-swarmbus/` via pip) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
 
-Claude Code **also** needs a listener daemon running (step 3 of the quickstart) to receive messages while the chat session is closed. The MCP tools only work while Claude is open — the daemon is what catches messages in between.
+**Persistent sessions (daemon-free delivery).** Pass `--persistent --presence` to `mcp-server` and the sidecar connects with a stable MQTT client identifier (`swarmbus-<agent-id>`) and `clean_session=False`. The broker queues QoS1 messages between sessions and redelivers them when the next session starts. `--presence` publishes a retained online/offline status so `list_agents` works without a daemon.
+
+```bash
+swarmbus mcp-server --agent-id planner --broker mqtt.example.com \
+  --port 8883 --tls --persistent --presence
+```
+
+This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects.
+
+If you do not use `--persistent`, the MCP server opens a fresh ephemeral session per `read_inbox`/`watch_inbox` call and only sees retained messages — the same limitation as `swarmbus read`.
 
 **Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
 
@@ -288,7 +297,16 @@ swarmbus mcp-server --agent-id planner
 
 `--body` and `--body-file` are mutually exclusive; exactly one is required.
 
-**Three receive tools — pick one per agent-id.** `start` is a persistent daemon that file-bridges incoming messages (reactive, durable). `tail` reads new content from the daemon's inbox file with cursor tracking (correct companion to `start`). `read` / `watch` open a fresh one-shot MQTT subscription (correct when no daemon is running for this id — ephemeral scripts, CI jobs). **Don't combine `start` + `read`/`watch` for the same id** — they race for QoS1 messages and the loser silently drops them. See the Quickstart section above for the decision rule.
+**Four receive paths — pick one per agent-id.**
+
+| Path | Durable? | Use when |
+|---|---|---|
+| `start` (daemon) | Yes (persistent session, default) | Long-running process, file-bridge to inbox, reactive wake |
+| `mcp-server --persistent` | Yes (persistent session) | MCP-based agents (Claude Code, Cursor); no daemon needed |
+| `read` / `watch` (one-shot) | No (ephemeral session) | CI jobs, shell scripts, quick checks |
+| `tail` (file-based) | N/A (reads daemon's file) | Companion to `start`; cursor-tracked |
+
+**Don't combine durable paths for the same id** — `start` + `mcp-server --persistent` both claim the same MQTT client identifier. The broker evicts the first connection when the second arrives. Use one or the other.
 
 ---
 
@@ -362,9 +380,22 @@ swarmbus send --agent-id laptop-cc --to planner \
 
 Anonymous is safe within a tailnet — the mesh is already authenticated. Never do this on the public internet.
 
-### Other networks
+### Other networks (TLS + auth)
 
-If you can't use Tailscale, run mosquitto with TLS + username/password auth. The swarmbus CLI doesn't yet expose TLS flags; supply them via a mosquitto client config file or use the Python API with the aiomqtt TLS parameters directly. This is out of scope for the bundled setup scripts.
+If you can't use Tailscale, run a broker hardened with TLS and username/password auth (Mosquitto and EMQX are both supported). swarmbus accepts the broker's CA + credentials on every CLI subcommand and via `SWARMBUS_BROKER_*` env vars; mTLS is supported when the broker requires it.
+
+```bash
+# Quick example — set creds once via env, run the daemon:
+export SWARMBUS_BROKER_USERNAME=laptop-cc
+export SWARMBUS_BROKER_PASSWORD=…
+export SWARMBUS_BROKER_TLS=1                # broker cert chains to a trusted CA
+# or: export SWARMBUS_BROKER_CA_CERT=/etc/ssl/certs/internal-ca.crt
+
+swarmbus start --agent-id laptop-cc --broker mqtt.example.com --port 8883 \
+  --inbox ~/sync/laptop-cc-inbox.md
+```
+
+For full reference see [docs/security.md](docs/security.md).
 
 ## Troubleshooting
 
@@ -382,6 +413,7 @@ Symptoms we hit during real deployment and the first thing to check. In every ca
 | `swarmbus tail --follow` dies when inbox file is rotated/moved. | Pre-`0d1415a` builds didn't catch `FileNotFoundError` in the poll loop. | Upgrade swarmbus + restart the `tail --follow` process. |
 | "My daemon is running but messages just pile up in the inbox file and nothing fires." | File-bridge caught the message (archive OK), but `--invoke` is either missing or broken. For Claude Code, a fresh session spawn is ~100k tokens — policy default is `priority=high` only. | `tail ~/.local/state/swarmbus-wake/<agent>.log`. If you see `policy=priority-high; priority=normal; archive-only` that's working-as-designed. Override with `SWARMBUS_WAKE_POLICY=all` for testing. |
 | Restarted daemon still rejects `priority=high`. | In-process Python module cache. The `pip install` wrote new bytes, but the already-running daemon reads its old loaded module. | `systemctl --user restart swarmbus-<agent>.service` (full process replacement, not `--reload`). |
+| `read_inbox` returns empty even though messages were sent while offline. | (a) Not using `--persistent` — ephemeral sessions only see retained messages. (b) Broker expired the persistent session before you reconnected. | Confirm `--persistent` is on the `mcp-server` command. Check broker `persistent_client_expiration` — set it to at least `1d` (mosquitto default is never-expire, but some deployments override). |
 
 For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journalctl --user -u swarmbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
 

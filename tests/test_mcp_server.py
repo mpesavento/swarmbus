@@ -119,3 +119,19 @@ async def test_list_agents_skips_malformed_payloads():
         app = create_mcp_app(agent_id="sparrow", broker="localhost")
         result = await app._tool_fns["list_agents"]()
     assert result == ["sparrow"]
+
+
+@pytest.mark.asyncio
+async def test_create_mcp_app_threads_persistent_to_bus():
+    with patch("swarmbus.mcp_server.AgentBus") as MockBus:
+        MockBus.return_value.send = AsyncMock()
+        create_mcp_app(agent_id="sparrow", broker="localhost", persistent=True)
+    assert MockBus.call_args.kwargs["persistent"] is True
+
+
+@pytest.mark.asyncio
+async def test_create_mcp_app_persistent_defaults_false():
+    with patch("swarmbus.mcp_server.AgentBus") as MockBus:
+        MockBus.return_value.send = AsyncMock()
+        create_mcp_app(agent_id="sparrow", broker="localhost")
+    assert MockBus.call_args.kwargs.get("persistent", False) is False
