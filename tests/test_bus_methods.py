@@ -319,3 +319,80 @@ async def test_send_outbox_agent_id_template_substitutes(tmp_path):
     assert "b1" in (tmp_path / "sparrow-outbox.md").read_text()
     assert "b2" in (tmp_path / "wren-outbox.md").read_text()
     assert "b2" not in (tmp_path / "sparrow-outbox.md").read_text()
+
+
+# --------------------------------------------------------------------------
+# read_inbox / watch_inbox persistent session kwargs
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_persistent_passes_identifier_and_clean_session():
+    """persistent=True → stable client-id + clean_session=False on read_inbox."""
+    captured_kwargs = {}
+    payloads = [_envelope(subject="queued")]
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__(payloads)
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        result = await bus.read_inbox(drain_timeout=0.1)
+    assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
+    assert captured_kwargs.get("clean_session") is False
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_non_persistent_omits_identifier():
+    """persistent=False (default) → no identifier or clean_session set."""
+    captured_kwargs = {}
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__([])
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=False)
+        await bus.read_inbox(drain_timeout=0.1)
+    assert "identifier" not in captured_kwargs
+    assert "clean_session" not in captured_kwargs
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_persistent_passes_identifier_and_clean_session():
+    """persistent=True → stable client-id + clean_session=False on watch_inbox."""
+    captured_kwargs = {}
+    payloads = [_envelope(subject="live")]
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__(payloads)
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        result = await bus.watch_inbox(timeout=0.1)
+    assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
+    assert captured_kwargs.get("clean_session") is False
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_non_persistent_omits_identifier():
+    """persistent=False (default) → no identifier or clean_session set."""
+    captured_kwargs = {}
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__([])
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=False)
+        await bus.watch_inbox(timeout=0.1)
+    assert "identifier" not in captured_kwargs
+    assert "clean_session" not in captured_kwargs

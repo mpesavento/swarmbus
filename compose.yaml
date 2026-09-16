@@ -1,0 +1,7 @@
+services:
+  test:
+    build:
+      context: .
+      args:
+        PYTHON_VERSION: "${PYTHON_VERSION:-3.12}"
+    command: pytest -v --tb=short

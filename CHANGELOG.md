@@ -16,39 +16,13 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
-## [0.1.4] — 2026-04-27
+## [0.1.5] — 2026-09-16
 
 ### Added
-- `examples/openclaw-bridge.mjs` — Node helper that delivers swarmbus messages to a running OpenClaw agent by speaking the gateway WebSocket protocol directly via plugin-sdk's `GatewayClient`. Skips the ~24 s `openclaw agent` CLI cold-start.
-- `OPENCLAW_WAKE_USE_CLI=1` env flag on `examples/openclaw-wake.sh` to force the legacy CLI path on hosts without a running gateway daemon.
-- `scripts/bench_wake.py` — bench harness comparing both wake paths against a deliberately bogus agent id (no real agent woken, no tokens spent).
-- `docs/openclaw-wake.md` — wake-path design reference and troubleshooting.
-
-### Changed
-- `examples/openclaw-wake.sh` now bridges the gateway WebSocket by default (~840 ms of dispatch overhead on a Raspberry Pi 5, ~30× faster than the CLI path). The CLI path remains as opt-in fallback via `OPENCLAW_WAKE_USE_CLI=1`.
-- `swarmbus init --host-type openclaw` wires the new wake script.
-
-**Wire-compat:** No envelope, topic, QoS, or MCP tool changes. The `--invoke` script's command-line interface is unchanged. Safe to upgrade in place.
-
----
-
-## [0.1.3] — 2026-04-23
-
-### Changed
-- CI now runs tests on the `dev` branch in addition to `main`.
-
-### Internal
-- Wired PyPI trusted publisher (OIDC) — future `v*` tag pushes auto-publish without an API token.
-
-**Wire-compat:** No envelope, topic, QoS, or MCP tool changes. Safe to upgrade in place.
-
----
-
-## [Unreleased] — 2026-04-14
-
-First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker reachable over loopback for now, Tailscale cross-host documented but not yet exercised in anger.
-
-### Added
+- **mTLS and MQTT auth support** (PR #12, closes #7) — MCP sidecar and CLI support for mTLS and username/password authentication. Credentials may be passed via CLI flags or environment variables; persisted into systemd auth sidecar if needed. Details in `docs/security.md`.
+- **Persistent MCP sessions** (PR #13) — `--persistent / --no-persistent` on `swarmbus mcp-server` (default off). When enabled, `read_inbox` and `watch_inbox` connect with a stable client identifier so the broker queues QoS1 messages between MCP server restarts. Replaces the listener daemon for MCP-based agents.
+- **Optional presence broadcasts** (PR #13) — `--presence / --no-presence` on `swarmbus mcp-server` (default off). Publishes retained online/offline presence so `list_agents` works without a listener daemon. Partial progress toward #8.
+- **Local testing infrastructure** (PR #11) — `Dockerfile`, `Makefile`, `compose.yaml`, and `.dockerignore` for `make`/`docker compose` driven local testing.
 - `swarmbus read` / `watch` / `list` / `tail` CLI subcommands (CLI now at full parity with the MCP tool surface, plus a file-tailer that works without racing a running daemon). Cursor-aware `tail` with inode-change detection for rotation safety.
 - `--priority {low,normal,high}` flag on `swarmbus send`. The envelope field always existed; the CLI never exposed it before.
 - `--reply-to` flag on `swarmbus send` for threading.
@@ -90,6 +64,34 @@ First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker rea
 2. **Topic layout — no change.**
 3. **Retain/QoS defaults — no change.** Inbox/broadcast stays `retain=False, qos=1`; presence stays `retain=True, qos=1`.
 4. **MCP tool contract — no change.** Names, parameters, and return types are stable; signature assertions added in `tests/test_integration.py` to prevent silent drift.
+
+---
+
+## [0.1.4] — 2026-04-27
+
+### Added
+- `examples/openclaw-bridge.mjs` — Node helper that delivers swarmbus messages to a running OpenClaw agent by speaking the gateway WebSocket protocol directly via plugin-sdk's `GatewayClient`. Skips the ~24 s `openclaw agent` CLI cold-start.
+- `OPENCLAW_WAKE_USE_CLI=1` env flag on `examples/openclaw-wake.sh` to force the legacy CLI path on hosts without a running gateway daemon.
+- `scripts/bench_wake.py` — bench harness comparing both wake paths against a deliberately bogus agent id (no real agent woken, no tokens spent).
+- `docs/openclaw-wake.md` — wake-path design reference and troubleshooting.
+
+### Changed
+- `examples/openclaw-wake.sh` now bridges the gateway WebSocket by default (~840 ms of dispatch overhead on a Raspberry Pi 5, ~30× faster than the CLI path). The CLI path remains as opt-in fallback via `OPENCLAW_WAKE_USE_CLI=1`.
+- `swarmbus init --host-type openclaw` wires the new wake script.
+
+**Wire-compat:** No envelope, topic, QoS, or MCP tool changes. The `--invoke` script's command-line interface is unchanged. Safe to upgrade in place.
+
+---
+
+## [0.1.3] — 2026-04-23
+
+### Changed
+- CI now runs tests on the `dev` branch in addition to `main`.
+
+### Internal
+- Wired PyPI trusted publisher (OIDC) — future `v*` tag pushes auto-publish without an API token.
+
+**Wire-compat:** No envelope, topic, QoS, or MCP tool changes. Safe to upgrade in place.
 
 ---
 
