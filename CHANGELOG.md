@@ -49,6 +49,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 First-day-in-production iteration. Sparrow + Wren deployed on an RPi, broker reachable over loopback for now, Tailscale cross-host documented but not yet exercised in anger.
 
 ### Added
+- MCP Sidecar and CLI support for mTLS and username / password. May be passed via command line or environment variable. Credentials persisted into systemd auth sidecar if needed. Details in `docs/security.md`.
 - `swarmbus read` / `watch` / `list` / `tail` CLI subcommands (CLI now at full parity with the MCP tool surface, plus a file-tailer that works without racing a running daemon). Cursor-aware `tail` with inode-change detection for rotation safety.
 - `--priority {low,normal,high}` flag on `swarmbus send`. The envelope field always existed; the CLI never exposed it before.
 - `--reply-to` flag on `swarmbus send` for threading.

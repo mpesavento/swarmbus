@@ -41,9 +41,30 @@ class _MCPApp:
         return decorator(fn) if fn else decorator
 
 
-def create_mcp_app(agent_id: str, broker: str = "localhost", port: int = 1883) -> _MCPApp:
+def create_mcp_app(
+    agent_id: str,
+    broker: str = "localhost",
+    port: int = 1883,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    tls: bool = False,
+    ca_cert: str | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
+) -> _MCPApp:
     """Create and return the MCP app (testable without running the server)."""
-    bus = AgentBus(agent_id=agent_id, broker=broker, port=port)
+    bus = AgentBus(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
     app = _MCPApp()
 
     @app.tool(name="send_message")
@@ -92,7 +113,18 @@ def create_mcp_app(agent_id: str, broker: str = "localhost", port: int = 1883) -
     return app
 
 
-def run_mcp_server(agent_id: str, broker: str = "localhost", port: int = 1883) -> None:
+def run_mcp_server(
+    agent_id: str,
+    broker: str = "localhost",
+    port: int = 1883,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    tls: bool = False,
+    ca_cert: str | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
+) -> None:
     """Start the MCP sidecar. Called by CLI `swarmbus mcp-server`."""
     if not _MCP_AVAILABLE:
         raise RuntimeError(
@@ -102,7 +134,17 @@ def run_mcp_server(agent_id: str, broker: str = "localhost", port: int = 1883) -
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("swarmbus")
-    app = create_mcp_app(agent_id=agent_id, broker=broker, port=port)
+    app = create_mcp_app(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
 
     # Register tool functions with the real FastMCP instance
     for name, fn in app._tool_fns.items():
