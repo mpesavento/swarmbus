@@ -82,6 +82,10 @@ _log() {
   printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"
 }
 
+# Portable inode/size — GNU stat (Linux) uses -c, BSD stat (macOS) uses -f.
+_stat_inode() { stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"; }
+_stat_size() { stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1"; }
+
 if [ "$RESET_CURSOR" = 1 ]; then
   rm -f "$CURSOR_FILE"
 fi
@@ -99,8 +103,8 @@ if [ -f "$CURSOR_FILE" ]; then
   cursor="${cursor:-0}"
 fi
 
-current_inode=$(stat -c '%i' "$INBOX")
-current_size=$(stat -c '%s' "$INBOX")
+current_inode=$(_stat_inode "$INBOX")
+current_size=$(_stat_size "$INBOX")
 
 if [ -n "$stored_inode" ] && [ "$stored_inode" != "$current_inode" ]; then
   _log "inode changed ($stored_inode -> $current_inode); resetting"
@@ -167,7 +171,8 @@ else
   exit 0
 fi
 
-response=$(curl -s -o /tmp/inbox-watch-curl.out -w '%{http_code}' \
+curl_out="$STATE_DIR/inbox-watch-curl.out"
+response=$(curl -s -o "$curl_out" -w '%{http_code}' \
   "https://api.telegram.org/bot${token}/sendMessage" \
   --data-urlencode "chat_id=${CHAT_ID}" \
   --data-urlencode "text=${msg}" \
@@ -177,6 +182,6 @@ if [ "$response" = "200" ]; then
   printf '%s %s\n' "$current_size" "$current_inode" > "$CURSOR_FILE"
   _log "pushed summary (${n_messages} msgs); cursor advanced to $current_size"
 else
-  _log "push failed (http $response); cursor NOT advanced. body=$(cat /tmp/inbox-watch-curl.out)"
+  _log "push failed (http $response); cursor NOT advanced. body=$(cat "$curl_out")"
   exit 1
 fi
