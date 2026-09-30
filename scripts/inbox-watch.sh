@@ -109,12 +109,10 @@ current_size=$(_stat_size "$INBOX")
 if [ -n "$stored_inode" ] && [ "$stored_inode" != "$current_inode" ]; then
   _log "inode changed ($stored_inode -> $current_inode); resetting"
   cursor=0
-  printf '%s %s\n' "$cursor" "$current_inode" > "$CURSOR_FILE"
 fi
 if [ "$current_size" -lt "$cursor" ]; then
   _log "size shrank ($current_size < $cursor); resetting"
   cursor=0
-  printf '%s %s\n' "$cursor" "$current_inode" > "$CURSOR_FILE"
 fi
 
 if [ "$current_size" = "$cursor" ]; then
@@ -129,9 +127,6 @@ headers=$(printf '%s' "$new_content" | grep -E '^## \[' || true)
 
 if [ -z "$headers" ]; then
   _log "new bytes but no complete header; skipping"
-  # Record what we have seen so a header-less tail (e.g. a freshly cleared inbox)
-  # converges instead of being re-examined on every tick.
-  printf '%s %s\n' "$current_size" "$current_inode" > "$CURSOR_FILE"
   exit 0
 fi
 
