@@ -11,8 +11,10 @@ Scenarios not yet covered (deliberately — see README or issues):
   * LWT on unclean TCP abort — cannot reliably force from test code
 """
 import asyncio
+import inspect
 import json
 import os
+import sqlite3
 import stat
 import sys
 from pathlib import Path
@@ -20,7 +22,7 @@ from pathlib import Path
 import aiomqtt
 import pytest
 
-from swarmbus.archive import SQLiteArchive
+from swarmbus.archive import SQLiteArchive, SQLiteMessageStore
 from swarmbus.bus import AgentBus
 from swarmbus.handlers.base import BaseHandler
 from swarmbus._compat import asyncio_timeout
@@ -28,6 +30,7 @@ from swarmbus.handlers.direct_invoke import DirectInvocationHandler
 from swarmbus.handlers.file_bridge import FileBridgeHandler
 from swarmbus.mcp_server import create_mcp_app
 from swarmbus.message import AgentMessage
+from swarmbus.runtime import ManagedMCPRuntime
 
 
 class CollectingHandler(BaseHandler):
@@ -242,6 +245,162 @@ async def test_persistent_client_multiple_sends(mosquitto_broker):
 
 
 @pytest.mark.asyncio
+async def test_persistent_runtime_replays_offline_delivery_across_restarts(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A persistent consumer must durably receive an offline delivery."""
+    host, port = mosquitto_broker
+    state_path = tmp_path / "consumer.sqlite3"
+    runtimes: list[ManagedMCPRuntime] = []
+
+    def new_runtime() -> ManagedMCPRuntime:
+        runtime = ManagedMCPRuntime(
+            agent_id="consumer",
+            broker=host,
+            port=port,
+            persistent=True,
+            state_path=state_path,
+        )
+        runtimes.append(runtime)
+        return runtime
+
+    try:
+        subscriber = new_runtime()
+        await subscriber.start()
+        await subscriber.wait_until_ready()
+        await subscriber.stop()
+
+        sender = AgentBus(
+            agent_id="sender",
+            broker=host,
+            port=port,
+            retain=False,
+        )
+        await sender.send(
+            to="consumer",
+            subject="offline",
+            body="queued while receiver was offline",
+        )
+
+        replayer = new_runtime()
+        await replayer.start()
+        await replayer.wait_until_ready()
+
+        deadline = asyncio.get_running_loop().time() + 3.0
+        unread = 0
+        while asyncio.get_running_loop().time() < deadline:
+            with sqlite3.connect(state_path) as db:
+                unread = db.execute(
+                    """SELECT COUNT(*) FROM inbox_messages
+                       WHERE acknowledged_at IS NULL"""
+                ).fetchone()[0]
+            if unread == 1:
+                break
+            await asyncio.sleep(0.05)
+        assert unread == 1
+
+        await replayer.stop()
+
+        drainer = new_runtime()
+        await drainer.start()
+        await drainer.wait_until_ready()
+        app = create_mcp_app(drainer)
+        messages = await app._tool_fns["read_inbox"]()
+
+        assert len(messages) == 1
+        assert messages[0]["from"] == "sender"
+        assert messages[0]["to"] == "consumer"
+        assert messages[0]["subject"] == "offline"
+        assert messages[0]["body"] == "queued while receiver was offline"
+    finally:
+        for runtime in reversed(runtimes):
+            await runtime.stop()
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier="swarmbus-consumer",
+            clean_session=True,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_persistent_runtime_redelivers_after_first_store_failure(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A failed durable write must remain unacked and redeliver exactly once."""
+    host, port = mosquitto_broker
+    state_path = tmp_path / "receiver.sqlite3"
+
+    class _FailOnceStore(SQLiteMessageStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.attempts = 0
+
+        async def store(self, msg, *, source_topic, received_at=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise sqlite3.OperationalError("injected first-write failure")
+            return await super().store(
+                msg,
+                source_topic=source_topic,
+                received_at=received_at,
+            )
+
+    store = _FailOnceStore(state_path)
+    runtime = ManagedMCPRuntime(
+        agent_id="receiver",
+        broker=host,
+        port=port,
+        persistent=True,
+        state_path=state_path,
+        store=store,
+    )
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+        sender = AgentBus(
+            agent_id="sender",
+            broker=host,
+            port=port,
+            retain=False,
+        )
+        await sender.send(
+            to="receiver",
+            subject="retry",
+            body="commit after broker redelivery",
+        )
+
+        deadline = asyncio.get_running_loop().time() + 5.0
+        row_count = 0
+        while asyncio.get_running_loop().time() < deadline:
+            with sqlite3.connect(state_path) as db:
+                row_count = db.execute(
+                    "SELECT COUNT(*) FROM inbox_messages"
+                ).fetchone()[0]
+            if store.attempts >= 2 and row_count == 1:
+                break
+            await asyncio.sleep(0.05)
+
+        assert store.attempts >= 2
+        assert row_count == 1
+        messages = await runtime.read_inbox()
+        assert len(messages) == 1
+        assert messages[0]["body"] == "commit after broker redelivery"
+    finally:
+        await runtime.stop()
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier="swarmbus-receiver",
+            clean_session=True,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_retained_presence_late_subscriber(mosquitto_broker):
     """Late subscriber to agents/+/presence must see who's currently online."""
     host, port = mosquitto_broker
@@ -272,22 +431,37 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
 
 
 @pytest.mark.asyncio
-async def test_list_agents_mcp_tool_sees_online_agents(mosquitto_broker):
-    """End-to-end: two agents listening → list_agents MCP tool returns both."""
+async def test_list_agents_mcp_tool_sees_online_agents(
+    mosquitto_broker,
+    tmp_path,
+):
+    """End-to-end: the managed runtime exposes retained online presence."""
     host, port = mosquitto_broker
 
     a = AgentBus(agent_id="one", broker=host, port=port, retain=False)
     b = AgentBus(agent_id="two", broker=host, port=port, retain=False)
     t_a = asyncio.create_task(a.listen())
     t_b = asyncio.create_task(b.listen())
-    await asyncio.sleep(0.4)  # let both retained online publishes settle
+    await asyncio.sleep(0.4)
 
+    runtime = ManagedMCPRuntime(
+        agent_id="observer",
+        broker=host,
+        port=port,
+        state_path=tmp_path / "observer.sqlite3",
+    )
     try:
-        app = create_mcp_app(agent_id="observer", broker=host, port=port)
-        result = await app._tool_fns["list_agents"]()
-        assert "one" in result
-        assert "two" in result
+        await runtime.start()
+        await runtime.wait_until_ready()
+        app = create_mcp_app(runtime)
+        for _ in range(20):
+            result = await app._tool_fns["list_agents"]()
+            if {"one", "two"}.issubset(result):
+                break
+            await asyncio.sleep(0.05)
+        assert {"one", "two"}.issubset(result)
     finally:
+        await runtime.stop()
         await _stop(t_a)
         await _stop(t_b)
         await _clear_retained(host, port, [
@@ -520,26 +694,38 @@ async def test_send_receive_large_body_at_limit(mosquitto_broker):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tools_expose_expected_signatures():
+async def test_mcp_tools_expose_expected_signatures(tmp_path):
     """MCP tool signatures are a public contract — anything consuming
     swarmbus via MCP (Claude Code sidecar, Cursor, custom clients) breaks
     if a tool name or parameter name changes. Assert the full tool shape."""
-    app = create_mcp_app(agent_id="sig-check", broker="localhost", port=1883)
+    assert list(inspect.signature(create_mcp_app).parameters) == ["runtime"]
 
-    expected = {"send_message", "read_inbox", "watch_inbox", "list_agents"}
+    runtime = ManagedMCPRuntime(
+        agent_id="sig-check",
+        state_path=tmp_path / "sig-check.sqlite3",
+    )
+    app = create_mcp_app(runtime)
+
+    expected = {
+        "send_message",
+        "read_inbox",
+        "list_agents",
+    }
     assert set(app._tool_fns.keys()) == expected
 
-    import inspect
     send_sig = inspect.signature(app._tool_fns["send_message"])
     # Positional/keyword params the LLM wire protocol depends on.
     assert set(send_sig.parameters.keys()) >= {"to", "subject", "body", "content_type"}
 
     read_sig = inspect.signature(app._tool_fns["read_inbox"])
-    assert len(read_sig.parameters) == 0  # no args
-
-    watch_sig = inspect.signature(app._tool_fns["watch_inbox"])
-    assert "timeout" in watch_sig.parameters
-    assert watch_sig.parameters["timeout"].default == 30.0
+    assert list(read_sig.parameters) == [
+        "ack_ids",
+        "max_messages",
+        "wait_seconds",
+    ]
+    assert read_sig.parameters["ack_ids"].default is None
+    assert read_sig.parameters["max_messages"].default == 10
+    assert read_sig.parameters["wait_seconds"].default == 0.0
 
     list_sig = inspect.signature(app._tool_fns["list_agents"])
     assert len(list_sig.parameters) == 0

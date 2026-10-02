@@ -672,3 +672,21 @@ def test_list_json():
     assert result.exit_code == 0, result.output
     import json as _json
     assert _json.loads(result.output) == ["sparrow", "wren"]
+
+
+def test_mcp_server_passes_state_dir():
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = runner.invoke(
+            main,
+            [
+                "mcp-server",
+                "--agent-id",
+                "sparrow",
+                "--state-dir",
+                "/tmp/swarmbus-state",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert run_server.call_args.kwargs["state_dir"] == "/tmp/swarmbus-state"
