@@ -145,7 +145,7 @@ The quickstart above uses the CLI path (#4 below) because it's the most universa
 
 ### 1. Claude Code — MCP server + behavioral skill
 
-Run the setup script. It registers the MCP server in `~/.claude/settings.json` **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches Claude when to send, read, watch, and list agents.
+Run the setup script. It registers the MCP server in `~/.claude/settings.json` **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches agents when to send, read, acknowledge, wait, and list agents.
 
 ```bash
 bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
@@ -153,25 +153,28 @@ bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
 bash scripts/setup-cc-plugin.sh planner localhost
 ```
 
-Restart Claude Code. Four MCP tools become available:
+Restart your agent harness. Three MCP tools become available:
 
 - `send_message(to, subject, body, content_type?)` — publish to a peer (or `to="broadcast"`)
-- `read_inbox()` — non-blocking check for queued messages
-- `watch_inbox(timeout)` — long-poll, returns when a message arrives
+- `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages
 - `list_agents()` — IDs of peers currently online
 
-The skill (`src/swarmbus/skills/using-swarmbus/SKILL.md`, also installed under `site-packages/swarmbus/skills/using-swarmbus/` via pip) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
+The skill (`src/swarmbus/skills/using-swarmbus/SKILL.md`, also installed under `site-packages/swarmbus/skills/using-swarmbus/` via pip) explains reply-to threading, inbox acknowledgement, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Agent harnesses should auto-load it when the user mentions a peer agent by name or asks about coordination.
 
-**Persistent sessions (daemon-free delivery).** Pass `--persistent --presence` to `mcp-server` and the sidecar connects with a stable MQTT client identifier (`swarmbus-<agent-id>`) and `clean_session=False`. The broker queues QoS1 messages between sessions and redelivers them when the next session starts. `--presence` publishes a retained online/offline status so `list_agents` works without a daemon.
+**Durable inbox (daemon-free delivery).** The MCP sidecar holds one MQTT connection for its process lifetime. Valid inbound messages are committed to the separate `inbox_messages` table in `<state-dir>/<agent-id>.sqlite3` before their QoS1 acknowledgement. `read_inbox` is non-destructive: the same stable message IDs remain available across reads and process restarts until a later call includes them in `ack_ids` after durable handling. Set `max_messages=0` for an acknowledgement-only call, or `wait_seconds>0` to long-poll without adding another MCP tool. A crash or lost transcript before application acknowledgement therefore causes at-least-once redelivery instead of silent loss.
+
+The default state directory is `~/.local/state/swarmbus` and can be changed with `--state-dir` or `SWARMBUS_STATE_DIR`. Managed state is private (directory mode `0700`, database mode `0600`); startup rejects unsafe existing permissions rather than weakening them. `SQLiteArchive.messages` remains an independent append/replace archive and is never imported into the inbox automatically.
+
+The MCP server defaults to a live-session MQTT subscription. Pass `--persistent --presence` so the broker also queues QoS1 messages while the sidecar is stopped and publishes retained online/offline status for `list_agents`:
 
 ```bash
 swarmbus mcp-server --agent-id planner --broker mqtt.example.com \
   --port 8883 --tls --persistent --presence
 ```
 
-This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects.
+This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects. Fatal runtime or schema failures surface as MCP tool errors instead of successful empty reads.
 
-If you do not use `--persistent`, the MCP server opens a fresh ephemeral session per `read_inbox`/`watch_inbox` call and only sees retained messages — the same limitation as `swarmbus read`.
+Without `--persistent`, messages received while the sidecar is running still survive process restarts in SQLite, but the broker does not queue messages sent while the sidecar is offline.
 
 **Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
 
