@@ -7,18 +7,33 @@ timeout and malformed-envelope branches directly.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
+
 import pytest
 from unittest.mock import patch
 
 import aiomqtt
 
-from swarmbus.bus import AgentBus
+from swarmbus.bus import AgentBus, _legacy_presence_payload
 from swarmbus.message import AgentMessage
+from swarmbus.registry import PresenceRecord
+from swarmbus.topics import DEFAULT_TOPICS
+
+#: Topic the inbox fixtures arrive on; every inbox test uses agent_id "me".
+_INBOX_TOPIC = DEFAULT_TOPICS.inbox("me")
 
 
 class _FakeMsg:
-    def __init__(self, payload: bytes, mid: int = 0, qos: int = 1):
+    """Minimal aiomqtt message carrying transport and topic metadata."""
+    def __init__(
+        self,
+        payload: bytes,
+        topic: str = _INBOX_TOPIC,
+        mid: int = 0,
+        qos: int = 1,
+    ):
         self.payload = payload
+        self.topic = topic
         self.mid = mid
         self.qos = qos
 
@@ -40,10 +55,43 @@ class _FakePaho:
         return 0
 
 
+def _legacy_presence(agent_id: str, status: str) -> _FakeMsg:
+    """Presence message exactly as AgentBus.listen/disconnect publish it."""
+    return _FakeMsg(
+        _legacy_presence_payload(agent_id, status).encode(),
+        DEFAULT_TOPICS.presence(agent_id),
+    )
+
+
+def _record_presence(
+    agent_id: str, state: str, *, topic_owner: str | None = None
+) -> _FakeMsg:
+    """Build a managed-runtime presence message."""
+    record = PresenceRecord(
+        agent_id=agent_id,
+        state=state,
+        connected_at=(
+            datetime.now(timezone.utc) if state == "online" else None
+        ),
+    )
+    return _FakeMsg(
+        record.to_json().encode(),
+        DEFAULT_TOPICS.presence(topic_owner or agent_id),
+    )
+
+
 class _FakeClient:
-    """Replays a preset list of payloads, then hangs (caller relies on timeout)."""
-    def __init__(self, payloads: list[bytes]):
-        self._payloads = payloads
+    """Replay preset payloads until the caller times out."""
+    def __init__(
+        self,
+        payloads: list[bytes] | list[_FakeMsg],
+        *,
+        topic: str = _INBOX_TOPIC,
+    ):
+        self._payloads = [
+            p if isinstance(p, _FakeMsg) else _FakeMsg(p, topic, mid=i)
+            for i, p in enumerate(payloads, start=1)
+        ]
         self.events: list = []
         self._client = _FakePaho(self.events)
 
@@ -57,11 +105,14 @@ class _FakeClient:
     async def subscribe(self, *_args, **_kwargs):
         pass
 
+    async def publish(self, topic, payload, **kwargs):
+        self.events.append(("publish", str(topic), payload, kwargs))
+
     @property
     def messages(self):
         async def _gen():
-            for i, p in enumerate(self._payloads, start=1):
-                yield _FakeMsg(p, mid=i)
+            for p in self._payloads:
+                yield p
         return _gen()
 
 
@@ -190,21 +241,81 @@ async def test_list_agents_broker_error_raises():
 
 
 # --------------------------------------------------------------------------
-# list_agents (existing coverage in test_mcp_server is solid; one direct test)
+# list_agents (test_mcp_server covers the tool surface; these are direct)
 # --------------------------------------------------------------------------
+
+
+async def _listed(messages: list[_FakeMsg]) -> list[str]:
+    """Run list_agents over a canned presence tree."""
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(messages)):
+        return await AgentBus.probe().list_agents(collect_window=0.1)
 
 
 @pytest.mark.asyncio
 async def test_list_agents_filters_offline():
-    payloads = [
-        json.dumps({"agent": "sparrow", "status": "online"}).encode(),
-        json.dumps({"agent": "wren", "status": "online"}).encode(),
-        json.dumps({"agent": "ghost", "status": "offline"}).encode(),
-    ]
-    with patch("swarmbus.bus.aiomqtt.Client", return_value=_FakeClient(payloads)):
-        bus = AgentBus.probe()
-        result = await bus.list_agents(collect_window=0.1)
-    assert result == ["sparrow", "wren"]
+    assert await _listed([
+        _legacy_presence("sparrow", "online"),
+        _legacy_presence("wren", "online"),
+        _legacy_presence("ghost", "offline"),
+    ]) == ["sparrow", "wren"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_reads_presence_record_shape():
+    """AgentBus accepts managed-runtime presence records."""
+    assert await _listed([
+        _record_presence("sparrow", "online"),
+        _record_presence("ghost", "offline"),
+    ]) == ["sparrow"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_mixes_legacy_and_record_shapes():
+    """Both shapes coexist on the presence tree during the transition."""
+    assert await _listed([
+        _legacy_presence("legacy-daemon", "online"),
+        _record_presence("managed-agent", "online"),
+    ]) == ["legacy-daemon", "managed-agent"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_trusts_topic_owner_not_payload_claim():
+    """Presence topic ownership overrides payload claims."""
+    assert await _listed([
+        _record_presence("sparrow", "online", topic_owner="wren"),
+    ]) == ["wren"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_skips_unattributable_presence_topic():
+    """Unattributable presence topics do not abort listing."""
+    assert await _listed([
+        _record_presence("imposter", "online", topic_owner="outer/inner"),
+        _legacy_presence("sparrow", "online"),
+    ]) == ["sparrow"]
+
+
+@pytest.mark.parametrize("junk", [b"[]", b"null", b"3"])
+@pytest.mark.asyncio
+async def test_list_agents_skips_non_dict_payloads(junk: bytes):
+    """Non-object JSON does not abort presence listing."""
+    assert await _listed([
+        _FakeMsg(junk, DEFAULT_TOPICS.presence("junk-publisher")),
+        _legacy_presence("sparrow", "online"),
+    ]) == ["sparrow"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_applies_last_presence_write_per_agent():
+    """Retained presence is last-write-wins, in both directions."""
+    assert await _listed([
+        _legacy_presence("sparrow", "offline"),
+        _legacy_presence("sparrow", "online"),
+    ]) == ["sparrow"]
+    assert await _listed([
+        _legacy_presence("sparrow", "online"),
+        _legacy_presence("sparrow", "offline"),
+    ]) == []
 
 
 @pytest.mark.asyncio
@@ -269,7 +380,7 @@ async def test_send_outbox_disabled_when_unset(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_listen_persistent_passes_stable_identifier_and_clean_session():
+async def test_listen_durable_passes_stable_identifier_and_clean_session():
     """persistent=True → stable client-id + clean_session=False on the MQTT client."""
     captured_kwargs = {}
 
@@ -299,7 +410,7 @@ async def test_listen_persistent_passes_stable_identifier_and_clean_session():
 
 
 @pytest.mark.asyncio
-async def test_listen_non_persistent_omits_identifier():
+async def test_listen_non_durable_omits_identifier():
     captured_kwargs = {}
 
     class _ClientStub:
@@ -349,7 +460,7 @@ async def test_send_outbox_agent_id_template_substitutes(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_persistent_passes_identifier_and_clean_session():
+async def test_read_inbox_durable_passes_identifier_and_clean_session():
     """persistent=True → stable client-id + clean_session=False on read_inbox."""
     captured_kwargs = {}
     payloads = [_envelope(subject="queued")]
@@ -368,7 +479,7 @@ async def test_read_inbox_persistent_passes_identifier_and_clean_session():
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_non_persistent_omits_identifier():
+async def test_read_inbox_non_durable_omits_identifier():
     """persistent=False (default) → no identifier or clean_session set."""
     captured_kwargs = {}
 
@@ -385,7 +496,7 @@ async def test_read_inbox_non_persistent_omits_identifier():
 
 
 @pytest.mark.asyncio
-async def test_watch_inbox_persistent_passes_identifier_and_clean_session():
+async def test_watch_inbox_durable_passes_identifier_and_clean_session():
     """persistent=True → stable client-id + clean_session=False on watch_inbox."""
     captured_kwargs = {}
     payloads = [_envelope(subject="live")]
@@ -404,7 +515,7 @@ async def test_watch_inbox_persistent_passes_identifier_and_clean_session():
 
 
 @pytest.mark.asyncio
-async def test_watch_inbox_non_persistent_omits_identifier():
+async def test_watch_inbox_non_durable_omits_identifier():
     """persistent=False (default) → no identifier or clean_session set."""
     captured_kwargs = {}
 
@@ -457,3 +568,36 @@ async def test_watch_inbox_non_persistent_never_touches_manual_ack():
     assert result["subject"] == "good"
     assert fake._client.manual_ack is None
     assert fake._client.acks == []
+
+@pytest.mark.asyncio
+async def test_persistent_watch_publishes_named_registry_and_presence():
+    captured_kwargs = {}
+    fake = _FakeClient([_envelope(subject="live")])
+
+    def client(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return fake
+
+    with patch("swarmbus.bus.aiomqtt.Client", client):
+        result = await AgentBus(
+            agent_id="sparrow",
+            persistent=True,
+        ).watch_inbox(timeout=0.1)
+
+    assert result is not None
+    will = captured_kwargs["will"]
+    assert str(will.topic) == DEFAULT_TOPICS.presence("sparrow")
+    assert json.loads(will.payload)["state"] == "offline"
+
+    publishes = [event for event in fake.events if event[0] == "publish"]
+    assert [event[1] for event in publishes] == [
+        DEFAULT_TOPICS.registry("sparrow"),
+        DEFAULT_TOPICS.presence("sparrow"),
+        DEFAULT_TOPICS.presence("sparrow"),
+    ]
+    registry = json.loads(publishes[0][2])
+    assert registry["lifecycle"] == "named"
+    assert registry["durability"] == "durable"
+    assert json.loads(publishes[1][2])["state"] == "online"
+    assert json.loads(publishes[2][2])["state"] == "offline"
+

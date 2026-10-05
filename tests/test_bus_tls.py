@@ -168,7 +168,7 @@ async def test_send_oneshot_passes_username_password_tls():
 
 
 @pytest.mark.asyncio
-async def test_listen_passes_auth_alongside_will_and_persistent():
+async def test_listen_passes_auth_alongside_will_and_durable():
     bus = AgentBus(
         agent_id="listener", broker="b", port=8883,
         username="alice", password="secret", tls=True,

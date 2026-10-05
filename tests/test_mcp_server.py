@@ -1,3 +1,4 @@
+from typing import get_args, get_type_hints
 from unittest.mock import AsyncMock, MagicMock
 
 import aiomqtt
@@ -5,10 +6,13 @@ import pytest
 
 from swarmbus.mcp_server import create_mcp_app
 from swarmbus.message import AgentMessage
+from swarmbus.registry import presence_payload
 from swarmbus.runtime import (
     ManagedMCPRuntime,
+    PresenceRequiredError,
     RuntimeFatalError,
     StoreUnavailable,
+    TransportUnavailable,
 )
 
 
@@ -19,7 +23,24 @@ class _FakeRuntime:
     def __init__(self):
         self.send_message = AsyncMock()
         self.read_inbox = AsyncMock(return_value=[])
-        self.list_agents = AsyncMock(return_value=[])
+        self.list_states = AsyncMock(return_value=[])
+        self.get_state = AsyncMock(return_value={})
+        self.update_state = AsyncMock(return_value={})
+
+
+def _directory_runtime(tmp_path) -> ManagedMCPRuntime:
+    """Connected, presence-enabled runtime holding one online peer."""
+    runtime = ManagedMCPRuntime(
+        agent_id="foo",
+        presence=True,
+        state_path=tmp_path / "foo.sqlite3",
+    )
+    runtime._client = MagicMock()
+    runtime.registry.update_presence(
+        runtime.topics.presence("wren"),
+        presence_payload("wren", "online"),
+    )
+    return runtime
 
 
 @pytest.mark.asyncio
@@ -97,15 +118,60 @@ async def test_read_inbox_supports_ack_only():
 
 
 @pytest.mark.asyncio
-async def test_list_agents_uses_runtime():
+async def test_agent_state_consolidates_list_get_and_update_actions():
     runtime = _FakeRuntime()
-    runtime.list_agents.return_value = ["sparrow", "wren"]
+    runtime.list_states.return_value = [{"agent_id": "wren"}]
+    runtime.get_state.return_value = {"agent_id": "wren"}
+    runtime.update_state.return_value = {"agent_id": "foo", "status": "working"}
     app = create_mcp_app(runtime)
 
-    result = await app._tool_fns["list_agents"]()
+    listed = await app._tool_fns["agent_state"](
+        action="list",
+        include_offline=True,
+        lifecycle="transient",
+    )
+    fetched = await app._tool_fns["agent_state"](
+        action="get",
+        agent_id="wren",
+    )
+    updated = await app._tool_fns["agent_state"](
+        action="update",
+        status="working",
+        capabilities=["development.files.write"],
+    )
 
-    assert result == ["sparrow", "wren"]
-    runtime.list_agents.assert_awaited_once_with()
+    assert listed == [{"agent_id": "wren"}]
+    assert fetched == {"agent_id": "wren"}
+    assert updated["status"] == "working"
+    runtime.list_states.assert_awaited_once_with(
+        include_offline=True,
+        lifecycle="transient",
+    )
+    runtime.get_state.assert_awaited_once_with("wren")
+    runtime.update_state.assert_awaited_once_with(
+        status="working",
+        working_set=None,
+        capabilities=["development.files.write"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"action": "list", "agent_id": "wren"},
+        {"action": "get"},
+        {"action": "get", "agent_id": "wren", "include_offline": True},
+        {"action": "update", "agent_id": "wren", "status": "nope"},
+        {"action": "update"},
+        {"action": "unknown"},
+    ],
+)
+async def test_agent_state_rejects_invalid_action_arguments(kwargs):
+    app = create_mcp_app(_FakeRuntime())
+
+    with pytest.raises(ValueError):
+        await app._tool_fns["agent_state"](**kwargs)
 
 
 @pytest.mark.asyncio
@@ -122,16 +188,87 @@ async def test_read_inbox_logs_broker_error(caplog):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool_name", ["read_inbox", "list_agents"])
-async def test_runtime_fatal_error_surfaces_as_mcp_tool_failure(tool_name):
+async def test_runtime_fatal_error_surfaces_as_mcp_tool_failure():
     runtime = _FakeRuntime()
-    getattr(runtime, tool_name).side_effect = RuntimeFatalError(
+    runtime.read_inbox.side_effect = RuntimeFatalError(
         "managed MQTT runtime failed"
     )
     app = create_mcp_app(runtime)
 
     with pytest.raises(RuntimeFatalError, match="managed MQTT runtime failed"):
-        await app._tool_fns[tool_name]()
+        await app._tool_fns["read_inbox"]()
+
+
+_AGENT_STATE_CALLS = {
+    "list": {"action": "list"},
+    "get": {"action": "get", "agent_id": "wren"},
+    "update": {"action": "update", "status": "busy"},
+}
+
+
+def test_agent_state_action_matrix_covers_every_declared_action():
+    """Cover every agent_state action with presence-refusal tests."""
+    app = create_mcp_app(_FakeRuntime())
+    hints = get_type_hints(app._tool_fns["agent_state"])
+
+    assert set(_AGENT_STATE_CALLS) == set(get_args(hints["action"]))
+
+
+@pytest.mark.asyncio
+async def test_presence_free_runtime_refuses_every_directory_action(tmp_path):
+    """A live messaging-only runtime rejects every directory action."""
+    runtime = ManagedMCPRuntime(
+        agent_id="foo",
+        state_path=tmp_path / "foo.sqlite3",
+    )
+    runtime._client = MagicMock()
+    app = create_mcp_app(runtime)
+
+    for kwargs in _AGENT_STATE_CALLS.values():
+        with pytest.raises(PresenceRequiredError):
+            await app._tool_fns["agent_state"](**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_agent_state_list_surfaces_transport_failure_to_the_caller(
+    tmp_path,
+):
+    """agent_state list propagates presence and transport failures."""
+    runtime = _directory_runtime(tmp_path)
+    app = create_mcp_app(runtime)
+
+    listed = await app._tool_fns["agent_state"](action="list")
+
+    assert [state["agent_id"] for state in listed] == ["wren"]
+
+    runtime._client = None
+
+    with pytest.raises(TransportUnavailable, match="disconnected"):
+        await app._tool_fns["agent_state"](action="list")
+
+
+@pytest.mark.asyncio
+async def test_agent_state_get_surfaces_transport_failure_to_the_caller(
+    tmp_path,
+):
+    """agent_state get propagates transport failures."""
+    runtime = _directory_runtime(tmp_path)
+    app = create_mcp_app(runtime)
+
+    fetched = await app._tool_fns["agent_state"](action="get", agent_id="wren")
+
+    assert fetched["agent_id"] == "wren"
+    with pytest.raises(ValueError, match="no registry record"):
+        await app._tool_fns["agent_state"](action="get", agent_id="sparrow")
+
+    runtime._client = None
+
+    for agent_id in ("wren", "sparrow"):
+        with pytest.raises(TransportUnavailable, match="disconnected"):
+            await app._tool_fns["agent_state"](
+                action="get",
+                agent_id=agent_id,
+            )
 
 
 @pytest.mark.asyncio
