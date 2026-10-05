@@ -73,7 +73,7 @@ ExecStart=/usr/local/bin/swarmbus start \
     --agent-id laptop-cc \
     --broker mqtt.example.com --port 8883 \
     --inbox %h/sync/laptop-cc-inbox.md \
-    --persistent
+    --durable
 Restart=on-failure
 
 [Install]

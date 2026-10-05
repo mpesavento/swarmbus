@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import stat
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import aiosqlite
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .handlers.base import BaseHandler
 from .message import AgentMessage
@@ -42,7 +43,12 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
     reply_to        TEXT,
     received_at     TEXT NOT NULL,
     source_topic    TEXT NOT NULL,
-    acknowledged_at TEXT
+    acknowledged_at TEXT,
+    sender_lifecycle_observed TEXT NOT NULL DEFAULT 'unknown',
+    sender_online_observed INTEGER,
+    sender_registry_observed_at TEXT,
+    sender_started_at_observed TEXT,
+    sender_capabilities_observed TEXT NOT NULL DEFAULT '[]'
 )
 """
 
@@ -65,6 +71,33 @@ _INBOX_MESSAGE_COLUMNS = """
 id, from_agent, to_agent, ts, subject, body, content_type, priority, reply_to
 """
 
+_SENDER_PROVENANCE_COLUMNS = """
+sender_lifecycle_observed, sender_online_observed,
+sender_registry_observed_at, sender_started_at_observed,
+sender_capabilities_observed
+"""
+
+_INBOX_V1_TO_V2 = (
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_lifecycle_observed TEXT NOT NULL DEFAULT 'unknown'""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_online_observed INTEGER""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_registry_observed_at TEXT""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_started_at_observed TEXT""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_capabilities_observed TEXT NOT NULL DEFAULT '[]'""",
+)
+
+
+class SenderStateObserved(BaseModel):
+    lifecycle: Literal["persistent", "transient", "unknown"] = "unknown"
+    online: bool | None = None
+    observed_at: datetime | None = None
+    started_at: datetime | None = None
+    capabilities: list[str] = Field(default_factory=list)
+
 
 class MessageConflictError(RuntimeError):
     """A stable message ID was reused for a different envelope."""
@@ -74,7 +107,7 @@ class SQLiteMessageStore:
     """Durable inbound message store for the managed MCP runtime."""
 
     SCHEMA_COMPONENT = "inbox"
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     _MANAGED_DIRECTORY_MODE = 0o700
     _MANAGED_DATABASE_MODE = 0o600
 
@@ -186,7 +219,19 @@ class SQLiteMessageStore:
 
                     await db.execute(_CREATE_INBOX_TABLE)
                     await db.execute(_CREATE_QUARANTINE_TABLE)
-                    if schema_version is None:
+                    if schema_version == 1:
+                        for statement in _INBOX_V1_TO_V2:
+                            await db.execute(statement)
+                        await db.execute(
+                            """UPDATE swarmbus_schema
+                               SET version = ?
+                               WHERE component = ?""",
+                            (
+                                self.SCHEMA_VERSION,
+                                self.SCHEMA_COMPONENT,
+                            ),
+                        )
+                    elif schema_version is None:
                         await db.execute(
                             """INSERT INTO swarmbus_schema
                                (component, version) VALUES (?, ?)""",
@@ -215,10 +260,20 @@ class SQLiteMessageStore:
         *,
         source_topic: str,
         received_at: datetime | None = None,
+        sender_provenance: dict | None = None,
     ) -> bool:
         """Commit one inbound message, returning whether it was newly inserted."""
         await self._ensure_open()
         received = received_at or datetime.now(timezone.utc)
+        observed = SenderStateObserved.model_validate(
+            sender_provenance
+            if sender_provenance is not None
+            else {
+                "lifecycle": "unknown",
+                "online": None,
+                "observed_at": received,
+            }
+        )
         envelope = (
             msg.id,
             msg.from_agent,
@@ -235,10 +290,34 @@ class SQLiteMessageStore:
                 """INSERT INTO inbox_messages
                    (id, from_agent, to_agent, ts, subject, body,
                     content_type, priority, reply_to, received_at,
-                    source_topic)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_topic, sender_lifecycle_observed,
+                    sender_online_observed, sender_registry_observed_at,
+                    sender_started_at_observed,
+                    sender_capabilities_observed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO NOTHING""",
-                (*envelope, received.isoformat(), source_topic),
+                (
+                    *envelope,
+                    received.isoformat(),
+                    source_topic,
+                    observed.lifecycle,
+                    (
+                        None
+                        if observed.online is None
+                        else int(observed.online)
+                    ),
+                    (
+                        observed.observed_at.isoformat()
+                        if observed.observed_at
+                        else None
+                    ),
+                    (
+                        observed.started_at.isoformat()
+                        if observed.started_at
+                        else None
+                    ),
+                    json.dumps(observed.capabilities),
+                ),
             )
             if cursor.rowcount == 1:
                 await db.commit()
@@ -276,10 +355,44 @@ class SQLiteMessageStore:
                 "reply_to": row["reply_to"],
             },
         )
-        return message.model_dump(by_alias=True, mode="json")
+        sender_state = SenderStateObserved.model_validate(
+            {
+                "lifecycle": row["sender_lifecycle_observed"],
+                "online": (
+                    None
+                    if row["sender_online_observed"] is None
+                    else bool(row["sender_online_observed"])
+                ),
+                "observed_at": row["sender_registry_observed_at"],
+                "started_at": row["sender_started_at_observed"],
+                "capabilities": json.loads(
+                    row["sender_capabilities_observed"] or "[]"
+                ),
+            }
+        )
+        payload = message.model_dump(by_alias=True, mode="json")
+        payload["sender_state_observed"] = {
+            "lifecycle": sender_state.lifecycle,
+            "online": sender_state.online,
+            "observed_at": (
+                sender_state.observed_at.isoformat()
+                if sender_state.observed_at
+                else None
+            ),
+            "started_at": (
+                sender_state.started_at.isoformat()
+                if sender_state.started_at
+                else None
+            ),
+            "capabilities": sender_state.capabilities,
+        }
+        return payload
 
     @staticmethod
-    def _quarantine_error(exc: ValidationError) -> str:
+    def _quarantine_error(exc: Exception) -> str:
+        if not isinstance(exc, ValidationError):
+            return f"{type(exc).__name__}: {exc}"
+
         details = []
         for error in exc.errors(
             include_url=False,
@@ -307,7 +420,8 @@ class SQLiteMessageStore:
                         remaining = max_messages - len(messages)
                         async with db.execute(
                             f"""SELECT rowid AS inbox_rowid,
-                                       {_INBOX_MESSAGE_COLUMNS}
+                                       {_INBOX_MESSAGE_COLUMNS},
+                                       {_SENDER_PROVENANCE_COLUMNS}
                                 FROM inbox_messages
                                 WHERE rowid > ?
                                   AND acknowledged_at IS NULL
@@ -330,7 +444,11 @@ class SQLiteMessageStore:
                         for row in rows:
                             try:
                                 message = self._deserialize_row(row)
-                            except ValidationError as exc:
+                            except (
+                                ValidationError,
+                                json.JSONDecodeError,
+                                TypeError,
+                            ) as exc:
                                 quarantined.append(
                                     (
                                         quarantine_time,

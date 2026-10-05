@@ -23,12 +23,33 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - **Explicit application acknowledgement without extra tools** — `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` first acknowledges the prior handled batch, then reads or waits for pending rows. `max_messages=0` is acknowledgement-only. Unacknowledged reads lost to a crash or transcript timeout redeliver the same stable IDs.
 - Managed inbox state uses private `0700` directories and `0600` database files, rejects unsafe existing permissions, quarantines malformed stored rows, and reports fatal runtime/schema failures through MCP.
 - Inbox schema versions are component-scoped. Existing `SQLiteArchive.messages` schemas and `INSERT OR REPLACE` behavior remain unchanged, and archive history is not imported or replayed automatically.
+- **Retained agent registry** — presence-enabled MCP sidecars publish lifecycle, durability, status, capabilities, and heartbeat state. `agent_state` reads or updates the directory.
+- **Registry maintenance commands** — `registry-gc` collects expired transient identities in bounded batches; `registry-forget` explicitly retires one identity. Both support dry runs, recheck online state before deletion, and audit destructive operations. `registry-forget` also accepts `--snapshot-seconds`.
+
+### Changed
+- **Messaging-only without `--presence`** — presence-free sidecars no longer subscribe to directory topics. `agent_state` raises `PresenceRequiredError`; send and inbox tools are unaffected.
+- **`--persistent` is now `--durable`** on `swarmbus start`, `swarmbus mcp-server`, and the Python API. There is no compatibility alias. `--durable` now requires `--presence`; defaults are unchanged.
+- `--lifecycle transient` requires `--presence`. Clean transient shutdown tombstones presence before registry state and destroys any durable MQTT session.
+- A refused `registry-forget` now exits non-zero after printing its report.
+
+### Fixed
+- `agent_state(action="list"|"get")` now raises `TransportUnavailable` while disconnected instead of serving stale or empty directory results.
+- Registry GC preserves partial reports across broker failures, accounts for skipped and malformed records consistently, reports presence orphans without deleting them, and destroys durable sessions when retiring their identities.
+- `AgentBus.list_agents` derives identity from the broker-authorized presence topic rather than trusting the payload claim.
+
+### Removed
+- **The `list_agents` MCP tool.** Use `agent_state(action="list")` and read each record's `agent_id`. The `swarmbus list` CLI and internal `AgentBus.list_agents` remain.
+
+### Security
+- Presence payload identity claims no longer carry authority; mismatches are logged and attributed to the topic owner.
 
 ### Wire-compat
 1. **Envelope shape — no change.**
 2. **Topic layout — no change.**
-3. **Retain/QoS defaults — no change.** The MCP server remains non-persistent by default; the managed runtime changes acknowledgement timing, not publish or subscribe defaults.
-4. **MCP tool contract — breaking consolidation.** The separate `watch_inbox` tool is replaced by `read_inbox(wait_seconds=...)`; `read_inbox` also gains optional `ack_ids` and `max_messages` parameters while preserving its no-argument behavior and list response. Acknowledge handled IDs on the next read, or use `max_messages=0` for an acknowledgement-only call. Restart the MCP sidecar and update its behavioral skill together. Existing archive rows remain archive-only.
+3. **Retain/QoS defaults — no change.** The MCP server remains non-durable by default; managed inbox acknowledgement timing changed, not publish or subscribe defaults.
+4. **MCP tool contract — breaking consolidation.** `watch_inbox` is replaced by `read_inbox(wait_seconds=...)`; `read_inbox` gains optional `ack_ids` and `max_messages`. `list_agents` is replaced by `agent_state(action="list")`, which requires a presence-enabled, connected sidecar. Restart the sidecar and update its behavioral skill together.
+
+The CLI and Python `persistent` names are also removed: replace `--persistent` / `--no-persistent` with `--durable` / `--no-durable`, and `persistent=` with `durable=`, before restarting services. No data migration or restart order is required.
 
 ---
 

@@ -106,6 +106,31 @@ async def test_message_store_reads_until_explicit_ack(db_path, msg):
 
 
 @pytest.mark.asyncio
+async def test_message_store_preserves_receiver_observed_sender_state(db_path, msg):
+    store = SQLiteMessageStore(db_path)
+    await store.open()
+    try:
+        provenance = {
+            "lifecycle": "transient",
+            "online": True,
+            "observed_at": "2026-10-01T12:00:00+00:00",
+            "started_at": "2026-10-01T11:00:00+00:00",
+            "capabilities": ["messaging", "development.files.write"],
+        }
+        await store.store(
+            msg,
+            source_topic="agents/sparrow/inbox",
+            sender_provenance=provenance,
+        )
+
+        stored = await store.read()
+
+        assert stored[0]["sender_state_observed"] == provenance
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_unacknowledged_message_survives_reads_and_restart(db_path, msg):
     store = SQLiteMessageStore(db_path)
     await store.open()
@@ -229,9 +254,67 @@ async def test_message_store_preserves_archive_without_importing(db_path, msg):
         }
         assert archive_row == (msg.body,)
         assert inbox_count == 0
-        assert inbox_version == 1
+        assert inbox_version == 2
         assert user_version == 37
         assert await store.read() == []
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_message_store_migrates_v1_inbox_to_sender_provenance(db_path):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """CREATE TABLE swarmbus_schema (
+                component TEXT PRIMARY KEY,
+                version INTEGER NOT NULL
+            )"""
+        )
+        await db.execute(
+            """INSERT INTO swarmbus_schema (component, version)
+               VALUES ('inbox', 1)"""
+        )
+        await db.execute(
+            """CREATE TABLE inbox_messages (
+                id TEXT PRIMARY KEY,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT NOT NULL,
+                ts TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                content_type TEXT NOT NULL DEFAULT 'text/plain',
+                priority TEXT NOT NULL DEFAULT 'normal',
+                reply_to TEXT,
+                received_at TEXT NOT NULL,
+                source_topic TEXT NOT NULL,
+                acknowledged_at TEXT
+            )"""
+        )
+        await db.commit()
+
+    Path(db_path).chmod(0o600)
+    store = SQLiteMessageStore(db_path)
+    await store.open()
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                "PRAGMA table_info(inbox_messages)"
+            ) as cursor:
+                columns = {row[1] for row in await cursor.fetchall()}
+            async with db.execute(
+                """SELECT version FROM swarmbus_schema
+                   WHERE component = 'inbox'"""
+            ) as cursor:
+                version = (await cursor.fetchone())[0]
+
+        assert {
+            "sender_lifecycle_observed",
+            "sender_online_observed",
+            "sender_registry_observed_at",
+            "sender_started_at_observed",
+            "sender_capabilities_observed",
+        } <= columns
+        assert version == 2
     finally:
         await store.close()
 
@@ -247,14 +330,14 @@ async def test_message_store_rejects_newer_schema(db_path):
         )
         await db.execute(
             """INSERT INTO swarmbus_schema (component, version)
-               VALUES ('inbox', 2)"""
+               VALUES ('inbox', 3)"""
         )
         await db.commit()
 
     Path(db_path).chmod(0o600)
     store = SQLiteMessageStore(db_path)
 
-    with pytest.raises(RuntimeError, match="inbox schema 2 is newer"):
+    with pytest.raises(RuntimeError, match="inbox schema 3 is newer"):
         await store.open()
 
 
@@ -394,5 +477,52 @@ async def test_read_quarantines_invalid_row_and_continues(db_path, msg):
         assert row[2] is not None
         assert "Agent ID must match" in row[3]
         assert msg.body not in row[3]
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "error_fragments"),
+    [
+        (
+            "sender_capabilities_observed",
+            "{not-json",
+            ("JSON", "Expecting"),
+        ),
+        ("sender_lifecycle_observed", "ephemeral", ("lifecycle",)),
+    ],
+)
+@pytest.mark.asyncio
+async def test_read_quarantines_invalid_sender_provenance(
+    db_path,
+    msg,
+    column,
+    value,
+    error_fragments,
+):
+    store = SQLiteMessageStore(db_path)
+    await store.open()
+    try:
+        await store.store(msg, source_topic="agents/sparrow/inbox")
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                f"""UPDATE inbox_messages
+                    SET {column} = ?
+                    WHERE id = ?""",
+                (value, msg.id),
+            )
+            await db.commit()
+
+        assert await store.read() == []
+
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                """SELECT error FROM inbox_message_quarantine
+                   WHERE message_id = ?""",
+                (msg.id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        assert row is not None
+        assert any(fragment in row[0] for fragment in error_fragments)
     finally:
         await store.close()
