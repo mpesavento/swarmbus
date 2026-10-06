@@ -58,6 +58,24 @@ class RegistryGCReport(BaseModel):
     failed_agent_ids: list[str] = Field(default_factory=list)
 
 
+class RegistryListEntry(RegistryRecord):
+    """One registry record joined with its retained presence evidence."""
+
+    presence_state: Literal["online", "offline", "unknown"] = "unknown"
+    online: bool | None = None
+    offline_reason: str | None = None
+
+
+class RegistryListReport(BaseModel):
+    """Structured snapshot of the retained identity directory."""
+
+    scanned: int
+    orphan_presence: int = 0
+    malformed: int = 0
+    identities: list[RegistryListEntry] = Field(default_factory=list)
+    orphan_presence_agent_ids: list[str] = Field(default_factory=list)
+
+
 class RegistryForgetReport(BaseModel):
     """Structured result of explicit retained-state retirement."""
 
@@ -296,6 +314,52 @@ class RegistryMaintenance:
             "outcome": outcome,
             "observed_at": now.isoformat(),
         }
+
+    async def list_registry(
+        self,
+        *,
+        stale_after_seconds: float,
+        now: datetime | None = None,
+    ) -> RegistryListReport:
+        """Return the retained directory joined with presence evidence."""
+
+        if stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+
+        snapshot = await self._snapshot(
+            (
+                self.topics.any_registry_filter(),
+                self.topics.any_presence_filter(),
+            )
+        )
+        identities = []
+        for agent_id, record in snapshot.records.items():
+            presence = snapshot.presence.get(agent_id)
+            identities.append(
+                RegistryListEntry(
+                    **record.model_dump(),
+                    presence_state=(presence.state if presence else "unknown"),
+                    online=self._observed_online(
+                        record,
+                        presence,
+                        now=current,
+                        stale_after_seconds=stale_after_seconds,
+                    ),
+                    offline_reason=presence.reason if presence else None,
+                )
+            )
+        identities.sort(key=lambda identity: identity.agent_id)
+        orphan_ids = sorted(snapshot.presence.keys() - snapshot.records.keys())
+        return RegistryListReport(
+            scanned=len(snapshot.records),
+            orphan_presence=len(orphan_ids),
+            malformed=snapshot.invalid_messages,
+            identities=identities,
+            orphan_presence_agent_ids=orphan_ids,
+        )
 
     async def gc_transient(
         self,

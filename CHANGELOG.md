@@ -62,13 +62,13 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - Inbox schema versions are component-scoped. Existing `SQLiteArchive.messages` schemas and `INSERT OR REPLACE` behavior remain unchanged, and archive history is not imported or replayed automatically.
 - `swarmbus watch` gains `--persistent / --no-persistent` (default off). When on, the broker queues QoS1 messages for the agent id while no watch is connected and each run prints the oldest queued one. The first run registers the session. Persistent watches publish a retained named registry record plus online/offline presence. `AgentBus.watch_inbox` acknowledges by hand in persistent mode, so messages delivered beyond the one returned are redelivered to the next run instead of being dropped.
 - **Retained agent registry** — presence-enabled MCP sidecars and persistent watches publish lifecycle, durability, status, capabilities, and heartbeat state. `agent_state` reads or updates the directory.
-- **Registry maintenance commands** — `registry-gc` collects expired transient identities in bounded batches; `registry-forget` explicitly retires one identity. Both support dry runs, recheck online state before deletion, and audit destructive operations. `registry-forget` also accepts `--snapshot-seconds`.
+- **Registry maintenance commands** — `registry-list` inspects retained identities and reports presence-only orphans; `registry-gc` collects expired transient identities in bounded batches; `registry-forget` explicitly retires one identity. The destructive commands support dry runs, recheck online state before deletion, and audit their operations. `registry-forget` also accepts `--snapshot-seconds`.
 
 ### Changed
 - **Messaging-only without `--presence`** — presence-free sidecars no longer subscribe to directory topics. `agent_state` raises `PresenceRequiredError`; send and inbox tools are unaffected.
 - `--persistent` on the MCP sidecar requires `--presence`; defaults are unchanged.
 - Registry lifecycle values are `named` and `transient`. `--lifecycle transient` requires `--presence`. Clean transient shutdown tombstones presence before registry state and destroys any persistent MQTT session.
-- A refused `registry-forget` now exits non-zero after printing its report.
+- A refused `registry-forget` now exits non-zero after printing its report. Interactive use prompts for confirmation; `--yes` bypasses the prompt.
 
 ### Fixed
 - Docs and the MCP missing-extra hint name the PyPI distribution `swarmbus-py[mcp]`; the `using-swarmbus` skill no longer passes `reply_to=` to the MCP `send_message` tool (which has no such parameter) and replies to `from` when `reply_to` is null; the README says `swarmbus read` returns retained messages only and states which MCP errors return an empty list. (#23)
