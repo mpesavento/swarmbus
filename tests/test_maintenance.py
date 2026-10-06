@@ -13,6 +13,7 @@ from swarmbus.maintenance import (
     OnlineIdentityError,
     RegistryForgetReport,
     RegistryGCReport,
+    RegistryListReport,
     RegistryMaintenance,
     UnconfirmedOfflineError,
 )
@@ -134,6 +135,54 @@ async def _gc_once(factory, *, now):
         retention_seconds=300,
         batch_size=10,
     )
+
+
+@pytest.mark.asyncio
+async def test_registry_list_joins_registry_and_presence_without_writes():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    online = _registry(
+        "online",
+        now=now,
+        age_seconds=30,
+        lifecycle="persistent",
+    )
+    offline = _registry("offline", now=now, age_seconds=300)
+    unknown = _registry("unknown", now=now, age_seconds=300)
+    factory = _ClientFactory(
+        [[
+            _message(unknown),
+            _message(_presence("orphan", "offline")),
+            _message(offline),
+            _message(_presence("offline", "offline")),
+            _message(online),
+            _message(_presence("online", "online")),
+        ]]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.list_registry(
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert report.scanned == 3
+    assert report.orphan_presence == 1
+    assert report.orphan_presence_agent_ids == ["orphan"]
+    assert [identity.agent_id for identity in report.identities] == [
+        "offline",
+        "online",
+        "unknown",
+    ]
+    assert [identity.online for identity in report.identities] == [
+        False,
+        True,
+        None,
+    ]
+    assert report.identities[1].lifecycle == "persistent"
+    _assert_nothing_published(factory)
 
 
 @pytest.mark.asyncio
@@ -1341,6 +1390,29 @@ def test_maintenance_rejects_non_positive_snapshot_window():
         RegistryMaintenance(snapshot_seconds=0)
 
 
+def test_registry_list_cli_prints_full_directory():
+    report = RegistryListReport(scanned=1)
+    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+        maintenance.return_value.list_registry = AsyncMock(return_value=report)
+        result = CliRunner().invoke(
+            main,
+            [
+                "registry-list",
+                "--stale-after-seconds",
+                "60",
+                "--snapshot-seconds",
+                "1.5",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert '"scanned": 1' in result.output
+    maintenance.return_value.list_registry.assert_awaited_once_with(
+        stale_after_seconds=60.0,
+    )
+    assert maintenance.call_args.kwargs["snapshot_seconds"] == 1.5
+
+
 def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
     runner = CliRunner()
     report = RegistryGCReport(
@@ -1391,6 +1463,46 @@ def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
     )
 
 
+def test_registry_gc_cli_reads_password_file(tmp_path):
+    password_file = tmp_path / "mqtt-password"
+    password_file.write_text("secret\n")
+    report = RegistryGCReport(
+        dry_run=True,
+        scanned=0,
+        eligible=0,
+        selected=0,
+    )
+
+    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+        maintenance.return_value.gc_transient = AsyncMock(return_value=report)
+        result = CliRunner().invoke(
+            main,
+            ["registry-gc", "--password-file", str(password_file)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert maintenance.call_args.kwargs["password"] == "secret"
+
+
+def test_registry_gc_cli_rejects_two_password_sources(tmp_path):
+    password_file = tmp_path / "mqtt-password"
+    password_file.write_text("secret\n")
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "registry-gc",
+            "--password",
+            "inline",
+            "--password-file",
+            str(password_file),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "mutually exclusive" in result.output
+
+
 def test_registry_gc_cli_requires_explicit_delete_switch_to_mutate():
     runner = CliRunner()
     report = RegistryGCReport(
@@ -1412,17 +1524,37 @@ def test_registry_gc_cli_requires_explicit_delete_switch_to_mutate():
     )
 
 
-def test_registry_forget_requires_yes_before_connecting():
+def test_registry_forget_prompts_before_connecting():
     runner = CliRunner()
     with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
         result = runner.invoke(
             main,
             ["registry-forget", "--agent-id", "old-session"],
+            input="n\n",
         )
 
-    assert result.exit_code == 2
-    assert "--yes is required" in result.output
+    assert result.exit_code == 1
+    assert "Forget 'old-session'" in result.output
     maintenance.assert_not_called()
+
+
+def test_registry_forget_confirmation_allows_mutation():
+    report = RegistryForgetReport(
+        agent_id="old-session",
+        dry_run=False,
+        deleted=True,
+        session_destroyed=True,
+    )
+    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+        maintenance.return_value.forget = AsyncMock(return_value=report)
+        result = CliRunner().invoke(
+            main,
+            ["registry-forget", "--agent-id", "old-session"],
+            input="y\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    maintenance.return_value.forget.assert_awaited_once()
 
 
 def test_registry_forget_tombstones_exact_agent_with_yes():

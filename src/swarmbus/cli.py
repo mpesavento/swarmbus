@@ -922,6 +922,87 @@ def _detect_agent_id() -> str:
     raise RuntimeError("no swarmbus-*.service unit detected")
 
 
+def _maintenance_password(
+    password: str | None,
+    password_file: str | None,
+) -> str | None:
+    if password is not None and password_file is not None:
+        raise click.UsageError(
+            "--password and --password-file are mutually exclusive"
+        )
+    if password_file is None:
+        return password
+
+    try:
+        with open(password_file, encoding="utf-8") as handle:
+            resolved = handle.read().rstrip("\r\n")
+    except OSError as exc:
+        raise click.ClickException(
+            f"unable to read password file {password_file!r}: {exc}"
+        ) from exc
+    if not resolved:
+        raise click.UsageError("--password-file must not be empty")
+    return resolved
+
+
+@main.command("registry-list")
+@click.option("--broker", default="localhost", show_default=True)
+@click.option("--port", default=1883, show_default=True)
+@click.option(
+    "--stale-after-seconds",
+    type=float,
+    default=180,
+    show_default=True,
+    help="Heartbeat age after which online presence is considered stale.",
+)
+@click.option(
+    "--snapshot-seconds",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Bounded retained-topic collection window for the snapshot.",
+)
+@click.option(
+    "--password-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Read the broker password from this file.",
+)
+@_broker_auth_options
+def registry_list(
+    broker: str,
+    port: int,
+    stale_after_seconds: float,
+    snapshot_seconds: float,
+    password_file: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """List retained identities and their presence evidence."""
+
+    from .maintenance import RegistryMaintenance
+
+    password = _maintenance_password(password, password_file)
+    maintenance = RegistryMaintenance(
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        snapshot_seconds=snapshot_seconds,
+    )
+    report = asyncio.run(
+        maintenance.list_registry(stale_after_seconds=stale_after_seconds)
+    )
+    click.echo(report.model_dump_json(indent=2))
+
+
 @main.command("registry-gc")
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
@@ -959,6 +1040,11 @@ def _detect_agent_id() -> str:
     default=False,
     help="Delete eligible records; the default is a read-only dry run.",
 )
+@click.option(
+    "--password-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Read the broker password from this file.",
+)
 @_broker_auth_options
 def registry_gc(
     broker: str,
@@ -968,6 +1054,7 @@ def registry_gc(
     batch_size: int,
     snapshot_seconds: float,
     delete: bool,
+    password_file: str | None,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -979,6 +1066,7 @@ def registry_gc(
 
     from .maintenance import RegistryMaintenance
 
+    password = _maintenance_password(password, password_file)
     maintenance = RegistryMaintenance(
         broker=broker,
         port=port,
@@ -1039,6 +1127,11 @@ def registry_gc(
     is_flag=True,
     help="Confirm deletion without an interactive prompt.",
 )
+@click.option(
+    "--password-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Read the broker password from this file.",
+)
 @_broker_auth_options
 def registry_forget(
     agent_id: str,
@@ -1049,6 +1142,7 @@ def registry_forget(
     force_online: bool,
     dry_run: bool,
     yes: bool,
+    password_file: str | None,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1059,10 +1153,14 @@ def registry_forget(
     """Explicitly remove one agent's retained registry and presence."""
 
     if not dry_run and not yes:
-        raise click.UsageError("--yes is required to publish tombstones")
+        click.confirm(
+            f"Forget {agent_id!r} and destroy its durable MQTT session?",
+            abort=True,
+        )
 
     from .maintenance import OnlineIdentityError, RegistryMaintenance
 
+    password = _maintenance_password(password, password_file)
     maintenance = RegistryMaintenance(
         broker=broker,
         port=port,

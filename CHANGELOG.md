@@ -24,13 +24,13 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - Managed inbox state uses private `0700` directories and `0600` database files, rejects unsafe existing permissions, quarantines malformed stored rows, and reports fatal runtime/schema failures through MCP.
 - Inbox schema versions are component-scoped. Existing `SQLiteArchive.messages` schemas and `INSERT OR REPLACE` behavior remain unchanged, and archive history is not imported or replayed automatically.
 - **Retained agent registry** — presence-enabled MCP sidecars publish lifecycle, durability, status, capabilities, and heartbeat state. `agent_state` reads or updates the directory.
-- **Registry maintenance commands** — `registry-gc` collects expired transient identities in bounded batches; `registry-forget` explicitly retires one identity. Both support dry runs, recheck online state before deletion, and audit destructive operations. `registry-forget` also accepts `--snapshot-seconds`.
+- **Registry maintenance commands** — `registry-list` inspects retained identities, `registry-gc` collects expired transients, and `registry-forget` explicitly retires one identity.
 
 ### Changed
 - **Messaging-only without `--presence`** — presence-free sidecars no longer subscribe to directory topics. `agent_state` raises `PresenceRequiredError`; send and inbox tools are unaffected.
 - **`--persistent` is now `--durable`** on `swarmbus start`, `swarmbus mcp-server`, and the Python API. There is no compatibility alias. `--durable` now requires `--presence`; defaults are unchanged.
 - `--lifecycle transient` requires `--presence`. Clean transient shutdown tombstones presence before registry state and destroys any durable MQTT session.
-- A refused `registry-forget` now exits non-zero after printing its report.
+- A refused `registry-forget` now exits non-zero after printing its report. Interactive use prompts for confirmation; `--yes` bypasses the prompt.
 
 ### Fixed
 - `agent_state(action="list"|"get")` now raises `TransportUnavailable` while disconnected instead of serving stale or empty directory results.
