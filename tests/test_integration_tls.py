@@ -38,6 +38,19 @@ def _free_port() -> int:
     return port
 
 
+def _wait_for_broker(proc: subprocess.Popen, port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError("mosquitto failed to start")
+        try:
+            with socket.create_connection(("localhost", port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.01)
+    raise TimeoutError("mosquitto did not accept connections")
+
+
 def _have(*cmds: str) -> bool:
     return all(shutil.which(c) is not None for c in cmds)
 
@@ -122,8 +135,9 @@ def mosquitto_tls_broker(tmp_path_factory) -> Iterator[dict]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    time.sleep(0.5)  # broker boot
-    if proc.poll() is not None:
+    try:
+        _wait_for_broker(proc, port)
+    except (RuntimeError, TimeoutError):
         pytest.fail(f"mosquitto failed to start; conf={conf.read_text()}")
 
     try:
@@ -171,10 +185,20 @@ async def test_tls_with_password_roundtrip(mosquitto_tls_broker):
         username=cfg["username"], password=cfg["password"],
         ca_cert=cfg["ca_cert"],
     )
+    readiness_sender = AgentBus(
+        agent_id="ready", broker=cfg["host"], port=cfg["port"],
+        retain=True,
+        username=cfg["username"], password=cfg["password"],
+        ca_cert=cfg["ca_cert"],
+    )
 
     listen_task = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
     try:
+        # A retained probe makes listener readiness broker-observable.
+        await readiness_sender.send(to="rx", subject="ready", body="ready")
+        await handler.wait(timeout=5.0)
+        handler.received.clear()
+
         await sender.send(to="rx", subject="hi", body="encrypted hello")
         await handler.wait(timeout=5.0)
         assert handler.received[0].body == "encrypted hello"
