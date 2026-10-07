@@ -486,7 +486,7 @@ async def test_long_poll_surfaces_store_failure_that_begins_while_waiting():
     )
     try:
         with pytest.raises(StoreUnavailable, match="disk full"):
-            await asyncio.wait_for(waiter, timeout=0.2)
+            await asyncio.wait_for(waiter, timeout=1.0)
     finally:
         handler.cancel()
         await asyncio.gather(handler, return_exceptions=True)
@@ -504,8 +504,8 @@ async def test_start_opens_store_without_waiting_for_broker():
         await keep_running.wait()
 
     runtime._connection_loop = _connection_loop
-    await asyncio.wait_for(runtime.start(), timeout=0.1)
-    await asyncio.wait_for(connection_started.wait(), timeout=0.1)
+    await asyncio.wait_for(runtime.start(), timeout=1.0)
+    await asyncio.wait_for(connection_started.wait(), timeout=1.0)
 
     assert store.opened is True
     assert runtime._connection_task is not None

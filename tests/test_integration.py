@@ -71,18 +71,52 @@ async def _clear_retained(host: str, port: int, topics: list[str]) -> None:
             await client.publish(topic, payload=b"", qos=1, retain=True)
 
 
+async def _start_listener(bus: AgentBus) -> asyncio.Task:
+    """Start a listener after proving its subscriptions are active."""
+    handlers = bus._handlers
+    ready = CollectingHandler()
+    bus._handlers = [ready]
+
+    async def listen_and_clear_probe() -> None:
+        try:
+            await bus.listen()
+        finally:
+            await _clear_retained(
+                bus.broker,
+                bus.port,
+                [bus.topics.inbox(bus.agent_id)],
+            )
+
+    task = asyncio.create_task(listen_and_clear_probe())
+    probe = AgentBus(
+        agent_id="readiness",
+        broker=bus.broker,
+        port=bus.port,
+        retain=True,
+    )
+    try:
+        await probe.send(to=bus.agent_id, subject="ready", body="ready")
+        await ready.wait_for_message()
+    except BaseException:
+        await _stop(task)
+        raise
+    finally:
+        bus._handlers = handlers
+    return task
+
+
 @pytest.fixture
 async def listening_agent(mosquitto_broker):
     """Start listeners and clean up their retained presence."""
     host, port = mosquitto_broker
     started: list[tuple[str, asyncio.Task]] = []
 
-    async def start(agent_id, *handlers, settle=0.3, **kwargs):
+    async def start(agent_id, *handlers, **kwargs):
         bus = AgentBus(agent_id=agent_id, broker=host, port=port, **kwargs)
+        task = await _start_listener(bus)
         for handler in handlers:
             bus.register_handler(handler)
-        started.append((agent_id, asyncio.create_task(bus.listen())))
-        await asyncio.sleep(settle)  # let the subscription establish
+        started.append((agent_id, task))
         return bus
 
     yield start
@@ -92,7 +126,14 @@ async def listening_agent(mosquitto_broker):
     await _clear_retained(
         host,
         port,
-        [DEFAULT_TOPICS.presence(agent_id) for agent_id, _ in started],
+        [
+            topic
+            for agent_id, _ in started
+            for topic in (
+                DEFAULT_TOPICS.inbox(agent_id),
+                DEFAULT_TOPICS.presence(agent_id),
+            )
+        ],
     )
 
 
@@ -149,9 +190,8 @@ async def test_broadcast_delivered_to_all_subscribers(mosquitto_broker):
 
     sender = AgentBus(agent_id="gamma", broker=host, port=port, retain=False)
 
-    t_a = asyncio.create_task(agent_a.listen())
-    t_b = asyncio.create_task(agent_b.listen())
-    await asyncio.sleep(0.3)  # allow both subscriptions to establish
+    t_a = await _start_listener(agent_a)
+    t_b = await _start_listener(agent_b)
 
     try:
         await sender.send(to="broadcast", subject="all-hands", body="everyone read this")
@@ -181,9 +221,8 @@ async def test_reply_to_roundtrip(mosquitto_broker):
     agent_b = AgentBus(agent_id="bee", broker=host, port=port, retain=False)
     agent_b.register_handler(h_b)
 
-    t_a = asyncio.create_task(agent_a.listen())
-    t_b = asyncio.create_task(agent_b.listen())
-    await asyncio.sleep(0.3)
+    t_a = await _start_listener(agent_a)
+    t_b = await _start_listener(agent_b)
 
     try:
         # A asks B a question, stamped with reply_to
@@ -231,8 +270,7 @@ async def test_persistent_client_multiple_sends(mosquitto_broker):
     receiver = AgentBus(agent_id="rx", broker=host, port=port, retain=False)
     receiver.register_handler(_AllMessages())
 
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         async with AgentBus(agent_id="tx", broker=host, port=port) as sender:
@@ -438,8 +476,7 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
     host, port = mosquitto_broker
 
     agent = AgentBus(agent_id="earlybird", broker=host, port=port, retain=False)
-    t = asyncio.create_task(agent.listen())
-    await asyncio.sleep(0.3)  # let it publish retained "online"
+    t = await _start_listener(agent)
 
     try:
         # A separate client subscribes *after* agent is online.
@@ -472,9 +509,8 @@ async def test_agent_state_mcp_tool_sees_online_agents(
 
     a = AgentBus(agent_id="one", broker=host, port=port, retain=False)
     b = AgentBus(agent_id="two", broker=host, port=port, retain=False)
-    t_a = asyncio.create_task(a.listen())
-    t_b = asyncio.create_task(b.listen())
-    await asyncio.sleep(0.4)
+    t_a = await _start_listener(a)
+    t_b = await _start_listener(b)
 
     runtime = ManagedMCPRuntime(
         agent_id="observer",
@@ -527,8 +563,7 @@ async def test_messaging_only_runtime_gets_no_directory_on_real_broker(
         retain=False,
     )
     peer.register_handler(collected)
-    listener = asyncio.create_task(peer.listen())
-    await asyncio.sleep(0.4)
+    listener = await _start_listener(peer)
 
     runtime = ManagedMCPRuntime(
         agent_id="quiet-peer",
@@ -582,8 +617,7 @@ async def test_file_bridge_handler_writes_to_disk(mosquitto_broker, tmp_path):
     receiver.register_handler(barrier)
 
     sender = AgentBus(agent_id="fb-tx", broker=host, port=port, retain=False)
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         await sender.send(to="fb-rx", subject="hello", body="written to disk")
@@ -612,15 +646,11 @@ async def test_sqlite_archive_handler_persists_message(mosquitto_broker, tmp_pat
     receiver.register_handler(barrier)
 
     sender = AgentBus(agent_id="sql-tx", broker=host, port=port, retain=False)
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         await sender.send(to="sql-rx", subject="archived", body="row in sqlite")
         await barrier.wait_for_message(timeout=3.0)
-
-        # Small grace for async archive commit
-        await asyncio.sleep(0.1)
 
         with sqlite3.connect(db_path) as con:
             rows = con.execute(
@@ -661,13 +691,11 @@ async def test_direct_invocation_handler_fires_subprocess(mosquitto_broker, tmp_
     receiver.register_handler(barrier)
 
     sender = AgentBus(agent_id="di-tx", broker=host, port=port, retain=False)
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         await sender.send(to="di-rx", subject="trigger", body="payload-on-stdin")
         await barrier.wait_for_message(timeout=3.0)
-        await asyncio.sleep(0.2)  # give subprocess time to flush
 
         text = out_file.read_text()
         assert "FROM=di-tx SUBJECT=trigger" in text
@@ -689,8 +717,7 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
     host, port = mosquitto_broker
 
     agent = AgentBus(agent_id="presence-tester", broker=host, port=port)
-    listen_task = asyncio.create_task(agent.listen())
-    await asyncio.sleep(0.3)  # let presence announce
+    listen_task = await _start_listener(agent)
 
     # Probe: subscribe to the presence topic and read the retained payload.
     async def _read_presence():
@@ -712,7 +739,6 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
     # Graceful shutdown -- exercises the close path, not LWT.
     await _stop(listen_task)
     await agent.disconnect()
-    await asyncio.sleep(0.2)
 
     offline_payload = await _read_presence()
     assert offline_payload is not None
@@ -741,10 +767,9 @@ async def test_non_retained_message_lost_when_no_subscriber(
     # Send to an agent with no listener running.
     sender = AgentBus(agent_id="lost-sender", broker=host, port=port, retain=False)
     await sender.send(to="lost-receiver", subject="lost", body="never seen")
-    await asyncio.sleep(0.2)  # let the publish complete
 
     handler = CollectingHandler()
-    await listening_agent("lost-receiver", handler, settle=0.5)
+    await listening_agent("lost-receiver", handler)
 
     assert len(handler.received) == 0, (
         f"Expected 0 messages for non-retained lost send, got "
@@ -773,8 +798,7 @@ async def test_send_receive_large_body_at_limit(mosquitto_broker):
 
     sender = AgentBus(agent_id="big-tx", broker=host, port=port, retain=False)
 
-    listen_task = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.2)
+    listen_task = await _start_listener(receiver)
 
     # Leave room for envelope overhead -- body alone can be the full 64KB.
     body = "x" * (64 * 1024)
