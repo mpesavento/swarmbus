@@ -11,6 +11,7 @@ import aiomqtt
 
 from .message import AgentMessage, _validate_registered_agent_id
 from .handlers.base import BaseHandler
+from .topics import DEFAULT_TOPICS, TopicMap
 from ._compat import asyncio_timeout
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,11 @@ def _build_tls_context(
     return context
 
 
+def _legacy_presence_payload(agent_id: str, status: str) -> str:
+    """Serialize the legacy presence payload."""
+    return json.dumps({"agent": agent_id, "status": status})
+
+
 def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
     """Append a sent message to the sender's outbox log.
 
@@ -72,13 +78,20 @@ def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
 
 
 class AgentBus:
+    # MQTT topic layout. Declared at class level on purpose: `probe()`
+    # builds an instance via cls.__new__ and never runs __init__, so an
+    # instance-only attribute would leave probe buses unable to build a
+    # topic. Root-less by default, which keeps the wire format unchanged;
+    # a rooted deployment overrides this with TopicMap(root=...).
+    topics: TopicMap = DEFAULT_TOPICS
+
     def __init__(
         self,
         agent_id: str,
         broker: str = "localhost",
         port: int = 1883,
         retain: bool = False,
-        persistent: bool = False,
+        durable: bool = False,
         *,
         username: str | None = None,
         password: str | None = None,
@@ -96,7 +109,7 @@ class AgentBus:
             retain=True unconditionally so late subscribers can see who is
             currently online.
 
-        persistent: whether `listen()` uses an MQTT persistent session. When
+        durable: whether `listen()` uses an MQTT persistent session. When
             True, the broker queues QoS1 messages for this agent-id even when
             the listener is disconnected, and redelivers them on reconnect —
             a crashed or restarted daemon does not lose messages. Comes with
@@ -127,7 +140,7 @@ class AgentBus:
         self.broker = broker
         self.port = port
         self.retain = retain
-        self.persistent = persistent
+        self.durable = durable
         self.username = username
         self.password = password
         self.tls = tls
@@ -195,7 +208,7 @@ class AgentBus:
         self.broker = broker
         self.port = port
         self.retain = False
-        self.persistent = False
+        self.durable = False
         self.username = username
         self.password = password
         self.tls = tls
@@ -296,7 +309,7 @@ class AgentBus:
             reply_to=reply_to,
         )
         # Broadcast uses agents/broadcast; directed messages use agents/{to}/inbox
-        topic = "agents/broadcast" if to == "broadcast" else f"agents/{to}/inbox"
+        topic = self.topics.route(to)
         payload = msg.to_json()
         if self._client is not None:
             await self._client.publish(topic, payload, qos=1, retain=self.retain)
@@ -329,8 +342,8 @@ class AgentBus:
         "online" is overwritten when an agent crashes unexpectedly.
         """
         will = aiomqtt.Will(
-            topic=f"agents/{self.agent_id}/presence",
-            payload=json.dumps({"agent": self.agent_id, "status": "offline"}),
+            topic=self.topics.presence(self.agent_id),
+            payload=_legacy_presence_payload(self.agent_id, "offline"),
             qos=1,
             retain=True,
         )
@@ -338,7 +351,7 @@ class AgentBus:
         # so the broker queues QoS1 messages for this agent when the listener
         # is offline, and redelivers them on reconnect.
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs(), "will": will}
-        if self.persistent:
+        if self.durable:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
         backoff = reconnect_initial
@@ -348,13 +361,15 @@ class AgentBus:
                     self.broker, port=self.port, **client_kwargs
                 ) as client:
                     await client.publish(
-                        f"agents/{self.agent_id}/presence",
-                        json.dumps({"agent": self.agent_id, "status": "online"}),
+                        self.topics.presence(self.agent_id),
+                        _legacy_presence_payload(self.agent_id, "online"),
                         qos=1,
                         retain=True,
                     )
-                    await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
-                    await client.subscribe("agents/broadcast", qos=1)
+                    await client.subscribe(
+                        self.topics.inbox(self.agent_id), qos=1
+                    )
+                    await client.subscribe(self.topics.broadcast, qos=1)
                     backoff = reconnect_initial  # reset after successful (re)connect
 
                     async for mqtt_msg in client.messages:
@@ -389,12 +404,12 @@ class AgentBus:
         By default, opens a fresh non-persistent MQTT session per call —
         only messages sent with ``retain=True`` are visible.
 
-        When ``self.persistent`` is True, connects with a stable client
+        When ``self.durable`` is True, connects with a stable client
         identifier (``swarmbus-<agent_id>``) and ``clean_session=False``.
         The broker queues QoS1 messages for this agent between calls and
         redelivers them on reconnect — no listener daemon required for
         durable delivery.  Only one client can hold a persistent session
-        at a time; do not run a daemon and persistent MCP server for the
+        at a time; do not run a daemon and a durable MCP server for the
         same agent-id.
 
         Returns a list of message dicts (up to ``max_messages``). Malformed
@@ -403,14 +418,14 @@ class AgentBus:
         (e.g. the MCP tool surface) must catch it themselves.
         """
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
-        if self.persistent:
+        if self.durable:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
         messages: list[dict] = []
         async with aiomqtt.Client(
             self.broker, port=self.port, **client_kwargs
         ) as client:
-            await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(drain_timeout):
                     async for mqtt_msg in client.messages:
@@ -432,10 +447,10 @@ class AgentBus:
         messages **published while this call is active**, plus any with
         ``retain=True`` on subscribe.
 
-        When ``self.persistent`` is True, connects with a stable client
+        When ``self.durable`` is True, connects with a stable client
         identifier and ``clean_session=False`` so queued QoS1 messages
         from previous sessions are also delivered.  Same mutual-exclusion
-        caveat as ``read_inbox``: do not run a daemon and persistent MCP
+        caveat as ``read_inbox``: do not run a daemon and a durable MCP
         server for the same agent-id.
 
         Returns None on timeout. Raises ``aiomqtt.MqttError`` if the broker
@@ -443,13 +458,13 @@ class AgentBus:
         MCP tool surface) must catch it themselves.
         """
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
-        if self.persistent:
+        if self.durable:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
         async with aiomqtt.Client(
             self.broker, port=self.port, **client_kwargs
         ) as client:
-            await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(timeout):
                     async for mqtt_msg in client.messages:
@@ -466,6 +481,9 @@ class AgentBus:
     async def list_agents(self, collect_window: float = 0.5) -> list[str]:
         """Return sorted IDs of agents whose latest retained presence is online.
 
+        Identity comes from the presence topic; the payload's own agent-id
+        claim is never read, only its state.
+
         Raises `aiomqtt.MqttError` on broker failure; callers that want the
         graceful empty-list fallback must catch it.
         """
@@ -473,7 +491,7 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
-            await client.subscribe("agents/+/presence", qos=0)
+            await client.subscribe(self.topics.any_presence_filter(), qos=0)
             try:
                 async with asyncio_timeout(collect_window):
                     async for mqtt_msg in client.messages:
@@ -481,10 +499,30 @@ class AgentBus:
                             payload = json.loads(mqtt_msg.payload)
                         except (json.JSONDecodeError, TypeError, ValueError):
                             continue
-                        name = payload.get("agent")
-                        status = payload.get("status")
-                        if not name:
+                        if not isinstance(payload, dict):
                             continue
+                        # Presence topics, not payload claims, define identity.
+                        try:
+                            name = self.topics.presence_agent(
+                                str(mqtt_msg.topic)
+                            )
+                        except ValueError as exc:
+                            logger.warning(
+                                "list_agents: skipping unattributable "
+                                "presence topic: %s", exc,
+                            )
+                            continue
+                        claimed = (
+                            payload.get("agent_id") or payload.get("agent")
+                        )
+                        if claimed and claimed != name:
+                            logger.warning(
+                                "list_agents: presence payload claims %r on "
+                                "%r's topic; attributing to the topic owner",
+                                claimed, name,
+                            )
+                        # Accept both legacy and registry presence shapes.
+                        status = payload.get("state") or payload.get("status")
                         if status == "online":
                             online.add(name)
                         else:
@@ -500,8 +538,8 @@ class AgentBus:
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
             await client.publish(
-                f"agents/{self.agent_id}/presence",
-                json.dumps({"agent": self.agent_id, "status": "offline"}),
+                self.topics.presence(self.agent_id),
+                _legacy_presence_payload(self.agent_id, "offline"),
                 qos=1,
                 retain=True,
             )

@@ -208,11 +208,11 @@ Bottom line: Tailscale authenticates that your peer is who you added to the tail
 
 ### Broker host goes offline
 
-All non-broker peers lose connectivity. Their daemons enter exponential-backoff reconnect (1s, 2s, 4s, ... capped at 60s). As soon as the broker comes back up, every peer reconnects; if `--persistent` is on (default for `swarmbus start`), the broker redelivers QoS1 messages that were queued while a peer was disconnected. Messages sent *to* the broker while *it* was down are simply lost — the sender gets an MqttError on `send`, not silent swallow.
+All non-broker peers lose connectivity. Their daemons enter exponential-backoff reconnect (1s, 2s, 4s, ... capped at 60s). As soon as the broker comes back up, every peer reconnects; if `--durable` is on (default for `swarmbus start`), the broker redelivers QoS1 messages that were queued while a peer was disconnected. Messages sent *to* the broker while *it* was down are simply lost — the sender gets an MqttError on `send`, not silent swallow.
 
 ### Peer host goes offline mid-conversation
 
-If the peer is running `swarmbus start --persistent`, the broker queues QoS1 messages for that peer's agent-id. When the peer reconnects, they redeliver. Bodies are capped at 64KB, so there's no unbounded memory risk; mosquitto will discard old queued messages per its persistence config if a peer is offline for very long.
+If the peer is running `swarmbus start --durable`, the broker queues QoS1 messages for that peer's agent-id. When the peer reconnects, they redeliver. Bodies are capped at 64KB, so there's no unbounded memory risk; mosquitto will discard old queued messages per its persistence config if a peer is offline for very long.
 
 ### Laptop goes to sleep
 
@@ -224,9 +224,9 @@ Usually because the broker host's MagicDNS name changed (rare — only happens o
 
 ### Two daemons for the same agent-id on different hosts
 
-**Don't.** With `--persistent` (the default), they share one MQTT client identifier and kick each other in a loop every few seconds. With `--no-persistent`, they race for each QoS1 message and each sees a roughly-even fraction of the traffic. In both cases, the archive you read from either machine is incomplete.
+**Don't.** With `--durable` (the default), they share one MQTT client identifier and kick each other in a loop every few seconds. With `--no-durable`, they race for each QoS1 message and each sees a roughly-even fraction of the traffic. In both cases, the archive you read from either machine is incomplete.
 
-If you legitimately want "reach me at whichever machine I happen to be on," use *different* agent-ids per host (`planner-pi` and `planner-laptop`) and have whoever's sending to you decide which to target (via `list_agents` or a routing convention).
+If you legitimately want "reach me at whichever machine I happen to be on," use *different* agent-ids per host (`planner-pi` and `planner-laptop`) and have whoever's sending to you decide which to target (via `agent_state` / `swarmbus list` or a routing convention).
 
 ---
 

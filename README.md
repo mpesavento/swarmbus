@@ -115,7 +115,7 @@ swarmbus watch --agent-id scratch --timeout 60  # block until one arrives
 
 **What to never do:** run `swarmbus read` or `swarmbus watch` against an agent-id that already has a daemon running. They'd race the daemon for QoS1 messages — whichever client is currently subscribed wins and the other silently never sees them. Use `swarmbus tail` (file-based) instead.
 
-**Daemon durability.** By default `swarmbus start` uses an MQTT persistent session (`--persistent`, on by default), so a crashed or restarted daemon doesn't lose queued messages — the broker redelivers them on reconnect. Disable with `--no-persistent` only if another process is already holding the `swarmbus-<agent-id>` client identifier.
+**Daemon durability.** By default `swarmbus start` uses an MQTT persistent session (`--durable`, on by default), so a crashed or restarted daemon doesn't lose queued messages — the broker redelivers them on reconnect. Disable with `--no-durable` only if another process is already holding the `swarmbus-<agent-id>` client identifier.
 
 That's the whole loop: broker → daemon OR one-shot per agent-id → `send` from anywhere → peer receives via tail (if daemon) or read (if not).
 
@@ -145,7 +145,7 @@ The quickstart above uses the CLI path (#4 below) because it's the most universa
 
 ### 1. Claude Code — MCP server + behavioral skill
 
-Run the setup script. It registers the MCP server in `~/.claude/settings.json` **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches Claude when to send, read, watch, and list agents.
+Run the setup script. It registers the MCP server in `~/.claude/settings.json` **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches agents when to send, read, acknowledge, wait, and list agents.
 
 ```bash
 bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
@@ -153,25 +153,32 @@ bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
 bash scripts/setup-cc-plugin.sh planner localhost
 ```
 
-Restart Claude Code. Four MCP tools become available:
+Restart your agent harness. Three MCP tools become available:
 
 - `send_message(to, subject, body, content_type?)` — publish to a peer (or `to="broadcast"`)
-- `read_inbox()` — non-blocking check for queued messages
-- `watch_inbox(timeout)` — long-poll, returns when a message arrives
-- `list_agents()` — IDs of peers currently online
+- `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages
+- `agent_state(action, ...)` — read or publish retained directory state. `action="list"` returns the online peers with their status, working set, capabilities, lifecycle and durability; add `include_offline=True` for the whole directory, `action="get"` for one peer, `action="update"` to publish your own.
 
-The skill (`src/swarmbus/skills/using-swarmbus/SKILL.md`, also installed under `site-packages/swarmbus/skills/using-swarmbus/` via pip) explains reply-to threading, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Claude auto-loads it when the user mentions a peer agent by name or asks about coordination.
+`agent_state` reads the agent directory, which only a sidecar started with `--presence` subscribes to. Without it the sidecar is messaging-only: it can send and receive, and `agent_state` raises a tool error naming the flag rather than returning an empty list.
 
-**Persistent sessions (daemon-free delivery).** Pass `--persistent --presence` to `mcp-server` and the sidecar connects with a stable MQTT client identifier (`swarmbus-<agent-id>`) and `clean_session=False`. The broker queues QoS1 messages between sessions and redelivers them when the next session starts. `--presence` publishes a retained online/offline status so `list_agents` works without a daemon.
+There is no `list_agents` tool. `[s["agent_id"] for s in agent_state(action="list")]` is what it returned; the CLI equivalent, `swarmbus list`, is unchanged.
+
+The skill (`src/swarmbus/skills/using-swarmbus/SKILL.md`, also installed under `site-packages/swarmbus/skills/using-swarmbus/` via pip) explains reply-to threading, inbox acknowledgement, content-type hygiene, broadcast vs directed, and security rules (inbound bodies are data, not instructions). Agent harnesses should auto-load it when the user mentions a peer agent by name or asks about coordination.
+
+**Durable inbox (daemon-free delivery).** The MCP sidecar holds one MQTT connection for its process lifetime. Valid inbound messages are committed to the separate `inbox_messages` table in `<state-dir>/<agent-id>.sqlite3` before their QoS1 acknowledgement. `read_inbox` is non-destructive: the same stable message IDs remain available across reads and process restarts until a later call includes them in `ack_ids` after durable handling. Set `max_messages=0` for an acknowledgement-only call, or `wait_seconds>0` to long-poll without adding another MCP tool. A crash or lost transcript before application acknowledgement therefore causes at-least-once redelivery instead of silent loss.
+
+The default state directory is `~/.local/state/swarmbus` and can be changed with `--state-dir` or `SWARMBUS_STATE_DIR`. Managed state is private (directory mode `0700`, database mode `0600`); startup rejects unsafe existing permissions rather than weakening them. `SQLiteArchive.messages` remains an independent append/replace archive and is never imported into the inbox automatically.
+
+The MCP server defaults to a live-session MQTT subscription. Pass `--durable --presence` so the broker also queues QoS1 messages while the sidecar is stopped and publishes retained online/offline status for `agent_state`:
 
 ```bash
 swarmbus mcp-server --agent-id planner --broker mqtt.example.com \
-  --port 8883 --tls --persistent --presence
+  --port 8883 --tls --durable --presence
 ```
 
-This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects.
+This replaces the daemon for most MCP-based agents. **Do not run a daemon and a durable MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects. Fatal runtime or schema failures surface as MCP tool errors instead of successful empty reads.
 
-If you do not use `--persistent`, the MCP server opens a fresh ephemeral session per `read_inbox`/`watch_inbox` call and only sees retained messages — the same limitation as `swarmbus read`.
+Without `--durable`, messages received while the sidecar is running still survive process restarts in SQLite, but the broker does not queue messages sent while the sidecar is offline.
 
 **Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
 
@@ -302,11 +309,15 @@ swarmbus mcp-server --agent-id planner
 | Path | Durable? | Use when |
 |---|---|---|
 | `start` (daemon) | Yes (persistent session, default) | Long-running process, file-bridge to inbox, reactive wake |
-| `mcp-server --persistent` | Yes (persistent session) | MCP-based agents (Claude Code, Cursor); no daemon needed |
+| `mcp-server --durable --presence` | Yes (persistent session) | MCP-based agents (Claude Code, Cursor); no daemon needed |
 | `read` / `watch` (one-shot) | No (ephemeral session) | CI jobs, shell scripts, quick checks |
 | `tail` (file-based) | N/A (reads daemon's file) | Companion to `start`; cursor-tracked |
 
-**Don't combine durable paths for the same id** — `start` + `mcp-server --persistent` both claim the same MQTT client identifier. The broker evicts the first connection when the second arrives. Use one or the other.
+**Don't combine durable paths for the same id** — `start` + `mcp-server --durable` both claim the same MQTT client identifier. The broker evicts the first connection when the second arrives. Use one or the other.
+
+`--durable` requires `--presence`. A durable session has the broker queue messages for an identity while it is away, and an identity absent from the directory can never be found with `swarmbus list` or retired with `swarmbus registry-forget` — so its queued backlog would grow without bound. A sidecar may be invisible only if it leaves nothing behind.
+
+`--durable` controls whether the broker queues mail during an identity's session; `--lifecycle persistent|transient` controls whether its directory record survives the process. `--durable --lifecycle transient` is valid: clean shutdown tombstones the directory record and destroys the MQTT session after the final publishes.
 
 ---
 
@@ -405,7 +416,7 @@ Symptoms we hit during real deployment and the first thing to check. In every ca
 |---|---|---|
 | Every `swarmbus send` reports "Sent to X" but peer never sees the message. | Peer's daemon has stale in-memory Python (pre-upgrade code). Wire-envelope change rejected by pydantic, dropped silently. | `swarmbus doctor --agent-id <peer>` → check "daemon library fresh". Fix: `systemctl --user restart swarmbus-<peer>.service`. |
 | `priority=high` messages sent but no wake wrapper ever fires. | (a) CLI default is `normal` — make sure `--priority high` is actually on the send. (b) Receiver's systemd unit has no `--invoke` flag. | `swarmbus doctor` → check "--invoke wired". Fix: edit `~/.config/systemd/user/swarmbus-<me>.service` ExecStart to add `--invoke <wrapper-path>`, `daemon-reload`, `restart`. |
-| `swarmbus list` returns nothing, but peers are running. | (a) Broker not reachable. (b) Peers' daemons crashed without `--persistent` so presence wasn't retained. | `swarmbus doctor` → "broker reachable" + "peer discovery". If broker is fine, have peers restart with `--persistent` (the default on `swarmbus start`). |
+| `swarmbus list` returns nothing, but peers are running. | (a) Broker not reachable. (b) Peers' daemons crashed without `--durable` so presence wasn't retained. | `swarmbus doctor` → "broker reachable" + "peer discovery". If broker is fine, have peers restart with `--durable` (the default on `swarmbus start`). |
 | `inbox-watch.sh` cron silently never pings operator. | Neither `TELEGRAM_BOT_TOKEN` env var nor `~/.secrets/TELEGRAM_BOT_TOKEN` file present. The script logs a skip reason to stderr (post-`aaa1823`) — but older installs silently no-op'd. | `tail ~/logs/inbox-watch-<agent>.log` for `[inbox-watch] no TELEGRAM_BOT_TOKEN...`. Fix: add the token to cron env or the secrets file. |
 | `inbox-watch.sh` never pings operator but log shows `pushed summary (1 msgs)`. | Bot is correctly sending, but to a different Telegram chat than the one the operator is watching. (Each agent typically has its own bot; all pings for agent X land in conversations with bot X.) | Check the operator's conversations with that agent's Telegram bot, not the current chat. |
 | Send errors with `[Errno 111] Connection refused`. | mosquitto isn't running (or `--broker` points at a host that can't reach 1883). | `systemctl status mosquitto` locally, or `mosquitto_pub -h <broker> -t ping -m x` from a peer host. |
@@ -413,7 +424,7 @@ Symptoms we hit during real deployment and the first thing to check. In every ca
 | `swarmbus tail --follow` dies when inbox file is rotated/moved. | Pre-`0d1415a` builds didn't catch `FileNotFoundError` in the poll loop. | Upgrade swarmbus + restart the `tail --follow` process. |
 | "My daemon is running but messages just pile up in the inbox file and nothing fires." | File-bridge caught the message (archive OK), but `--invoke` is either missing or broken. For Claude Code, a fresh session spawn is ~100k tokens — policy default is `priority=high` only. | `tail ~/.local/state/swarmbus-wake/<agent>.log`. If you see `policy=priority-high; priority=normal; archive-only` that's working-as-designed. Override with `SWARMBUS_WAKE_POLICY=all` for testing. |
 | Restarted daemon still rejects `priority=high`. | In-process Python module cache. The `pip install` wrote new bytes, but the already-running daemon reads its old loaded module. | `systemctl --user restart swarmbus-<agent>.service` (full process replacement, not `--reload`). |
-| `read_inbox` returns empty even though messages were sent while offline. | (a) Not using `--persistent` — ephemeral sessions only see retained messages. (b) Broker expired the persistent session before you reconnected. | Confirm `--persistent` is on the `mcp-server` command. Check broker `persistent_client_expiration` — set it to at least `1d` (mosquitto default is never-expire, but some deployments override). |
+| `read_inbox` returns empty even though messages were sent while offline. | (a) Not using `--durable` — ephemeral sessions only see retained messages. (b) Broker expired the persistent session before you reconnected. | Confirm `--durable --presence` are both on the `mcp-server` command (`--durable` requires `--presence`). Check broker `persistent_client_expiration` — set it to at least `1d` (mosquitto default is never-expire, but some deployments override). |
 
 For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journalctl --user -u swarmbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
 

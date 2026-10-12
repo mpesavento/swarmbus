@@ -12,10 +12,14 @@ These verify two contracts:
 
 Mocks ``AgentBus`` / ``run_mcp_server`` so no broker is required.
 """
+from typing import get_args
 from unittest.mock import patch, AsyncMock
+
+import pytest
 from click.testing import CliRunner
 
 from swarmbus.cli import main
+from swarmbus.registry import AgentLifecycle
 
 
 # ---------------------------------------------------------------------------
@@ -190,18 +194,18 @@ def test_mcp_server_picks_up_env_vars():
     assert kw["tls"] is True
 
 
-def test_mcp_server_persistent_flag_threads_through():
+def test_mcp_server_durable_flag_threads_through():
     runner = CliRunner()
     with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
         result = runner.invoke(
             main,
-            ["mcp-server", "--agent-id", "sb", "--persistent"],
+            ["mcp-server", "--agent-id", "sb", "--durable", "--presence"],
         )
     assert result.exit_code == 0, result.output
-    assert mock_run.call_args.kwargs["persistent"] is True
+    assert mock_run.call_args.kwargs["durable"] is True
 
 
-def test_mcp_server_no_persistent_is_default():
+def test_mcp_server_no_durable_is_default():
     runner = CliRunner()
     with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
         result = runner.invoke(
@@ -209,7 +213,235 @@ def test_mcp_server_no_persistent_is_default():
             ["mcp-server", "--agent-id", "sb"],
         )
     assert result.exit_code == 0, result.output
-    assert mock_run.call_args.kwargs["persistent"] is False
+    assert mock_run.call_args.kwargs["durable"] is False
+
+
+def test_mcp_server_registry_timing_env_vars():
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb"],
+            env={
+                "SWARMBUS_REGISTRY_HEARTBEAT_SECONDS": "20",
+                "SWARMBUS_REGISTRY_STALE_AFTER_SECONDS": "90",
+            },
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["registry_heartbeat_seconds"] == 20
+    assert mock_run.call_args.kwargs["registry_stale_after_seconds"] == 90
+
+
+def test_mcp_server_threads_registry_lifecycle_options():
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            [
+                "mcp-server",
+                "--agent-id",
+                "sb",
+                "--lifecycle",
+                "transient",
+                "--presence",
+                "--client-id",
+                "sb-session-7",
+                "--capability",
+                "development.files.write",
+                "--capability",
+                "web.read",
+                "--registry-heartbeat-seconds",
+                "20",
+                "--registry-stale-after-seconds",
+                "90",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["lifecycle"] == "transient"
+    assert mock_run.call_args.kwargs["presence"] is True
+    assert mock_run.call_args.kwargs["client_id"] == "sb-session-7"
+    assert mock_run.call_args.kwargs["capabilities"] == (
+        "development.files.write",
+        "web.read",
+    )
+    assert mock_run.call_args.kwargs["registry_heartbeat_seconds"] == 20
+    assert mock_run.call_args.kwargs["registry_stale_after_seconds"] == 90
+
+
+def _lifecycle_choices():
+    """Read the --lifecycle vocabulary off the command that declares it."""
+    command = main.commands["mcp-server"]
+    option = next(
+        param for param in command.params if param.name == "lifecycle"
+    )
+    return tuple(option.type.choices)
+
+
+def test_mcp_server_lifecycle_choices_match_registry_type():
+    """Keep CLI lifecycle choices aligned with AgentLifecycle."""
+    assert set(_lifecycle_choices()) == set(get_args(AgentLifecycle))
+
+
+def test_mcp_server_rejects_transient_without_presence():
+    """Transient lifecycle without presence is a CLI usage error."""
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb", "--lifecycle", "transient"],
+        )
+
+    assert result.exit_code == 2, result.output
+    assert "--lifecycle transient" in result.output
+    assert "--presence" in result.output
+    assert mock_run.call_count == 0
+
+
+_ACCEPTED_DURABLE_PRESENCE_FLAGS = [
+    ([], False, False),
+    (["--presence"], False, True),
+    (["--durable", "--presence"], True, True),
+]
+_REJECTED_DURABLE_PRESENCE_FLAGS = [
+    (["--durable"], True, False),
+]
+
+
+def test_mcp_server_durable_presence_flag_matrix_is_exhaustive():
+    """Cover the lifecycle/presence flag cross product."""
+    covered = {
+        (durable, presence)
+        for _, durable, presence in (
+            _ACCEPTED_DURABLE_PRESENCE_FLAGS
+            + _REJECTED_DURABLE_PRESENCE_FLAGS
+        )
+    }
+
+    assert covered == {
+        (durable, presence)
+        for durable in (False, True)
+        for presence in (False, True)
+    }
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_durable", "expected_presence"),
+    _ACCEPTED_DURABLE_PRESENCE_FLAGS,
+)
+def test_mcp_server_accepts_valid_durable_presence_combinations(
+    flags,
+    expected_durable,
+    expected_presence,
+):
+    """Only durable sidecars without presence are rejected."""
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb", *flags],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["durable"] is expected_durable
+    assert mock_run.call_args.kwargs["presence"] is expected_presence
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_durable", "expected_presence"),
+    _REJECTED_DURABLE_PRESENCE_FLAGS,
+)
+def test_mcp_server_rejects_durable_without_presence(
+    flags,
+    expected_durable,
+    expected_presence,
+):
+    """Reject durable sidecars absent from the directory."""
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb", *flags],
+        )
+
+    assert result.exit_code == 2, result.output
+    assert "--durable" in result.output
+    assert "--presence" in result.output
+    assert mock_run.call_count == 0
+
+
+def test_mcp_server_rejects_the_retired_persistent_flag():
+    """Reject the removed --persistent option."""
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            ["mcp-server", "--agent-id", "sb", "--persistent", "--presence"],
+        )
+
+    assert result.exit_code == 2, result.output
+    assert "--persistent" in result.output
+    assert mock_run.call_count == 0
+
+
+def _durable_default(command_name):
+    """Read the --durable default off the command that declares it."""
+    command = main.commands[command_name]
+    option = next(
+        param for param in command.params if param.name == "durable"
+    )
+    return option.default
+
+
+def test_durable_defaults_differ_between_start_and_mcp_server():
+    """Preserve distinct start and mcp-server durability defaults."""
+    assert _durable_default("start") is True
+    assert _durable_default("mcp-server") is False
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "presence_flags", "expected_presence"),
+    [
+        ("transient", ["--presence"], True),
+        ("persistent", [], False),
+        ("persistent", ["--presence"], True),
+    ],
+)
+def test_mcp_server_accepts_valid_lifecycle_presence_combinations(
+    lifecycle,
+    presence_flags,
+    expected_presence,
+):
+    """Only transient lifecycle without presence is rejected."""
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(
+            main,
+            [
+                "mcp-server",
+                "--agent-id",
+                "sb",
+                "--lifecycle",
+                lifecycle,
+                *presence_flags,
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["lifecycle"] == lifecycle
+    assert mock_run.call_args.kwargs["presence"] is expected_presence
+
+
+def test_mcp_server_default_lifecycle_presence_pair_is_accepted():
+    """The no-flags invocation must stay valid and unchanged."""
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
+        result = runner.invoke(main, ["mcp-server", "--agent-id", "sb"])
+
+    assert result.exit_code == 0, result.output
+    assert mock_run.call_args.kwargs["lifecycle"] == "persistent"
+    assert mock_run.call_args.kwargs["presence"] is False
 
 
 # ---------------------------------------------------------------------------
