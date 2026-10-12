@@ -20,6 +20,7 @@ from .bus import AgentBus
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
+from .maintenance import OnlineIdentityError, RegistryMaintenance
 from .message import (
     DEFAULT_HOP_LIMIT,
     UNTRUSTED_METADATA_LABEL,
@@ -1129,8 +1130,6 @@ def registry_list(
 ) -> None:
     """List retained identities and their presence evidence."""
 
-    from .maintenance import RegistryMaintenance
-
     password = _maintenance_password(password, password_file)
     maintenance = RegistryMaintenance(
         broker=broker,
@@ -1209,8 +1208,6 @@ def registry_gc(
     tls: bool,
 ) -> None:
     """Collect old transient retained registry entries."""
-
-    from .maintenance import RegistryMaintenance
 
     password = _maintenance_password(password, password_file)
     maintenance = RegistryMaintenance(
@@ -1300,11 +1297,9 @@ def registry_forget(
 
     if not dry_run and not yes:
         click.confirm(
-            f"Forget {agent_id!r} and destroy its durable MQTT session?",
+            f"Forget {agent_id!r} and destroy its persistent MQTT session?",
             abort=True,
         )
-
-    from .maintenance import OnlineIdentityError, RegistryMaintenance
 
     password = _maintenance_password(password, password_file)
     maintenance = RegistryMaintenance(

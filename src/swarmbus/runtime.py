@@ -408,7 +408,7 @@ class ManagedMCPRuntime:
                 # Only now is the willed connection gone, so reclaiming the
                 # client id cannot make the broker publish its will.
                 if destroy_session:
-                    await self._destroy_durable_session()
+                    await self._destroy_persistent_session()
                 await self.store.close()
                 if self._state is not RuntimeState.FATAL:
                     self._state = RuntimeState.STOPPED
@@ -985,7 +985,7 @@ class ManagedMCPRuntime:
         # publishes that connection's will. Defer until after a clean close.
         return self.persistent
 
-    async def _destroy_durable_session(self) -> None:
+    async def _destroy_persistent_session(self) -> None:
         """Destroy the broker session for a retired transient identity."""
         # A will could recreate the presence orphan just removed.
         kwargs = {
