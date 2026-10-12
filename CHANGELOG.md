@@ -34,7 +34,10 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ### Fixed
 - `agent_state(action="list"|"get")` now raises `TransportUnavailable` while disconnected instead of serving stale or empty directory results.
-- Registry GC preserves partial reports across broker failures, accounts for skipped and malformed records consistently, reports presence orphans without deleting them, and destroys durable sessions when retiring their identities.
+- Registry GC preserves partial reports across broker failures, accounts for skipped and malformed records consistently, and destroys durable sessions when retiring their identities.
+- **Presence-only orphans are collectable.** A retained presence record with no registry record has no `last_seen` to age against, so `registry-gc` now stamps `first_seen_offline` onto the payload as retained the first time it sees one offline, ages from that stamp on later runs, and tombstones it past retention. The stamp is written once and never rewritten — rewriting it would reset the clock every run and the record could never age out. Records that say `online` are never written to, every write is decided on a re-read to avoid clobbering an agent that just reconnected, and the report breaks the old single `orphan_presence` count out into `orphan_stamped`, `orphan_waiting`, `orphan_collected`, `orphan_online`, `orphan_would_stamp`, `orphan_would_collect`, `orphan_skipped`, `orphan_failed`, and `orphan_deferred` (which sum to `orphan_presence`).
+- **`registry-list` shows how long an orphan has been waiting.** A new `orphans` list reports each presence-only record's `agent_id`, `presence_state`, `first_seen_offline` stamp (null until GC writes one) and the derived `offline_age_seconds`, so the wait no longer has to be read off the MQTT topic by hand. Orphans stay out of `identities` because they have no registry record to describe. `orphan_presence_agent_ids` is unchanged.
+- Orphan presence writes catch transport faults by name (`aiomqtt.MqttError`, `OSError` subclasses for socket/DNS/TLS, and `asyncio.TimeoutError`, which is not an `OSError` on 3.10) instead of every exception. A failed write is still reported as `orphan_failed`/`orphan_skipped` and the sweep continues to the next orphan; cancellation propagates.
 - `AgentBus.list_agents` derives identity from the broker-authorized presence topic rather than trusting the payload claim.
 
 ### Removed
@@ -44,7 +47,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - Presence payload identity claims no longer carry authority; mismatches are logged and attributed to the topic owner.
 
 ### Wire-compat
-1. **Envelope shape — no change.**
+1. **Envelope shape — no change.** Retained presence payloads gain one optional key, `first_seen_offline`, written only by `registry-gc`. Readers ignore unknown keys, so mixed-version fleets are fine in both directions; a pre-upgrade reader simply cannot see the stamp.
 2. **Topic layout — no change.**
 3. **Retain/QoS defaults — no change.** The MCP server remains non-durable by default; managed inbox acknowledgement timing changed, not publish or subscribe defaults.
 4. **MCP tool contract — breaking consolidation.** `watch_inbox` is replaced by `read_inbox(wait_seconds=...)`; `read_inbox` gains optional `ack_ids` and `max_messages`. `list_agents` is replaced by `agent_state(action="list")`, which requires a presence-enabled, connected sidecar. Restart the sidecar and update its behavioral skill together.

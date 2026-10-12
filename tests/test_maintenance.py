@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 from datetime import datetime, timedelta, timezone
 from typing import get_args
 from unittest.mock import AsyncMock, patch
@@ -8,9 +9,11 @@ import aiomqtt
 import pytest
 from click.testing import CliRunner
 
+from swarmbus.bus import _legacy_presence_payload
 from swarmbus.cli import main
 from swarmbus.maintenance import (
     OnlineIdentityError,
+    OrphanPresenceEntry,
     RegistryForgetReport,
     RegistryGCReport,
     RegistryListReport,
@@ -82,8 +85,12 @@ def _registry(
     )
 
 
-def _presence(agent_id, state):
-    return PresenceRecord(agent_id=agent_id, state=state)
+def _presence(agent_id, state, *, first_seen_offline=None):
+    return PresenceRecord(
+        agent_id=agent_id,
+        state=state,
+        first_seen_offline=first_seen_offline,
+    )
 
 
 def _message(record):
@@ -108,6 +115,18 @@ def _assert_nothing_published(factory):
         )
 
 
+def _presence_writes(factory, agent_id):
+    """Payloads published to one agent's presence topic, in order."""
+
+    topic = DEFAULT_TOPICS.presence(agent_id)
+    return [
+        call.args[1]
+        for client in factory.clients
+        for call in client.publish.await_args_list
+        if call.args[0] == topic
+    ]
+
+
 def _assert_gc_identities(report):
     """Assert the GC report counter identities."""
 
@@ -120,6 +139,20 @@ def _assert_gc_identities(report):
     ), (
         f"selected {report.selected} != deleted {report.deleted} + "
         f"would_delete {report.would_delete} + skipped {report.skipped}"
+    )
+    orphan_dispositions = (
+        report.orphan_online
+        + report.orphan_stamped
+        + report.orphan_waiting
+        + report.orphan_collected
+        + report.orphan_would_stamp
+        + report.orphan_would_collect
+        + report.orphan_skipped
+        + report.orphan_deferred
+    )
+    assert report.orphan_presence == orphan_dispositions, (
+        f"orphan_presence {report.orphan_presence} != the sum of the "
+        f"per-orphan dispositions {orphan_dispositions}"
     )
 
 
@@ -182,6 +215,53 @@ async def test_registry_list_joins_registry_and_presence_without_writes():
         None,
     ]
     assert report.identities[1].lifecycle == "persistent"
+    _assert_nothing_published(factory)
+
+
+@pytest.mark.asyncio
+async def test_registry_list_surfaces_orphan_stamps_and_waiting_age():
+    """An orphan appears only as an orphan, so its wait has to be reported
+    outside `identities` -- it has no registry record to carry it."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    stamp = now - timedelta(seconds=450)
+    identity = _registry("worker", now=now, age_seconds=30)
+    factory = _ClientFactory(
+        [[
+            _message(identity),
+            _message(_presence("worker", "online")),
+            _message(
+                _presence("stamped", "offline", first_seen_offline=stamp)
+            ),
+            _message(_presence("unstamped", "offline")),
+            _message(_presence("live", "online")),
+        ]]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.list_registry(
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    orphans = {orphan.agent_id: orphan for orphan in report.orphans}
+    assert set(orphans) == {"stamped", "unstamped", "live"}
+    # The operator question is how long this one has been waiting.
+    assert orphans["stamped"].first_seen_offline == stamp
+    assert orphans["stamped"].offline_age_seconds == (
+        now - stamp
+    ).total_seconds()
+    assert orphans["unstamped"].first_seen_offline is None
+    assert orphans["unstamped"].offline_age_seconds is None
+    assert orphans["live"].presence_state == "online"
+    assert orphans["live"].first_seen_offline is None
+    # Synthesizing a registry record for an orphan would make the listing
+    # claim an identity that does not exist.
+    assert [entry.agent_id for entry in report.identities] == ["worker"]
+    assert report.orphan_presence == 3
+    assert report.orphan_presence_agent_ids == sorted(orphans)
     _assert_nothing_published(factory)
 
 
@@ -391,7 +471,8 @@ async def test_gc_counts_malformed_records_and_fails_closed():
 @pytest.mark.asyncio
 async def test_gc_counts_presence_without_registry_record():
     """Presence-only agents are outside the registry scan, so they must be
-    reported or they accumulate invisibly. Counted, never collected."""
+    reported or they accumulate invisibly. Reported and aged on their own
+    pass, which leaves the registry pass unchanged."""
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     stale = _registry("worker", now=now, age_seconds=900)
     factory = _ClientFactory(
@@ -403,6 +484,10 @@ async def test_gc_counts_presence_without_registry_record():
                 _message(_presence("legacy-online", "online")),
             ],
             [_message(stale), _message(_presence("worker", "offline"))],
+            [_message(_presence("legacy-offline", "offline"))],
+            # Spare: fixture exhaustion would fail this test before any
+            # assertion runs.
+            [],
         ]
     )
     maintenance = RegistryMaintenance(
@@ -418,6 +503,8 @@ async def test_gc_counts_presence_without_registry_record():
     )
 
     assert report.orphan_presence == 2
+    assert report.orphan_online == 1
+    assert report.orphan_stamped == 1
     assert report.scanned == 1
     assert report.deleted_agent_ids == ["worker"]
     _assert_gc_identities(report)
@@ -425,18 +512,23 @@ async def test_gc_counts_presence_without_registry_record():
         (DEFAULT_TOPICS.presence("worker"), b""),
         (DEFAULT_TOPICS.registry("worker"), b""),
     ]
+    assert _presence_writes(factory, "legacy-online") == []
 
 
 @pytest.mark.asyncio
-async def test_gc_reports_presence_only_orphans_without_deleting_them():
-    """Presence-only orphans are reported without broker writes."""
+async def test_gc_stamps_presence_only_orphans_on_first_sighting():
+    """An orphan has no registry last_seen to age against, so the first
+    sighting stamps the retained payload instead of collecting it."""
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     factory = _ClientFactory(
         [
             [
                 _message(_presence("legacy-one", "offline")),
                 _message(_presence("legacy-two", "offline")),
-            ]
+            ],
+            [_message(_presence("legacy-one", "offline"))],
+            [_message(_presence("legacy-two", "offline"))],
+            [],
         ]
     )
     maintenance = RegistryMaintenance(
@@ -452,6 +544,11 @@ async def test_gc_reports_presence_only_orphans_without_deleting_them():
     )
 
     assert report.orphan_presence == 2
+    assert report.orphan_stamped == 2
+    assert report.orphan_stamped_agent_ids == ["legacy-one", "legacy-two"]
+    assert report.orphan_collected == 0
+    assert report.orphan_waiting == 0
+    assert report.orphan_failed == 0
     assert report.scanned == 0
     assert report.eligible == 0
     assert report.selected == 0
@@ -459,8 +556,308 @@ async def test_gc_reports_presence_only_orphans_without_deleting_them():
     assert report.would_delete == 0
     assert report.preserved_by_reason == {}
     _assert_gc_identities(report)
-    assert len(factory.calls) == 1
-    assert factory.clients[0].publish.await_count == 0
+    for agent_id in ("legacy-one", "legacy-two"):
+        topic = DEFAULT_TOPICS.presence(agent_id)
+        written = _presence_writes(factory, agent_id)
+        assert len(written) == 1, written
+        assert written[0] not in (b"", ""), "orphan tombstoned, not stamped"
+        stamped = PresenceRecord.from_mqtt(topic, written[0])
+        assert stamped.first_seen_offline == now
+        assert stamped.state == "offline"
+
+
+@pytest.mark.asyncio
+async def test_gc_never_restamps_an_orphan_and_collects_it_past_retention():
+    """The stamp is written once and only aged afterwards.
+
+    Rewriting it on a later run would reset the clock every pass, so the
+    record's age could never exceed one GC interval and it would never be
+    collectable -- worse than leaving it alone, and invisible without the
+    orphan counters.
+    """
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    stamp = now - timedelta(seconds=100)
+    stamped = _presence("legacy", "offline", first_seen_offline=stamp)
+    # Spare batches repeat the record so a run that wrongly decides to
+    # stamp fails on the write assertions, not on fixture exhaustion.
+    waiting_factory = _ClientFactory([[_message(stamped)]] * 3)
+    collecting_factory = _ClientFactory([[_message(stamped)]] * 3)
+
+    waiting = await _gc_once(waiting_factory, now=now)
+    collected = await _gc_once(
+        collecting_factory,
+        now=stamp + timedelta(seconds=301),
+    )
+
+    assert waiting.orphan_waiting == 1
+    assert waiting.orphan_stamped == 0
+    assert waiting.orphan_collected == 0
+    # No write at all leaves the stamp on the broker exactly as it was.
+    _assert_nothing_published(waiting_factory)
+    _assert_gc_identities(waiting)
+
+    assert collected.orphan_collected == 1
+    assert collected.orphan_collected_agent_ids == ["legacy"]
+    assert collected.orphan_stamped == 0
+    assert collected.orphan_waiting == 0
+    # The tombstone is the only write the record ever receives.
+    assert _presence_writes(collecting_factory, "legacy") == [b""]
+    _assert_gc_identities(collected)
+
+
+@pytest.mark.asyncio
+async def test_gc_never_writes_to_an_orphan_that_says_online():
+    """An online presence record is live state, whatever the registry says."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    factory = _ClientFactory([[_message(_presence("live", "online"))]] * 3)
+
+    report = await _gc_once(factory, now=now)
+
+    assert report.orphan_presence == 1
+    assert report.orphan_online == 1
+    assert report.orphan_stamped == 0
+    assert report.orphan_collected == 0
+    _assert_nothing_published(factory)
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_abandons_an_orphan_stamp_when_the_reread_says_online():
+    """An agent can reconnect between the scan and the write, so the write
+    is decided on a fresh read: otherwise a stale offline payload would
+    land on top of a live record."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    factory = _ClientFactory(
+        [
+            [_message(_presence("waking", "offline"))],
+            [_message(_presence("waking", "online"))],
+            [],
+        ]
+    )
+
+    report = await _gc_once(factory, now=now)
+
+    assert report.orphan_online == 1
+    assert report.orphan_stamped == 0
+    assert report.orphan_stamped_agent_ids == []
+    _assert_nothing_published(factory)
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_orphan_stamp_preserves_a_legacy_payload_as_observed():
+    """A legacy payload has no reason key and different field names.
+
+    The stamp is added to the payload that is retained; rebuilding one from
+    the current schema would rewrite the record while claiming only to add
+    a timestamp.
+    """
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    topic = DEFAULT_TOPICS.presence("legacy")
+    original = _legacy_presence_payload("legacy", "offline")
+    factory = _ClientFactory([[_Message(topic, original)]] * 3)
+
+    report = await _gc_once(factory, now=now)
+
+    assert report.orphan_stamped == 1
+    written = _presence_writes(factory, "legacy")
+    assert len(written) == 1, written
+    payload = json.loads(written[0])
+    observed = json.loads(original)
+    assert {key: payload[key] for key in observed} == observed
+    assert set(payload) == set(observed) | {"first_seen_offline"}
+    # The stamp has to survive being read back, or it is rewritten on
+    # every run.
+    assert PresenceRecord.from_mqtt(topic, written[0]).first_seen_offline == now
+
+
+@pytest.mark.asyncio
+async def test_gc_orphan_counters_separate_stamped_from_waiting():
+    """Stamped-this-run and already-waiting are different populations: the
+    first rising while the second never drains is the re-stamp failure."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    fresh = _presence("fresh-orphan", "offline")
+    waiting = _presence(
+        "waiting-orphan",
+        "offline",
+        first_seen_offline=now - timedelta(seconds=30),
+    )
+    live = _presence("live-orphan", "online")
+    factory = _ClientFactory(
+        [
+            [_message(fresh), _message(waiting), _message(live)],
+            [_message(fresh)],
+            [],
+        ]
+    )
+
+    report = await _gc_once(factory, now=now)
+
+    assert report.orphan_presence == 3
+    assert report.orphan_stamped == 1
+    assert report.orphan_stamped_agent_ids == ["fresh-orphan"]
+    assert report.orphan_waiting == 1
+    assert report.orphan_online == 1
+    assert report.orphan_collected == 0
+    assert report.orphan_deferred == 0
+    _assert_gc_identities(report)
+    assert _presence_writes(factory, "waiting-orphan") == []
+    assert _presence_writes(factory, "live-orphan") == []
+
+
+@pytest.mark.asyncio
+async def test_gc_dry_run_never_stamps_or_collects_an_orphan():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    unstamped = _presence("fresh-orphan", "offline")
+    expired = _presence(
+        "old-orphan",
+        "offline",
+        first_seen_offline=now - timedelta(seconds=900),
+    )
+    factory = _ClientFactory(
+        [
+            [_message(unstamped), _message(expired)],
+            [_message(unstamped)],
+            [_message(expired)],
+            [],
+        ]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=10,
+        dry_run=True,
+    )
+
+    assert report.orphan_would_stamp == 1
+    assert report.orphan_would_collect == 1
+    assert report.orphan_stamped == 0
+    assert report.orphan_collected == 0
+    _assert_nothing_published(factory)
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_orphan_batch_bound_defers_the_rest():
+    """Orphan writes are bounded per run like registry deletions are."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    factory = _ClientFactory(
+        [
+            [
+                _message(_presence("orphan-one", "offline")),
+                _message(_presence("orphan-two", "offline")),
+            ],
+            [_message(_presence("orphan-one", "offline"))],
+            [],
+        ]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.orphan_presence == 2
+    assert report.orphan_stamped == 1
+    assert report.orphan_stamped_agent_ids == ["orphan-one"]
+    assert report.orphan_deferred == 1
+    _assert_gc_identities(report)
+    assert _presence_writes(factory, "orphan-two") == []
+
+
+@pytest.mark.asyncio
+async def test_gc_orphan_write_failure_is_recorded_and_batch_continues():
+    """One orphan's transport fault must not abandon the others: the
+    failure is recorded and the sweep carries on to the next."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    one = _presence("orphan-one", "offline")
+    two = _presence("orphan-two", "offline")
+    factory = _ClientFactory(
+        [
+            [_message(one), _message(two)],
+            [_message(one)],
+            [_message(two)],
+            [],
+        ],
+        # Not an MqttError: a socket, DNS or TLS fault can surface raw.
+        publish_side_effects={1: [OSError("connection reset by peer")]},
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=10,
+    )
+
+    assert report.orphan_presence == 2
+    assert report.orphan_failed == 1
+    assert report.orphan_skipped == 1
+    assert report.orphan_deferred == 0, "the rest of the batch was abandoned"
+    assert report.orphan_stamped == 1
+    assert report.orphan_stamped_agent_ids == ["orphan-two"]
+    _assert_gc_identities(report)
+    assert factory.clients[1].publish.await_count == 1
+    written = _presence_writes(factory, "orphan-two")
+    assert len(written) == 1, written
+    assert (
+        PresenceRecord.from_mqtt(
+            DEFAULT_TOPICS.presence("orphan-two"),
+            written[0],
+        ).first_seen_offline
+        == now
+    )
+
+
+@pytest.mark.asyncio
+async def test_gc_orphan_write_records_a_publish_timeout():
+    """asyncio.TimeoutError is only an OSError subclass from 3.11 on, so a
+    timed-out write has to be caught by name to stay recoverable."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    orphan = _presence("orphan", "offline")
+    factory = _ClientFactory(
+        [[_message(orphan)]] * 3,
+        publish_side_effects={1: [asyncio.TimeoutError()]},
+    )
+
+    report = await _gc_once(factory, now=now)
+
+    assert report.orphan_failed == 1
+    assert report.orphan_skipped == 1
+    assert report.orphan_stamped == 0
+    assert report.orphan_stamped_agent_ids == []
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_orphan_write_lets_cancellation_propagate():
+    """Cancellation is not a transport fault. Recording it as one would
+    keep a cancelled sweep writing to the broker."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    orphan = _presence("orphan", "offline")
+    factory = _ClientFactory(
+        [[_message(orphan)]] * 3,
+        publish_side_effects={1: [asyncio.CancelledError()]},
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _gc_once(factory, now=now)
 
 
 @pytest.mark.asyncio
@@ -564,7 +961,11 @@ async def test_snapshot_registry_tombstone_deletes_the_record_it_read():
                 _message(stale),
                 _message(offline),
                 _Message(DEFAULT_TOPICS.registry("worker"), b""),
-            ]
+            ],
+            # Presence outliving its registry record is an orphan, so the
+            # orphan pass re-reads it.
+            [_message(offline)],
+            [],
         ]
     )
 
@@ -573,9 +974,12 @@ async def test_snapshot_registry_tombstone_deletes_the_record_it_read():
 
     assert control_report.scanned == 1
     assert control_report.deleted == 1
+    assert control_report.orphan_presence == 0
     assert report.scanned == 0
     assert report.eligible == 0
     assert report.malformed == 0
+    assert report.orphan_presence == 1
+    assert report.orphan_stamped == 1
     _assert_gc_identities(report)
     assert tombstoned.clients[0].publish.await_count == 0
 
@@ -1528,6 +1932,49 @@ def test_registry_list_cli_prints_full_directory():
         stale_after_seconds=60.0,
     )
     assert maintenance.call_args.kwargs["snapshot_seconds"] == 1.5
+
+
+def test_registry_list_cli_renders_orphan_stamps():
+    """Reading the stamp off the MQTT topic by hand is the thing this
+    replaces, so it has to reach the command's output."""
+    stamp = datetime(2026, 10, 1, tzinfo=timezone.utc) - timedelta(
+        seconds=450
+    )
+    report = RegistryListReport(
+        scanned=0,
+        orphan_presence=2,
+        orphans=[
+            OrphanPresenceEntry(
+                agent_id="stamped",
+                presence_state="offline",
+                first_seen_offline=stamp,
+                offline_age_seconds=450.0,
+            ),
+            OrphanPresenceEntry(
+                agent_id="unstamped",
+                presence_state="offline",
+            ),
+        ],
+        orphan_presence_agent_ids=["stamped", "unstamped"],
+    )
+    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+        maintenance.return_value.list_registry = AsyncMock(return_value=report)
+        result = CliRunner().invoke(main, ["registry-list"])
+
+    assert result.exit_code == 0, result.output
+    rendered = {
+        orphan["agent_id"]: orphan
+        for orphan in json.loads(result.output)["orphans"]
+    }
+    assert set(rendered) == {"stamped", "unstamped"}
+    # Read back through the model rather than pattern-matched: what matters
+    # is that the values survive, not how they are spelled.
+    stamped = OrphanPresenceEntry.model_validate(rendered["stamped"])
+    assert stamped.first_seen_offline == stamp
+    assert stamped.offline_age_seconds == 450.0
+    unstamped = OrphanPresenceEntry.model_validate(rendered["unstamped"])
+    assert unstamped.first_seen_offline is None
+    assert unstamped.offline_age_seconds is None
 
 
 def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():

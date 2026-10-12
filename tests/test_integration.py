@@ -917,6 +917,161 @@ async def test_transient_registry_gc_removes_retained_state_on_real_broker(
 
 
 @pytest.mark.asyncio
+async def test_transient_gc_stamps_then_collects_orphan_presence_on_real_broker(
+    mosquitto_broker,
+):
+    """A retained presence record with no registry record is collectable
+    only because GC stamps its first sighting: run one stamps, a run past
+    retention collects, and the run in between leaves the stamp alone."""
+    host, port = mosquitto_broker
+    topics = TopicMap(root="gc-orphan-acceptance")
+    agent_id = "orphan-worker"
+    presence_topic = topics.presence(agent_id)
+    now = datetime.now(timezone.utc)
+    presence = PresenceRecord(
+        agent_id=agent_id,
+        state="offline",
+        reason="shutdown",
+    )
+    await _clear_retained(host, port, [presence_topic])
+
+    try:
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(
+                presence_topic,
+                presence.to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            topics=topics,
+            snapshot_seconds=0.2,
+        )
+        first = await maintenance.gc_transient(
+            now=now,
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert first.orphan_stamped_agent_ids == [agent_id]
+        assert first.orphan_collected == 0
+        retained = await _read_retained(host, port, [presence_topic])
+        assert presence_topic in retained, _describe_retained(retained)
+        stamped = PresenceRecord.from_mqtt(
+            presence_topic,
+            retained[presence_topic],
+            topics=topics,
+        )
+        assert stamped.first_seen_offline is not None
+        assert stamped.reason == "shutdown"
+
+        second = await maintenance.gc_transient(
+            now=now + timedelta(seconds=60),
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert second.orphan_waiting == 1
+        assert second.orphan_stamped == 0
+        assert second.orphan_collected == 0
+        unchanged = await _read_retained(host, port, [presence_topic])
+        assert presence_topic in unchanged, _describe_retained(unchanged)
+        assert (
+            PresenceRecord.from_mqtt(
+                presence_topic,
+                unchanged[presence_topic],
+                topics=topics,
+            ).first_seen_offline
+            == stamped.first_seen_offline
+        )
+
+        third = await maintenance.gc_transient(
+            now=stamped.first_seen_offline + timedelta(seconds=301),
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert third.orphan_collected_agent_ids == [agent_id]
+        assert third.orphan_stamped == 0
+        collected = await _read_retained(host, port, [presence_topic])
+        assert presence_topic not in collected, _describe_retained(collected)
+    finally:
+        await _clear_retained(host, port, [presence_topic])
+
+
+@pytest.mark.asyncio
+async def test_registry_list_reports_orphan_wait_after_a_real_gc_stamp(
+    mosquitto_broker,
+):
+    """The stamp GC leaves on the broker is the only record of how long an
+    orphan has been waiting, so the listing has to read it back."""
+    host, port = mosquitto_broker
+    topics = TopicMap(root="orphan-list-acceptance")
+    agent_id = "listed-orphan"
+    presence_topic = topics.presence(agent_id)
+    now = datetime.now(timezone.utc)
+    await _clear_retained(host, port, [presence_topic])
+
+    try:
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(
+                presence_topic,
+                PresenceRecord(agent_id=agent_id, state="offline").to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            topics=topics,
+            snapshot_seconds=0.2,
+        )
+
+        before = await maintenance.list_registry(
+            now=now,
+            stale_after_seconds=60,
+        )
+
+        assert [orphan.agent_id for orphan in before.orphans] == [agent_id]
+        assert before.orphans[0].first_seen_offline is None
+        assert before.orphans[0].offline_age_seconds is None
+
+        stamped = await maintenance.gc_transient(
+            now=now,
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert stamped.orphan_stamped_agent_ids == [agent_id]
+
+        later = now + timedelta(seconds=120)
+        after = await maintenance.list_registry(
+            now=later,
+            stale_after_seconds=60,
+        )
+
+        assert [orphan.agent_id for orphan in after.orphans] == [agent_id]
+        orphan = after.orphans[0]
+        assert orphan.first_seen_offline is not None
+        assert orphan.offline_age_seconds > 0
+        assert orphan.offline_age_seconds == (
+            later - orphan.first_seen_offline
+        ).total_seconds()
+        # An orphan has no registry record, so it must not show up as one.
+        assert after.identities == []
+    finally:
+        await _clear_retained(host, port, [presence_topic])
+
+
+@pytest.mark.asyncio
 async def test_durable_session_queues_message_until_reconnect(
     mosquitto_broker,
 ):

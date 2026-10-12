@@ -13,6 +13,9 @@ from .topics import DEFAULT_TOPICS, TopicMap
 MAX_STATUS_LENGTH = 280
 MAX_CAPABILITY_LENGTH = 128
 AgentLifecycle = Literal["persistent", "transient"]
+#: Payload key holding the first-sighting stamp maintenance writes onto a
+#: presence record that has no registry record to age against.
+PRESENCE_FIRST_SEEN_OFFLINE_KEY = "first_seen_offline"
 
 
 def _normalize_string_list(
@@ -114,11 +117,28 @@ class PresenceRecord(BaseModel):
     state: Literal["online", "offline"]
     connected_at: datetime | None = None
     reason: str | None = None
+    #: When maintenance first observed this record offline with no registry
+    #: record to age against. Written by GC, never by the agent itself.
+    first_seen_offline: datetime | None = None
 
     @field_validator("agent_id")
     @classmethod
     def validate_agent_id(cls, value: str) -> str:
         return _validate_agent_id(value)
+
+    @field_validator("first_seen_offline")
+    @classmethod
+    def validate_aware_first_seen_offline(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        # Retention is computed from this field, so a naive value would make
+        # the subtraction raise mid-collection. Reject it as malformed here.
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError("first_seen_offline must be timezone-aware")
+        return value
 
     def to_json(self) -> str:
         return self.model_dump_json(exclude_none=True)
@@ -136,12 +156,18 @@ class PresenceRecord(BaseModel):
 
         data = json.loads(payload)
         if "agent_id" not in data and "agent" in data:
+            # Every key the current schema keeps has to be carried across, or
+            # it is silently dropped on read: a stamp that does not survive
+            # this translation would be rewritten on every maintenance pass.
             data = {
                 "schema_version": 1,
                 "agent_id": data["agent"],
                 "state": data.get("status"),
                 "connected_at": data.get("connected_at"),
                 "reason": data.get("reason"),
+                PRESENCE_FIRST_SEEN_OFFLINE_KEY: data.get(
+                    PRESENCE_FIRST_SEEN_OFFLINE_KEY
+                ),
             }
         record = cls.model_validate(data)
         if record.agent_id != topic_agent:
@@ -167,6 +193,78 @@ def presence_payload(
         ),
         reason=reason,
     ).to_json()
+
+
+def stamp_presence_payload(
+    payload: str | bytes,
+    *,
+    first_seen_offline: datetime,
+) -> str:
+    """Add the first-seen-offline stamp to an observed presence payload.
+
+    Edits the payload as observed instead of re-serializing a
+    ``PresenceRecord``: older records carry different keys, and rebuilding
+    them from the current schema would rewrite them while claiming only to
+    add a timestamp. Callers decide *whether* to stamp (see
+    :func:`orphan_presence_action`); this only writes it.
+    """
+
+    if first_seen_offline.tzinfo is None or (
+        first_seen_offline.utcoffset() is None
+    ):
+        raise ValueError("first_seen_offline must be timezone-aware")
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("presence payload must be a JSON object")
+    return json.dumps(
+        {
+            **data,
+            PRESENCE_FIRST_SEEN_OFFLINE_KEY: first_seen_offline.isoformat(),
+        }
+    )
+
+
+class OrphanPresenceAction(str, Enum):
+    """What maintenance owes one presence record with no registry record."""
+
+    ONLINE = "online"
+    STAMP = "stamp"
+    WAIT = "wait"
+    COLLECT = "collect"
+
+
+def orphan_presence_action(
+    *,
+    presence: PresenceRecord,
+    now: datetime,
+    retention_seconds: float,
+) -> OrphanPresenceAction:
+    """Decide the next action for a presence record with no registry record.
+
+    Such a record has no registry ``last_seen`` to age against, so the first
+    pass that sees one offline stamps ``first_seen_offline`` into the
+    retained payload and later passes age from that stamp.
+
+    A stamped record is only ever aged, never stamped again: re-stamping
+    would reset the clock on every pass, so its age could never exceed one
+    maintenance interval and it would never be collected. That also makes
+    this idempotent, and makes a stamp dated ahead of the clock wait rather
+    than be rewritten.
+    """
+
+    if retention_seconds <= 0:
+        raise ValueError("retention_seconds must be positive")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+
+    if presence.state == "online":
+        return OrphanPresenceAction.ONLINE
+    first_seen = presence.first_seen_offline
+    if first_seen is None:
+        return OrphanPresenceAction.STAMP
+    if (now - first_seen).total_seconds() > retention_seconds:
+        return OrphanPresenceAction.COLLECT
+    return OrphanPresenceAction.WAIT
 
 
 class GCDecisionReason(str, Enum):
