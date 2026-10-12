@@ -813,18 +813,90 @@ async def test_forget_refuses_when_presence_was_never_observed():
 
 
 @pytest.mark.asyncio
-async def test_forget_refuses_when_no_retained_state_is_observed_at_all():
-    """An empty snapshot does not prove an identity is offline."""
-    factory = _ClientFactory([[]])
+async def test_forget_reports_already_absent_after_two_empty_snapshots():
+    factory = _ClientFactory([[], []])
+    audit_events = []
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=audit_events.append,
+    )
+
+    result = await maintenance.forget("ghost-session")
+
+    assert result.already_absent is True
+    assert result.lifecycle == "unknown"
+    assert result.online is None
+    assert result.rechecked is True
+    assert result.refused is False
+    assert result.deleted is False
+    assert result.session_destroyed is False
+    assert audit_events == []
+    assert len(factory.calls) == 2
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    _assert_nothing_published(factory)
+
+
+@pytest.mark.parametrize(
+    ("presence_state", "age_seconds", "expected_reason"),
+    [
+        ("offline", 900, "unconfirmed-offline"),
+        ("online", 5, "online"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_forget_refuses_state_that_appears_after_empty_snapshot(
+    presence_state,
+    age_seconds,
+    expected_reason,
+):
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    record = _registry(
+        "starting-session",
+        now=now,
+        age_seconds=age_seconds,
+        lifecycle="named",
+    )
+    presence = _presence(record.agent_id, presence_state)
+    factory = _ClientFactory([[], [_message(record), _message(presence)]])
     maintenance = RegistryMaintenance(
         client_factory=factory,
         snapshot_seconds=0.001,
     )
 
-    with pytest.raises(UnconfirmedOfflineError, match="ghost-session"):
-        await maintenance.forget("ghost-session")
+    result = await maintenance.forget(
+        record.agent_id,
+        now=now,
+        stale_after_seconds=60,
+    )
 
-    assert len(factory.calls) == 1
+    assert result.refused is True
+    assert result.refused_reason == expected_reason
+    assert result.already_absent is False
+    assert result.online is (presence_state == "online")
+    assert result.deleted is False
+    assert result.session_destroyed is False
+    assert len(factory.calls) == 2
+    _assert_nothing_published(factory)
+
+
+@pytest.mark.asyncio
+async def test_forget_refuses_malformed_evidence_after_empty_snapshot():
+    agent_id = "malformed-session"
+    malformed = _Message(DEFAULT_TOPICS.registry(agent_id), b"{")
+    factory = _ClientFactory([[], [malformed]])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    result = await maintenance.forget(agent_id)
+
+    assert result.refused is True
+    assert result.refused_reason == "unconfirmed-offline"
+    assert result.already_absent is False
+    assert result.deleted is False
+    assert len(factory.calls) == 2
     _assert_nothing_published(factory)
 
 
@@ -916,9 +988,8 @@ async def test_forget_evicts_observed_online_identity_with_force_online():
 
 
 @pytest.mark.asyncio
-async def test_forget_reports_already_absent_when_nothing_was_retained():
-    """force_online can retire an already-absent persistent session."""
-    factory = _ClientFactory([[], [], []])
+async def test_forget_force_online_does_not_impersonate_absent_identity():
+    factory = _ClientFactory([[], []])
     audit_events = []
     maintenance = RegistryMaintenance(
         client_factory=factory,
@@ -931,14 +1002,12 @@ async def test_forget_reports_already_absent_when_nothing_was_retained():
     assert result.already_absent is True
     assert result.lifecycle == "unknown"
     assert result.online is None
-    assert result.deleted is True
-    assert result.session_destroyed is True
-    assert audit_events[0]["lifecycle"] == "unknown"
-    assert audit_events[0]["last_seen"] is None
-    assert [call.args for call in factory.clients[2].publish.await_args_list] == [
-        (DEFAULT_TOPICS.presence("ghost-session"), b""),
-        (DEFAULT_TOPICS.registry("ghost-session"), b""),
-    ]
+    assert result.deleted is False
+    assert result.session_destroyed is False
+    assert audit_events == []
+    assert len(factory.calls) == 2
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    _assert_nothing_published(factory)
 
 
 @pytest.mark.asyncio
@@ -1262,6 +1331,54 @@ async def test_gc_durable_transient_tombstones_on_its_own_client_id():
     assert kwargs["identifier"] == "swarmbus-ghost"
     assert kwargs["clean_session"] is True
     assert [c.args for c in factory.clients[2].publish.await_args_list] == [
+        (DEFAULT_TOPICS.presence("ghost"), b""),
+        (DEFAULT_TOPICS.registry("ghost"), b""),
+    ]
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_keeps_a_durable_session_when_presence_is_unconfirmed():
+    """Absent presence is unconfirmed, not offline: clear records, keep the
+    session. A live agent whose presence missed the snapshot window is
+    indistinguishable from a retired one, and session destruction discards
+    queued messages irreversibly."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    rec = _registry("ghost", now=now, age_seconds=1200)
+    rec.durability = "durable"
+    factory = _ClientFactory(
+        [
+            [_message(rec)],   # scan
+            [_message(rec)],   # per-agent recheck, no presence retained
+            # Spare: without it, dropping the guard fails on fixture
+            # exhaustion rather than on the assertions below.
+            [],
+        ]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.deleted == 1
+    assert report.sessions_destroyed == 0
+    assert report.sessions_preserved == 1
+    # No third client: impersonating the agent id is what destroys the
+    # session, so never opening one is the property under test.
+    assert len(factory.clients) == 2
+    assert all(
+        "identifier" not in kwargs or kwargs["identifier"] != "swarmbus-ghost"
+        for _, kwargs in factory.calls
+    )
+    assert [c.args for c in factory.clients[1].publish.await_args_list] == [
         (DEFAULT_TOPICS.presence("ghost"), b""),
         (DEFAULT_TOPICS.registry("ghost"), b""),
     ]

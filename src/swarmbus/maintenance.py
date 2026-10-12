@@ -48,6 +48,9 @@ class RegistryGCReport(BaseModel):
     deleted: int = 0
     # Deleted identities whose persistent MQTT session was destroyed.
     sessions_destroyed: int = 0
+    # Durable identities whose records were cleared but whose session was
+    # kept because presence was never positively observed offline.
+    sessions_preserved: int = 0
     would_delete: int = 0
     disappeared: int = 0
     failed: int = 0
@@ -493,10 +496,29 @@ class RegistryMaintenance:
                         report.failed_agent_ids.append(original.agent_id)
                         continue
 
+                    # Destroying a session is irreversible and discards queued
+                    # messages, so it needs presence positively observed
+                    # offline. Absent presence is also what a live agent looks
+                    # like when its presence misses the snapshot window.
+                    confirmed_offline = (
+                        self._observed_online(
+                            record,
+                            presence,
+                            now=current,
+                            stale_after_seconds=stale_after_seconds,
+                        )
+                        is False
+                    )
+                    destroy_session = (
+                        record.durability == "durable" and confirmed_offline
+                    )
+                    if record.durability == "durable" and not confirmed_offline:
+                        report.sessions_preserved += 1
+
                     presence_deleted = False
                     try:
-                        if record.durability == "durable":
-                            # Retiring a persistent identity also destroys its session.
+                        if destroy_session:
+                            # A stable session is destroyed only with positive offline evidence.
                             async with self._new_client(
                                 identifier=f"swarmbus-{original.agent_id}",
                                 clean_session=True,
@@ -589,42 +611,61 @@ class RegistryMaintenance:
         snapshot = await self._snapshot(filters)
         record = snapshot.records.get(agent_id)
         presence = snapshot.presence.get(agent_id)
+        initial_absent = (
+            record is None
+            and presence is None
+            and snapshot.invalid_messages == 0
+        )
         online = self._observed_online(
             record,
             presence,
             now=current,
             stale_after_seconds=stale_after_seconds,
         )
-        if not force_online:
+        if not force_online and not initial_absent:
             self._enforce_offline_interlock(agent_id, online)
 
-        # Recheck before deletion because the bounded snapshot may miss presence.
-        # The reader must be anonymous: clean_session=True destroys the target
-        # session at connect time. Dry runs use the same decision path.
+        # Two bounded reads distinguish absence from delayed retained state.
         async with self._new_client() as reader:
             fresh = await self._snapshot_with_client(reader, filters)
         record = fresh.records.get(agent_id)
         presence = fresh.presence.get(agent_id)
+        fresh_absent = (
+            record is None
+            and presence is None
+            and fresh.invalid_messages == 0
+        )
         online = self._observed_online(
             record,
             presence,
             now=current,
             stale_after_seconds=stale_after_seconds,
         )
+        confirmed_absent = initial_absent and fresh_absent
         report = RegistryForgetReport(
             agent_id=agent_id,
             dry_run=dry_run,
             lifecycle=record.lifecycle if record else "unknown",
             online=online,
             rechecked=True,
-            already_absent=record is None and presence is None,
+            already_absent=confirmed_absent,
         )
-        if not force_online and online is not False:
-            report.refused = True
-            report.refused_reason = (
-                "online" if online else "unconfirmed-offline"
-            )
+        if confirmed_absent:
             return report
+
+        if not force_online:
+            if initial_absent:
+                report.refused = True
+                report.refused_reason = (
+                    "online" if online is True else "unconfirmed-offline"
+                )
+                return report
+            if online is not False:
+                report.refused = True
+                report.refused_reason = (
+                    "online" if online else "unconfirmed-offline"
+                )
+                return report
 
         if dry_run:
             return report
