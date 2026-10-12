@@ -1101,6 +1101,35 @@ async def test_registry_forget_destroys_queued_durable_session(
 
 
 @pytest.mark.asyncio
+async def test_registry_forget_is_idempotent_for_absent_identity(
+    mosquitto_broker,
+):
+    host, port = mosquitto_broker
+    agent_id = "already-retired-session"
+    await _clear_retained(
+        host,
+        port,
+        [
+            DEFAULT_TOPICS.registry(agent_id),
+            DEFAULT_TOPICS.presence(agent_id),
+        ],
+    )
+    maintenance = RegistryMaintenance(
+        broker=host,
+        port=port,
+        snapshot_seconds=0.05,
+    )
+
+    report = await maintenance.forget(agent_id)
+
+    assert report.already_absent is True
+    assert report.rechecked is True
+    assert report.refused is False
+    assert report.deleted is False
+    assert report.session_destroyed is False
+
+
+@pytest.mark.asyncio
 async def test_mcp_tools_expose_expected_signatures(tmp_path):
     """MCP tool signatures are a public contract -- anything consuming
     swarmbus via MCP (Claude Code sidecar, Cursor, custom clients) breaks
