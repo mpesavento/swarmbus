@@ -71,6 +71,42 @@ async def _clear_retained(host: str, port: int, topics: list[str]) -> None:
             await client.publish(topic, payload=b"", qos=1, retain=True)
 
 
+async def _read_retained(
+    host: str,
+    port: int,
+    topics: list[str],
+    *,
+    settle: float = 0.5,
+    window: float = 1.0,
+) -> dict[str, bytes]:
+    """Snapshot retained payloads for the given topics.
+
+    A cleared topic delivers nothing, so a missing key means tombstoned.
+    The collection window outlasts the settle delay so a broker-side
+    publish that lands late (a Last Will) still registers.
+    """
+    await asyncio.sleep(settle)
+    seen: dict[str, bytes] = {}
+    async with aiomqtt.Client(host, port=port) as client:
+        for topic in topics:
+            await client.subscribe(topic, qos=1)
+        try:
+            async with asyncio_timeout(window):
+                async for msg in client.messages:
+                    seen[str(msg.topic)] = msg.payload
+        except asyncio.TimeoutError:
+            pass
+    return seen
+
+
+def _describe_retained(retained: dict[str, bytes]) -> str:
+    return json.dumps(
+        {topic: payload.decode() for topic, payload in retained.items()},
+        indent=2,
+        sort_keys=True,
+    )
+
+
 async def _start_listener(bus: AgentBus) -> asyncio.Task:
     """Start a listener after proving its subscriptions are active."""
     handlers = bus._handlers
@@ -1011,6 +1047,145 @@ async def test_transient_durable_shutdown_destroys_queued_session(
                 DEFAULT_TOPICS.presence(agent_id),
             ],
         )
+
+
+@pytest.mark.asyncio
+async def test_transient_nondurable_clean_stop_tombstones_presence(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A clean non-durable transient stop() leaves both retained topics
+    empty even though its Last Will stays armed to the end.
+
+    The client id is explicit so the probe below can take it over. A
+    takeover publishes the kicked connection's will, so a silent takeover
+    means the broker had nothing left to kick -- not a will still pending
+    behind a socket it has yet to notice."""
+    host, port = mosquitto_broker
+    agent_id = "transient-ephemeral-exit"
+    presence_topic = DEFAULT_TOPICS.presence(agent_id)
+    registry_topic = DEFAULT_TOPICS.registry(agent_id)
+    await _clear_retained(host, port, [presence_topic, registry_topic])
+    runtime = ManagedMCPRuntime(
+        agent_id=agent_id,
+        broker=host,
+        port=port,
+        persistent=False,
+        presence=True,
+        lifecycle="transient",
+        client_id=agent_id,
+        state_path=tmp_path / "transient-ephemeral.sqlite3",
+    )
+
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+
+        online = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert json.loads(online[presence_topic])["state"] == "online"
+        assert json.loads(online[registry_topic])["lifecycle"] == "transient"
+
+        # Absence after shutdown only means something if a will was armed.
+        will = runtime._client_kwargs()["will"]
+        assert will.topic == presence_topic
+        assert json.loads(will.payload)["reason"] == "connection-lost"
+
+        await runtime.stop()
+
+        retained = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert retained == {}, (
+            "non-durable transient shutdown left retained state: "
+            f"{_describe_retained(retained)}"
+        )
+
+        async with aiomqtt.Client(host, port=port, identifier=agent_id):
+            pass
+        after_takeover = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert after_takeover == {}, (
+            "taking over the client id published a will that had outlived "
+            f"stop(): {_describe_retained(after_takeover)}"
+        )
+    finally:
+        await runtime.stop()
+        await _clear_retained(host, port, [presence_topic, registry_topic])
+
+
+@pytest.mark.asyncio
+async def test_transient_durable_clean_stop_tombstones_presence(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A clean durable transient stop() leaves no retained state.
+
+    Destroying the session reclaims the client id, which kicks the live
+    connection and makes the broker publish its will onto the presence
+    topic. Deferring the destroy until after that connection closes is
+    what keeps the tombstone; stripping the will from the reclaiming
+    client does not, because the will that fires belongs to the kicked
+    one.
+    """
+    host, port = mosquitto_broker
+    agent_id = "transient-durable-presence"
+    client_id = f"swarmbus-{agent_id}"
+    presence_topic = DEFAULT_TOPICS.presence(agent_id)
+    registry_topic = DEFAULT_TOPICS.registry(agent_id)
+    await _clear_retained(host, port, [presence_topic, registry_topic])
+    runtime = ManagedMCPRuntime(
+        agent_id=agent_id,
+        broker=host,
+        port=port,
+        persistent=True,
+        presence=True,
+        lifecycle="transient",
+        state_path=tmp_path / "transient-durable.sqlite3",
+    )
+
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+
+        online = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert json.loads(online[presence_topic])["state"] == "online"
+        assert json.loads(online[registry_topic])["durability"] == "durable"
+
+        await runtime.stop()
+
+        retained = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+
+        assert retained == {}, (
+            "transient durable shutdown left retained state instead of "
+            f"tombstones: {_describe_retained(retained)}"
+        )
+    finally:
+        await runtime.stop()
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=True,
+        ):
+            pass
+        await _clear_retained(host, port, [presence_topic, registry_topic])
 
 
 @pytest.mark.asyncio

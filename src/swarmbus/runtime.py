@@ -370,11 +370,14 @@ class ManagedMCPRuntime:
                 return_exceptions=True,
             )
             self._heartbeat_task = None
+        destroy_session = False
         try:
             if self._client is not None and self.presence:
                 try:
                     if self.lifecycle == "transient":
-                        await self._clear_transient_retained_state()
+                        destroy_session = (
+                            await self._clear_transient_retained_state()
+                        )
                     else:
                         await self._publish_presence(
                             "offline",
@@ -402,6 +405,10 @@ class ManagedMCPRuntime:
                 self._client = None
                 self._pending_client = None
                 self._pending_ack_adapter = None
+                # Only now is the willed connection gone, so reclaiming the
+                # client id cannot make the broker publish its will.
+                if destroy_session:
+                    await self._destroy_durable_session()
                 await self.store.close()
                 if self._state is not RuntimeState.FATAL:
                     self._state = RuntimeState.STOPPED
@@ -952,7 +959,8 @@ class ManagedMCPRuntime:
         )
         self.registry.update_registry(topic, payload)
 
-    async def _clear_transient_retained_state(self) -> None:
+    async def _clear_transient_retained_state(self) -> bool:
+        """Tombstone retained state; report whether a session destroy is owed."""
         if self._client is None:
             raise self._transport_unavailable()
         registry_topic = self.topics.registry(self.agent_id)
@@ -973,9 +981,9 @@ class ManagedMCPRuntime:
         )
         self.registry.remove_presence(presence_topic)
         self.registry.remove_registry(registry_topic)
-        if self.persistent:
-            # Reclaiming the client id disconnects the tombstone publisher.
-            await self._destroy_durable_session()
+        # Reclaiming the client id kicks the live connection, and the broker
+        # publishes that connection's will. Defer until after a clean close.
+        return self.persistent
 
     async def _destroy_durable_session(self) -> None:
         """Destroy the broker session for a retired transient identity."""
@@ -989,5 +997,7 @@ class ManagedMCPRuntime:
         try:
             async with aiomqtt.Client(self.broker, port=self.port, **kwargs):
                 pass
-        except aiomqtt.MqttError as exc:
+        # Session cleanup is best-effort during shutdown; cancellation still
+        # propagates because CancelledError is a BaseException.
+        except (aiomqtt.MqttError, OSError, asyncio.TimeoutError) as exc:
             logger.warning("failed to destroy persistent session: %s", exc)
