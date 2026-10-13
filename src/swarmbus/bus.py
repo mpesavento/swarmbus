@@ -442,11 +442,14 @@ class AgentBus:
         messages **published while this call is active**, plus any with
         ``retain=True`` on subscribe.
 
-        When ``self.persistent`` is True, connects with a stable client
-        identifier and ``clean_session=False`` so queued QoS1 messages
-        from previous sessions are also delivered.  Same mutual-exclusion
-        caveat as ``read_inbox``: do not run a daemon and persistent MCP
-        server for the same agent-id.
+        When ``self.persistent`` is True, connects as ``swarmbus-<agent_id>``
+        with ``clean_session=False`` and acknowledges by hand. The returned
+        message is acknowledged, every skipped malformed payload is
+        acknowledged, and nothing else is. Messages received but not
+        returned stay unacknowledged, so the broker redelivers them in
+        order to the next call, one message per call. Only one client per
+        agent-id can hold the session: do not run a daemon or persistent
+        MCP server for the same agent-id.
 
         Returns None on timeout. Raises ``aiomqtt.MqttError`` if the broker
         is unreachable; callers that want graceful None-on-error (e.g. the
@@ -456,19 +459,32 @@ class AgentBus:
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
-        async with aiomqtt.Client(
-            self.broker, port=self.port, **client_kwargs
-        ) as client:
+        client_cm = aiomqtt.Client(self.broker, port=self.port, **client_kwargs)
+        ack_adapter = None
+        if self.persistent:
+            # Function-local: runtime.py imports from this module at top level.
+            from .runtime import _ManualAckAdapter
+
+            # Must precede connect: the broker replays queued messages
+            # right after CONNACK, before our SUBSCRIBE.
+            ack_adapter = _ManualAckAdapter(client_cm)
+            ack_adapter.enable()
+        async with client_cm as client:
             await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(timeout):
                     async for mqtt_msg in client.messages:
                         try:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
-                            return json.loads(msg.to_json())
+                            result = json.loads(msg.to_json())
                         except Exception as exc:
                             logger.warning("watch_inbox: skipping bad envelope: %s", exc)
+                            if ack_adapter is not None:
+                                ack_adapter.ack(mqtt_msg)
                             continue
+                        if ack_adapter is not None:
+                            ack_adapter.ack(mqtt_msg)
+                        return result
             except asyncio.TimeoutError:
                 return None
         return None
