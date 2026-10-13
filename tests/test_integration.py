@@ -729,3 +729,103 @@ async def test_mcp_tools_expose_expected_signatures(tmp_path):
 
     list_sig = inspect.signature(app._tool_fns["list_agents"])
     assert len(list_sig.parameters) == 0
+
+
+def _watch_persistent(host, port, agent_id, *extra):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    return CliRunner().invoke(main, [
+        "watch", "--agent-id", agent_id, "--broker", host, "--port", str(port),
+        "--persistent", *extra,
+    ])
+
+
+def _cli_send(host, port, to, subject, body):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    result = CliRunner().invoke(main, [
+        "send", "--agent-id", "pw-sender", "--to", to,
+        "--broker", host, "--port", str(port),
+        "--subject", subject, "--body", body,
+    ])
+    assert result.exit_code == 0, result.output
+
+
+def _drop_session(host, port, agent_id):
+    async def _go():
+        async with aiomqtt.Client(
+            host, port=port,
+            identifier=f"swarmbus-{agent_id}",
+            clean_session=True,
+        ):
+            pass
+
+    asyncio.run(_go())
+
+
+def test_watch_persistent_delivers_message_sent_while_no_watch_running(mosquitto_broker):
+    host, port = mosquitto_broker
+    agent = "pw-single"
+    try:
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        _cli_send(host, port, agent, "while-away", "hello later")
+        result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        msg = json.loads(result.stdout)
+        assert msg["subject"] == "while-away"
+        assert msg["body"] == "hello later"
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_three_offline_messages_arrive_one_per_watch_in_order(
+    mosquitto_broker,
+):
+    host, port = mosquitto_broker
+    agent = "pw-three"
+    subjects = ["queued-one", "queued-two", "queued-three"]
+    try:
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        for subject in subjects:
+            _cli_send(host, port, agent, subject, "body of " + subject)
+        received = []
+        for _ in subjects:
+            result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+            assert result.exit_code == 0, result.output
+            received.append(json.loads(result.stdout))
+        assert [m["subject"] for m in received] == subjects
+        assert len({m["id"] for m in received}) == 3
+        assert _watch_persistent(host, port, agent, "--timeout", "1").exit_code == 1
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_first_ever_run_does_not_see_earlier_message(mosquitto_broker):
+    host, port = mosquitto_broker
+    agent = "pw-first"
+    try:
+        _cli_send(host, port, agent, "before", "sent before any session")
+        assert _watch_persistent(host, port, agent, "--timeout", "1").exit_code == 1
+        _cli_send(host, port, agent, "after", "sent after registration")
+        result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["subject"] == "after"
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_multiline_body_survives_queue(mosquitto_broker):
+    host, port = mosquitto_broker
+    agent = "pw-lines"
+    body = "line one\nline two\n\nline four"
+    try:
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        _cli_send(host, port, agent, "multi", body)
+        result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["body"] == body
+    finally:
+        _drop_session(host, port, agent)

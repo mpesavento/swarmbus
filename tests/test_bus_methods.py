@@ -17,16 +17,38 @@ from swarmbus.message import AgentMessage
 
 
 class _FakeMsg:
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, mid: int = 0, qos: int = 1):
         self.payload = payload
+        self.mid = mid
+        self.qos = qos
+
+
+class _FakePaho:
+    """Stands in for the paho client aiomqtt wraps; records manual-ack use."""
+    def __init__(self, events: list):
+        self._events = events
+        self.manual_ack = None
+        self.acks: list[tuple[int, int]] = []
+
+    def manual_ack_set(self, on: bool):
+        self.manual_ack = on
+        self._events.append(("manual_ack_set", on))
+
+    def ack(self, mid: int, qos: int):
+        self.acks.append((mid, qos))
+        self._events.append(("ack", mid))
+        return 0
 
 
 class _FakeClient:
     """Replays a preset list of payloads, then hangs (caller relies on timeout)."""
     def __init__(self, payloads: list[bytes]):
         self._payloads = payloads
+        self.events: list = []
+        self._client = _FakePaho(self.events)
 
     async def __aenter__(self):
+        self.events.append(("enter",))
         return self
 
     async def __aexit__(self, *_):
@@ -38,8 +60,8 @@ class _FakeClient:
     @property
     def messages(self):
         async def _gen():
-            for p in self._payloads:
-                yield _FakeMsg(p)
+            for i, p in enumerate(self._payloads, start=1):
+                yield _FakeMsg(p, mid=i)
         return _gen()
 
 
@@ -396,3 +418,42 @@ async def test_watch_inbox_non_persistent_omits_identifier():
         await bus.watch_inbox(timeout=0.1)
     assert "identifier" not in captured_kwargs
     assert "clean_session" not in captured_kwargs
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_persistent_acks_only_the_returned_message():
+    """persistent=True → manual ack on before connect; only the returned mid is acked."""
+    fake = _FakeClient([_envelope(subject="first"), _envelope(subject="second")])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        result = await bus.watch_inbox(timeout=0.2)
+    assert result is not None
+    assert result["subject"] == "first"
+    assert fake._client.acks == [(1, 1)]
+    assert fake._client.manual_ack is True
+    assert fake.events.index(("manual_ack_set", True)) < fake.events.index(("enter",))
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_persistent_acks_skipped_bad_envelope():
+    """A skipped malformed payload is acked too, in order, before the returned one."""
+    fake = _FakeClient([b"garbage", _envelope(subject="good")])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        result = await bus.watch_inbox(timeout=0.2)
+    assert result is not None
+    assert result["subject"] == "good"
+    assert fake._client.acks == [(1, 1), (2, 1)]
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_non_persistent_never_touches_manual_ack():
+    """persistent=False → manual ack stays untouched and nothing is acked."""
+    fake = _FakeClient([b"garbage", _envelope(subject="good")])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        bus = AgentBus(agent_id="sparrow", persistent=False)
+        result = await bus.watch_inbox(timeout=0.2)
+    assert result is not None
+    assert result["subject"] == "good"
+    assert fake._client.manual_ack is None
+    assert fake._client.acks == []

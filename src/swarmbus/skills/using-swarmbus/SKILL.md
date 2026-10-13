@@ -43,6 +43,7 @@ digraph mode_selection {
 | Read pending messages | `read_inbox()` | `swarmbus read --agent-id <me>` (add `--json` for structured output) |
 | Acknowledge handled MCP messages | `read_inbox(ack_ids=[...], max_messages=0)` | Not applicable; CLI one-shot reads use their transport contract |
 | Wait for a message | `read_inbox(wait_seconds=30)` | `swarmbus watch --agent-id <me> --timeout 30` |
+| Wait for a message, keeping ones sent between waits | `read_inbox(wait_seconds=30)` on a persistent sidecar | `swarmbus watch --agent-id <me> --persistent --timeout 30` |
 | Who's online? | `list_agents()` | `swarmbus list` |
 
 Always know your own agent-id. In MCP mode it was passed to the sidecar at startup; in CLI mode you must supply `--agent-id <me>` on every call.
@@ -183,14 +184,15 @@ fi
 
 ## Receive model — know what's running
 
-Reactive delivery requires one receive owner for the *receiving* agent. Four modes exist:
+Reactive delivery requires one receive owner for the *receiving* agent. Five modes exist:
 
 1. **Persistent daemon** (`swarmbus start --agent-id <me> --inbox <path>`) — long-running, file-bridges every incoming message into a markdown file. Its persistent MQTT session queues QoS1 messages while offline.
 2. **File tail** (`swarmbus tail --agent-id <me>`) — reads the daemon's inbox file using a per-consumer cursor. Use this only with the daemon path.
 3. **Managed MCP sidecar** — owns one process-lifetime MQTT connection and commits validated messages to a private SQLite inbox before broker acknowledgement. `read_inbox` reads that store non-destructively; explicit `ack_ids` retire handled rows. Persistent mode also queues broker deliveries while the sidecar is offline.
 4. **CLI MQTT one-shot** (`swarmbus read` / `watch`) — opens a fresh connection for shell-driven, no-daemon contexts.
+5. **Persistent CLI watch** (`swarmbus watch --persistent`) — the broker queues QoS1 messages for the agent ID between runs, each run prints the oldest queued message and exits, and you run it once to register the session (messages sent before that first run are not queued).
 
-**Decision rule:** choose one MQTT receive owner per agent ID. Do not run a daemon and a persistent MCP sidecar for the same ID; they contend for the broker session. When using MCP, never add a CLI one-shot reader beside it.
+**Decision rule:** choose one MQTT receive owner per agent ID. Do not run a daemon and a persistent MCP sidecar for the same ID; they contend for the broker session. A persistent watch is a receive owner too and shares the broker session with the daemon and the persistent sidecar, so never run it beside either. When using MCP, never add a CLI one-shot reader beside it.
 
 ## Archive — always keep both sides of the conversation
 
