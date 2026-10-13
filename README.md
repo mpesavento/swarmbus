@@ -100,7 +100,7 @@ swarmbus list                              # who's online right now?
 **Two read paths, pick by deployment shape:**
 
 - **Always-on agent with a daemon (Planner, Coder, any long-lived session)**: use `swarmbus tail` to read new content from the inbox file. No MQTT contention with the daemon — the daemon is the sole broker subscriber, tail just reads the file it writes. Cursor-tracked so repeat calls only show new.
-- **Ephemeral or scripted agent without a daemon**: use `swarmbus read` / `swarmbus watch`. These open a fresh MQTT connection, catch retained messages or messages published during the connection window, and exit.
+- **Ephemeral or scripted agent without a daemon**: use `swarmbus read` / `swarmbus watch`. These open a fresh MQTT connection, catch retained messages or messages published during the connection window, and exit. `swarmbus watch --persistent` also keeps messages sent between runs: the broker queues them for the agent id, each run prints the oldest, and you run it once first to register.
 
 ```bash
 # With a daemon running (Planner/Coder pattern):
@@ -111,6 +111,7 @@ swarmbus tail --agent-id planner --consumer bot  # separate cursor
 # No daemon — ephemeral (CI job, shell pipeline):
 swarmbus read --agent-id scratch              # drain retained messages, exit
 swarmbus watch --agent-id scratch --timeout 60  # block until one arrives
+swarmbus watch --agent-id scratch --persistent --timeout 60  # also receives what was sent since the last watch
 ```
 
 **What to never do:** run `swarmbus read` or `swarmbus watch` against an agent-id that already has a daemon running. They'd race the daemon for QoS1 messages — whichever client is currently subscribed wins and the other silently never sees them. Use `swarmbus tail` (file-based) instead.
@@ -300,16 +301,19 @@ swarmbus mcp-server --agent-id planner
 
 `--body` and `--body-file` are mutually exclusive; exactly one is required.
 
-**Four receive paths — pick one per agent-id.**
+**Five receive paths — pick one per agent-id.**
 
 | Path | Durable? | Use when |
 |---|---|---|
 | `start` (daemon) | Yes (persistent session, default) | Long-running process, file-bridge to inbox, reactive wake |
 | `mcp-server --persistent` | Yes (persistent session) | MCP-based agents (Claude Code, Cursor); no daemon needed |
+| `watch --persistent` | Yes (persistent session; first run registers) | Agent sessions that wait, handle one message, and wait again |
 | `read` / `watch` (one-shot) | No (ephemeral session) | CI jobs, shell scripts, quick checks |
 | `tail` (file-based) | N/A (reads daemon's file) | Companion to `start`; cursor-tracked |
 
-**Don't combine durable paths for the same id** — `start` + `mcp-server --persistent` both claim the same MQTT client identifier. The broker evicts the first connection when the second arrives. Use one or the other.
+**Don't combine durable paths for the same id** — `start`, `mcp-server --persistent` and `watch --persistent` all claim the same `swarmbus-<agent-id>` MQTT client identifier. The broker evicts the connected one when another arrives. Use exactly one per id.
+
+**Using `watch --persistent`.** The session exists only after a first `watch --persistent` has connected, so run `swarmbus watch --agent-id <me> --persistent --timeout 1` once to register (it exits 1); a message sent before that is not queued. Use the flag on every watch for an id or on none: a plain `read`/`watch` gets its own live copy while the session queues the same message, so the next `watch --persistent` prints it again. The queue lives in the broker, and mosquitto keeps it across a restart only with `persistence true`. Broadcasts are not queued for a session that only `watch --persistent` created.
 
 ---
 

@@ -348,6 +348,16 @@ def read(
 @click.option("--port", default=1883, show_default=True)
 @click.option("--timeout", default=30.0, show_default=True, help="Seconds to wait")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON (default: pretty)")
+@click.option(
+    "--persistent/--no-persistent",
+    default=False,
+    show_default=True,
+    help="Use an MQTT persistent session so the broker queues messages for "
+         "this agent id while no watch is connected. Each run prints the "
+         "oldest queued message; the first run only registers the session. "
+         "Only one client per agent id can hold the session -- do not "
+         "combine with a running daemon or `mcp-server --persistent`.",
+)
 @_broker_auth_options
 def watch(
     agent_id: str,
@@ -355,6 +365,7 @@ def watch(
     port: int,
     timeout: float,
     as_json: bool,
+    persistent: bool,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -364,20 +375,25 @@ def watch(
 ) -> None:
     """Block until one message arrives, print it, exit.
 
-    Catches messages published while this call is active. If a listener
-    daemon is already running for the same agent-id, the two will race
-    for each incoming message — use one mechanism per id at a time.
+    By default it catches only messages published while this call is
+    active. With --persistent the broker queues messages sent between
+    runs and each run prints the oldest queued one; the first run for an
+    agent-id only registers the session. If a listener daemon is already
+    running for the same agent-id, the two will race for each incoming
+    message — use one mechanism per id at a time.
 
     Exit 0 on message, exit 1 on timeout, exit 2 on broker error. Use in
     shell pipelines when you want to wait for a specific reply.
 
     \b
     swarmbus watch --agent-id planner --timeout 60
+    swarmbus watch --agent-id planner --persistent --timeout 60
     """
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
         port=port,
+        persistent=persistent,
         username=username,
         password=password,
         tls=tls,
