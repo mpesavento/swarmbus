@@ -11,6 +11,7 @@ import aiomqtt
 
 from .message import AgentMessage, _validate_registered_agent_id
 from .handlers.base import BaseHandler
+from .topics import DEFAULT_TOPICS, TopicMap
 from ._compat import asyncio_timeout
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,13 @@ def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
 
 
 class AgentBus:
+    # MQTT topic layout. Declared at class level on purpose: `probe()`
+    # builds an instance via cls.__new__ and never runs __init__, so an
+    # instance-only attribute would leave probe buses unable to build a
+    # topic. Root-less by default, which keeps the wire format unchanged;
+    # a rooted deployment overrides this with TopicMap(root=...).
+    topics: TopicMap = DEFAULT_TOPICS
+
     def __init__(
         self,
         agent_id: str,
@@ -296,7 +304,7 @@ class AgentBus:
             reply_to=reply_to,
         )
         # Broadcast uses agents/broadcast; directed messages use agents/{to}/inbox
-        topic = "agents/broadcast" if to == "broadcast" else f"agents/{to}/inbox"
+        topic = self.topics.route(to)
         payload = msg.to_json()
         if self._client is not None:
             await self._client.publish(topic, payload, qos=1, retain=self.retain)
@@ -329,7 +337,7 @@ class AgentBus:
         "online" is overwritten when an agent crashes unexpectedly.
         """
         will = aiomqtt.Will(
-            topic=f"agents/{self.agent_id}/presence",
+            topic=self.topics.presence(self.agent_id),
             payload=json.dumps({"agent": self.agent_id, "status": "offline"}),
             qos=1,
             retain=True,
@@ -348,13 +356,15 @@ class AgentBus:
                     self.broker, port=self.port, **client_kwargs
                 ) as client:
                     await client.publish(
-                        f"agents/{self.agent_id}/presence",
+                        self.topics.presence(self.agent_id),
                         json.dumps({"agent": self.agent_id, "status": "online"}),
                         qos=1,
                         retain=True,
                     )
-                    await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
-                    await client.subscribe("agents/broadcast", qos=1)
+                    await client.subscribe(
+                        self.topics.inbox(self.agent_id), qos=1
+                    )
+                    await client.subscribe(self.topics.broadcast, qos=1)
                     backoff = reconnect_initial  # reset after successful (re)connect
 
                     async for mqtt_msg in client.messages:
@@ -410,7 +420,7 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **client_kwargs
         ) as client:
-            await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(drain_timeout):
                     async for mqtt_msg in client.messages:
@@ -449,7 +459,7 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **client_kwargs
         ) as client:
-            await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(timeout):
                     async for mqtt_msg in client.messages:
@@ -473,7 +483,7 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
-            await client.subscribe("agents/+/presence", qos=0)
+            await client.subscribe(self.topics.any_presence_filter(), qos=0)
             try:
                 async with asyncio_timeout(collect_window):
                     async for mqtt_msg in client.messages:
@@ -500,7 +510,7 @@ class AgentBus:
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
             await client.publish(
-                f"agents/{self.agent_id}/presence",
+                self.topics.presence(self.agent_id),
                 json.dumps({"agent": self.agent_id, "status": "offline"}),
                 qos=1,
                 retain=True,
