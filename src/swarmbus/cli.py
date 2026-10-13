@@ -943,6 +943,13 @@ def _detect_agent_id() -> str:
          "(offline). Makes this agent visible to `list_agents` without "
          "a listener daemon.",
 )
+@click.option(
+    "--state-dir",
+    default="~/.local/state/swarmbus",
+    envvar="SWARMBUS_STATE_DIR",
+    show_default=True,
+    help="Directory for the durable SQLite inbox. [env: SWARMBUS_STATE_DIR]",
+)
 @_broker_auth_options
 def mcp_server(
     agent_id: str,
@@ -950,6 +957,7 @@ def mcp_server(
     port: int,
     persistent: bool,
     presence: bool,
+    state_dir: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -965,6 +973,7 @@ def mcp_server(
         port=port,
         persistent=persistent,
         presence=presence,
+        state_dir=state_dir,
         username=username,
         password=password,
         tls=tls,
