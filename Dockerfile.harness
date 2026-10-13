@@ -1,0 +1,21 @@
+# Runtime image for drydock runs on swarmbus: what every check runs inside (.harness/contract.yml).
+# It mirrors CI (.github/workflows/test.yml): the integration and TLS tests start a real mosquitto
+# broker at /usr/sbin/mosquitto and call openssl. The product Dockerfile is not used because it
+# copies the source in; here the worktree is bind-mounted at /repo.
+FROM python:3.12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates mosquitto openssl \
+ && rm -rf /var/lib/apt/lists/*
+
+# A uv new enough to read uv.lock as committed (lock revision 2); an older one rewrites it.
+COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /usr/local/bin/uv
+
+# The environment lives in the bind-mounted worktree, not in the image: every check is a fresh
+# `docker run --rm`, and `commands.install` builds it once per worktree. Not `.venv`, so a Linux
+# environment never overwrites a host one. `.venv-harness/` is gitignored.
+ENV UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/repo/.venv-harness \
+    PATH="/repo/.venv-harness/bin:$PATH"
+
+WORKDIR /repo

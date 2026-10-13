@@ -206,3 +206,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .worktrees/
+
+# drydock: the harness environment, built in the bind-mounted worktree (Dockerfile.harness)
+.venv-harness/
