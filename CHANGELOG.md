@@ -16,7 +16,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
-## [Unreleased]
+## [0.2.0] — 2026-10-14
 
 ### Added
 - **Durable MCP inbox** — the MCP sidecar now owns one lifespan-managed MQTT connection and commits inbound QoS1 messages to a separate `inbox_messages` table before acknowledging them to the broker. `--state-dir` and `SWARMBUS_STATE_DIR` select the storage directory.
