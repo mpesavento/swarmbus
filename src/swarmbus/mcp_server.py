@@ -136,7 +136,7 @@ def run_mcp_server(
     """Start the MCP sidecar with one managed MQTT connection."""
     if not _MCP_AVAILABLE:
         raise RuntimeError(
-            "mcp package not installed. Run: uv pip install 'swarmbus[mcp]'"
+            "mcp package not installed. Run: uv pip install 'swarmbus-py[mcp]'"
         )
 
     from mcp.server.fastmcp import FastMCP

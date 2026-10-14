@@ -38,7 +38,7 @@ The broker runs as a system service on port 1883 after install. For cross-machin
 ### 2. Install the CLI
 
 ```bash
-pip install "swarmbus[mcp]"
+pip install "swarmbus-py[mcp]"
 ```
 
 ### 3. Set up agents with `swarmbus init`
@@ -127,7 +127,7 @@ That's the whole loop: broker → daemon OR one-shot per agent-id → `send` fro
 ```bash
 pip install swarmbus-py
 # with MCP sidecar support:
-pip install "swarmbus[mcp]"
+pip install "swarmbus-py[mcp]"
 ```
 
 ## Integration paths
@@ -173,7 +173,7 @@ swarmbus mcp-server --agent-id planner --broker mqtt.example.com \
   --port 8883 --tls --persistent --presence
 ```
 
-This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects. Fatal runtime or schema failures surface as MCP tool errors instead of successful empty reads.
+This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects. When the sidecar has lost its broker connection (`aiomqtt.MqttError` or `TransportUnavailable`), `read_inbox` and `list_agents` log the error and return an empty list. Any other failure raises and surfaces as an MCP tool error, including a fatal runtime failure (`RuntimeFatalError`) and a degraded durable inbox (`StoreUnavailable`). An inbox schema newer than this version is rejected when the sidecar starts, before any tool runs.
 
 Without `--persistent`, messages received while the sidecar is running still survive process restarts in SQLite, but the broker does not queue messages sent while the sidecar is offline.
 
@@ -276,7 +276,7 @@ swarmbus send --agent-id planner --to coder --subject report --body-file report.
 # Send from stdin (pipe-friendly)
 cat report.md | swarmbus send --agent-id planner --to coder --subject report --body-file -
 
-# Drain queued messages and exit (non-blocking; use ONLY when no daemon is running for this id)
+# Read retained messages and exit (non-blocking; a non-retained send that arrived while nothing was subscribed is gone; use ONLY when no daemon is running for this id)
 swarmbus read --agent-id planner
 swarmbus read --agent-id planner --json | jq '.[].subject'
 

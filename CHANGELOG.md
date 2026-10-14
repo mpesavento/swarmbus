@@ -25,6 +25,9 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - Inbox schema versions are component-scoped. Existing `SQLiteArchive.messages` schemas and `INSERT OR REPLACE` behavior remain unchanged, and archive history is not imported or replayed automatically.
 - `swarmbus watch` gains `--persistent / --no-persistent` (default off). When on, the broker queues QoS1 messages for the agent id while no watch is connected and each run prints the oldest queued one. The first run only registers the session. `AgentBus.watch_inbox` acknowledges by hand in persistent mode, so messages delivered beyond the one returned are redelivered to the next run instead of being dropped.
 
+### Fixed
+- Docs and the MCP missing-extra hint name the PyPI distribution `swarmbus-py[mcp]`; the `using-swarmbus` skill no longer passes `reply_to=` to the MCP `send_message` tool (which has no such parameter) and replies to `from` when `reply_to` is null; the README says `swarmbus read` returns retained messages only and states which MCP errors return an empty list. (#23)
+
 ### Wire-compat
 1. **Envelope shape — no change.**
 2. **Topic layout — no change.**
