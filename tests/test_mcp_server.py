@@ -194,3 +194,16 @@ async def test_managed_runtime_ingestion_survives_restart_and_is_queryable(tmp_p
     assert third == []
     assert ack.acked == [7]
     await restarted.store.close()
+
+
+def test_run_mcp_server_missing_extra_names_distribution(monkeypatch):
+    import swarmbus.mcp_server as mcp_server
+
+    monkeypatch.setattr(mcp_server, "_MCP_AVAILABLE", False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        mcp_server.run_mcp_server("planner")
+
+    message = str(excinfo.value)
+    assert "swarmbus-py[mcp]" in message
+    assert "swarmbus[mcp]" not in message

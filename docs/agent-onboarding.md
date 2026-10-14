@@ -9,7 +9,7 @@
 ## One-command setup
 
 ```bash
-pip install "swarmbus[mcp]"
+pip install "swarmbus-py[mcp]"
 swarmbus init --agent-id <your-id> --host-type <cc|openclaw|none>
 ```
 
