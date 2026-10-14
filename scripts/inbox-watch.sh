@@ -82,6 +82,10 @@ _log() {
   printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"
 }
 
+# Portable inode/size — GNU stat (Linux) uses -c, BSD stat (macOS) uses -f.
+_stat_inode() { stat -c '%i' "$1" 2>/dev/null || stat -f '%i' "$1"; }
+_stat_size() { stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1"; }
+
 if [ "$RESET_CURSOR" = 1 ]; then
   rm -f "$CURSOR_FILE"
 fi
@@ -99,16 +103,18 @@ if [ -f "$CURSOR_FILE" ]; then
   cursor="${cursor:-0}"
 fi
 
-current_inode=$(stat -c '%i' "$INBOX")
-current_size=$(stat -c '%s' "$INBOX")
+current_inode=$(_stat_inode "$INBOX")
+current_size=$(_stat_size "$INBOX")
 
 if [ -n "$stored_inode" ] && [ "$stored_inode" != "$current_inode" ]; then
   _log "inode changed ($stored_inode -> $current_inode); resetting"
   cursor=0
+  printf '%s %s\n' "$cursor" "$current_inode" > "$CURSOR_FILE"
 fi
 if [ "$current_size" -lt "$cursor" ]; then
   _log "size shrank ($current_size < $cursor); resetting"
   cursor=0
+  printf '%s %s\n' "$cursor" "$current_inode" > "$CURSOR_FILE"
 fi
 
 if [ "$current_size" = "$cursor" ]; then
@@ -123,6 +129,9 @@ headers=$(printf '%s' "$new_content" | grep -E '^## \[' || true)
 
 if [ -z "$headers" ]; then
   _log "new bytes but no complete header; skipping"
+  # Record what we have seen so a header-less tail (e.g. a freshly cleared inbox)
+  # converges instead of being re-examined on every tick.
+  printf '%s %s\n' "$current_size" "$current_inode" > "$CURSOR_FILE"
   exit 0
 fi
 
@@ -167,7 +176,8 @@ else
   exit 0
 fi
 
-response=$(curl -s -o /tmp/inbox-watch-curl.out -w '%{http_code}' \
+curl_out="$STATE_DIR/inbox-watch-curl.out"
+response=$(curl -s -o "$curl_out" -w '%{http_code}' \
   "https://api.telegram.org/bot${token}/sendMessage" \
   --data-urlencode "chat_id=${CHAT_ID}" \
   --data-urlencode "text=${msg}" \
@@ -177,6 +187,6 @@ if [ "$response" = "200" ]; then
   printf '%s %s\n' "$current_size" "$current_inode" > "$CURSOR_FILE"
   _log "pushed summary (${n_messages} msgs); cursor advanced to $current_size"
 else
-  _log "push failed (http $response); cursor NOT advanced. body=$(cat /tmp/inbox-watch-curl.out)"
+  _log "push failed (http $response); cursor NOT advanced. body=$(cat "$curl_out")"
   exit 1
 fi

@@ -11,6 +11,7 @@ import aiomqtt
 
 from .message import AgentMessage, _validate_registered_agent_id
 from .handlers.base import BaseHandler
+from .topics import DEFAULT_TOPICS, TopicMap
 from ._compat import asyncio_timeout
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,13 @@ def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
 
 
 class AgentBus:
+    # MQTT topic layout. Declared at class level on purpose: `probe()`
+    # builds an instance via cls.__new__ and never runs __init__, so an
+    # instance-only attribute would leave probe buses unable to build a
+    # topic. Root-less by default, which keeps the wire format unchanged;
+    # a rooted deployment overrides this with TopicMap(root=...).
+    topics: TopicMap = DEFAULT_TOPICS
+
     def __init__(
         self,
         agent_id: str,
@@ -296,7 +304,7 @@ class AgentBus:
             reply_to=reply_to,
         )
         # Broadcast uses agents/broadcast; directed messages use agents/{to}/inbox
-        topic = "agents/broadcast" if to == "broadcast" else f"agents/{to}/inbox"
+        topic = self.topics.route(to)
         payload = msg.to_json()
         if self._client is not None:
             await self._client.publish(topic, payload, qos=1, retain=self.retain)
@@ -329,7 +337,7 @@ class AgentBus:
         "online" is overwritten when an agent crashes unexpectedly.
         """
         will = aiomqtt.Will(
-            topic=f"agents/{self.agent_id}/presence",
+            topic=self.topics.presence(self.agent_id),
             payload=json.dumps({"agent": self.agent_id, "status": "offline"}),
             qos=1,
             retain=True,
@@ -348,13 +356,15 @@ class AgentBus:
                     self.broker, port=self.port, **client_kwargs
                 ) as client:
                     await client.publish(
-                        f"agents/{self.agent_id}/presence",
+                        self.topics.presence(self.agent_id),
                         json.dumps({"agent": self.agent_id, "status": "online"}),
                         qos=1,
                         retain=True,
                     )
-                    await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
-                    await client.subscribe("agents/broadcast", qos=1)
+                    await client.subscribe(
+                        self.topics.inbox(self.agent_id), qos=1
+                    )
+                    await client.subscribe(self.topics.broadcast, qos=1)
                     backoff = reconnect_initial  # reset after successful (re)connect
 
                     async for mqtt_msg in client.messages:
@@ -410,7 +420,7 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **client_kwargs
         ) as client:
-            await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(drain_timeout):
                     async for mqtt_msg in client.messages:
@@ -432,11 +442,14 @@ class AgentBus:
         messages **published while this call is active**, plus any with
         ``retain=True`` on subscribe.
 
-        When ``self.persistent`` is True, connects with a stable client
-        identifier and ``clean_session=False`` so queued QoS1 messages
-        from previous sessions are also delivered.  Same mutual-exclusion
-        caveat as ``read_inbox``: do not run a daemon and persistent MCP
-        server for the same agent-id.
+        When ``self.persistent`` is True, connects as ``swarmbus-<agent_id>``
+        with ``clean_session=False`` and acknowledges by hand. The returned
+        message is acknowledged, every skipped malformed payload is
+        acknowledged, and nothing else is. Messages received but not
+        returned stay unacknowledged, so the broker redelivers them in
+        order to the next call, one message per call. Only one client per
+        agent-id can hold the session: do not run a daemon or persistent
+        MCP server for the same agent-id.
 
         Returns None on timeout. Raises ``aiomqtt.MqttError`` if the broker
         is unreachable; callers that want graceful None-on-error (e.g. the
@@ -446,19 +459,32 @@ class AgentBus:
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
-        async with aiomqtt.Client(
-            self.broker, port=self.port, **client_kwargs
-        ) as client:
-            await client.subscribe(f"agents/{self.agent_id}/inbox", qos=1)
+        client_cm = aiomqtt.Client(self.broker, port=self.port, **client_kwargs)
+        ack_adapter = None
+        if self.persistent:
+            # Function-local: runtime.py imports from this module at top level.
+            from .runtime import _ManualAckAdapter
+
+            # Must precede connect: the broker replays queued messages
+            # right after CONNACK, before our SUBSCRIBE.
+            ack_adapter = _ManualAckAdapter(client_cm)
+            ack_adapter.enable()
+        async with client_cm as client:
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
                 async with asyncio_timeout(timeout):
                     async for mqtt_msg in client.messages:
                         try:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
-                            return json.loads(msg.to_json())
+                            result = json.loads(msg.to_json())
                         except Exception as exc:
                             logger.warning("watch_inbox: skipping bad envelope: %s", exc)
+                            if ack_adapter is not None:
+                                ack_adapter.ack(mqtt_msg)
                             continue
+                        if ack_adapter is not None:
+                            ack_adapter.ack(mqtt_msg)
+                        return result
             except asyncio.TimeoutError:
                 return None
         return None
@@ -473,7 +499,7 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
-            await client.subscribe("agents/+/presence", qos=0)
+            await client.subscribe(self.topics.any_presence_filter(), qos=0)
             try:
                 async with asyncio_timeout(collect_window):
                     async for mqtt_msg in client.messages:
@@ -500,7 +526,7 @@ class AgentBus:
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
             await client.publish(
-                f"agents/{self.agent_id}/presence",
+                self.topics.presence(self.agent_id),
                 json.dumps({"agent": self.agent_id, "status": "offline"}),
                 qos=1,
                 retain=True,

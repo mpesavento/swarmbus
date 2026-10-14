@@ -1,11 +1,13 @@
-.PHONY: test test-dev test-matrix build clean
+.PHONY: test test-one test-dev test-matrix build clean
 
 PYTHON_VERSION ?= 3.12
 
 build:
 	PYTHON_VERSION=$(PYTHON_VERSION) docker compose build
 
-test: build
+test: test-matrix
+
+test-one: build
 	PYTHON_VERSION=$(PYTHON_VERSION) docker compose run --rm test
 
 test-dev:

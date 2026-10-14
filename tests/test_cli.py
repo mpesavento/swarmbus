@@ -672,3 +672,60 @@ def test_list_json():
     assert result.exit_code == 0, result.output
     import json as _json
     assert _json.loads(result.output) == ["sparrow", "wren"]
+
+
+def test_mcp_server_passes_state_dir():
+    runner = CliRunner()
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = runner.invoke(
+            main,
+            [
+                "mcp-server",
+                "--agent-id",
+                "sparrow",
+                "--state-dir",
+                "/tmp/swarmbus-state",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert run_server.call_args.kwargs["state_dir"] == "/tmp/swarmbus-state"
+
+
+_WATCH_MSG = {
+    "id": "x", "from": "wren", "to": "sparrow",
+    "ts": "2026-04-14T05:00:00Z", "subject": "pong", "body": "got it",
+    "content_type": "text/plain", "priority": "normal", "reply_to": "wren",
+}
+
+
+def test_watch_persistent_flag_builds_persistent_bus():
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.watch_inbox = AsyncMock(return_value=_WATCH_MSG)
+        result = runner.invoke(main, [
+            "watch", "--agent-id", "sparrow", "--persistent", "--timeout", "1",
+        ])
+    assert result.exit_code == 0, result.output
+    assert MockBus.call_args.kwargs["persistent"] is True
+
+
+def test_watch_no_persistent_flag_builds_ephemeral_bus():
+    runner = CliRunner()
+    for extra in (["--no-persistent"], []):
+        with patch("swarmbus.cli.AgentBus") as MockBus:
+            instance = MockBus.return_value
+            instance.watch_inbox = AsyncMock(return_value=_WATCH_MSG)
+            result = runner.invoke(main, [
+                "watch", "--agent-id", "sparrow", *extra, "--timeout", "1",
+            ])
+        assert result.exit_code == 0, result.output
+        assert MockBus.call_args.kwargs["persistent"] is False
+
+
+def test_watch_help_names_persistent_flag():
+    runner = CliRunner()
+    result = runner.invoke(main, ["watch", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--persistent" in result.output

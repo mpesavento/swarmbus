@@ -16,6 +16,26 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [0.2.0] — 2026-10-14
+
+### Added
+- **Durable MCP inbox** — the MCP sidecar now owns one lifespan-managed MQTT connection and commits inbound QoS1 messages to a separate `inbox_messages` table before acknowledging them to the broker. `--state-dir` and `SWARMBUS_STATE_DIR` select the storage directory.
+- **Explicit application acknowledgement without extra tools** — `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` first acknowledges the prior handled batch, then reads or waits for pending rows. `max_messages=0` is acknowledgement-only. Unacknowledged reads lost to a crash or transcript timeout redeliver the same stable IDs.
+- Managed inbox state uses private `0700` directories and `0600` database files, rejects unsafe existing permissions, quarantines malformed stored rows, and reports fatal runtime/schema failures through MCP.
+- Inbox schema versions are component-scoped. Existing `SQLiteArchive.messages` schemas and `INSERT OR REPLACE` behavior remain unchanged, and archive history is not imported or replayed automatically.
+- `swarmbus watch` gains `--persistent / --no-persistent` (default off). When on, the broker queues QoS1 messages for the agent id while no watch is connected and each run prints the oldest queued one. The first run only registers the session. `AgentBus.watch_inbox` acknowledges by hand in persistent mode, so messages delivered beyond the one returned are redelivered to the next run instead of being dropped.
+
+### Fixed
+- Docs and the MCP missing-extra hint name the PyPI distribution `swarmbus-py[mcp]`; the `using-swarmbus` skill no longer passes `reply_to=` to the MCP `send_message` tool (which has no such parameter) and replies to `from` when `reply_to` is null; the README says `swarmbus read` returns retained messages only and states which MCP errors return an empty list. (#23)
+
+### Wire-compat
+1. **Envelope shape — no change.**
+2. **Topic layout — no change.**
+3. **Retain/QoS defaults — no change.** The MCP server remains non-persistent by default; the managed runtime changes acknowledgement timing, not publish or subscribe defaults. `swarmbus watch` is still ephemeral by default; `--persistent` opts in to the `swarmbus-<id>` session with `clean_session=False`; subscription QoS stays 1; in that mode `watch` acknowledges only the message it prints (and any malformed payload it skips).
+4. **MCP tool contract — breaking consolidation.** The separate `watch_inbox` tool is replaced by `read_inbox(wait_seconds=...)`; `read_inbox` also gains optional `ack_ids` and `max_messages` parameters while preserving its no-argument behavior and list response. Acknowledge handled IDs on the next read, or use `max_messages=0` for an acknowledgement-only call. Restart the MCP sidecar and update its behavioral skill together. Existing archive rows remain archive-only.
+
+---
+
 ## [0.1.5] — 2026-09-16
 
 ### Added
