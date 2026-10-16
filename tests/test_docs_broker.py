@@ -30,3 +30,29 @@ def test_security_doc_acl_matches_topic_layout():
     ]
     missing = [line for line in expected if line not in text]
     assert not missing, missing
+
+
+def test_docs_describe_rate_limit_broadcast_rule_send_exit_3_and_hop_limit_8():
+    readme = (ROOT / "README.md").read_text()
+    skill = (ROOT / "src" / "swarmbus" / "skills" / "using-swarmbus" / "SKILL.md").read_text()
+    changelog = (ROOT / "CHANGELOG.md").read_text()
+
+    assert "swarmbus has no rate limiter of its own" not in readme
+    for text in (readme, changelog):
+        for token in ("--rate-limit", "--rate-cooldown", "SWARMBUS_RATE_LIMIT", "SWARMBUS_RATE_COOLDOWN"):
+            assert token in text, token
+    assert "default 8" in readme and "default 4" not in readme
+    assert "never trips its sender" in readme
+    assert "exits 3" in readme and "--force" in readme
+
+    assert "default 8" in skill and "default 4" not in skill
+    assert "exits 3" in skill and "Do not retry with `--force`" in skill
+    assert "20 messages a minute" in skill
+
+    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+    assert "default 8" in unreleased and "default 4" not in unreleased
+    assert "**Per-sender rate limit at every listener**" in unreleased
+    assert "never trips its sender" in unreleased
+    assert "exits 3" in unreleased
+    assert "`cooling` list" in unreleased
+    assert unreleased.count("### Wire-compat") == 1
