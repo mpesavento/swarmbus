@@ -144,8 +144,15 @@ async def test_inbox_commit_happens_before_qos1_ack():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [OSError("disk full"), sqlite3.OperationalError("locked")])
-async def test_store_failure_leaves_message_unacked(error):
+@pytest.mark.parametrize(
+    ("error_type", "text"), [(OSError, "disk full"), (sqlite3.OperationalError, "locked")]
+)
+async def test_store_failure_leaves_message_unacked(error_type, text):
+    # Build the error here, not in parametrize: a collection-time instance keeps its
+    # __traceback__ (frames, AgentMessage, pydantic TzInfo) alive until interpreter
+    # shutdown, and pydantic_core segfaults freeing it then on 3.12.
+    error = error_type(text)
+
     class _BrokenStore(_FakeStore):
         async def store(self, msg, *, source_topic):
             raise error
