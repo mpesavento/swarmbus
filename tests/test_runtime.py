@@ -781,3 +781,29 @@ async def test_identical_redelivery_is_acked_without_conflict_record():
     assert events == ["seen", "ack"]
     assert store.conflicts == []
     assert runtime.state is RuntimeState.CONNECTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    {"body": 5},
+    {"subject": "x‮" * 600},
+    {"id": "m\x00-1"},
+])
+async def test_invalid_field_is_acked_not_stored_with_one_line_warning(override, caplog):
+    store = _FakeStore([])
+    runtime = _runtime(store)
+    ack = _RecordingAck()
+    message = _FakeMqttMessage(_message())
+    message.payload = json.dumps({
+        "id": "m-1", "from": "wren", "to": "foo", "subject": "s", "body": "b",
+        **override,
+    }).encode()
+
+    with caplog.at_level(logging.WARNING, logger="swarmbus.runtime"):
+        await runtime._handle_message(message, ack)
+
+    assert store.messages == []
+    assert ack.messages == [message]
+    warnings = [r.getMessage() for r in caplog.records if r.name == "swarmbus.runtime"]
+    assert len(warnings) == 1
+    assert "\n" not in warnings[0] and "‮" not in warnings[0]
