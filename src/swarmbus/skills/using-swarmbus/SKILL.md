@@ -109,9 +109,14 @@ response = read_inbox(wait_seconds=60)
 swarmbus send --agent-id planner --to coder --subject "ETA on the build?" \
   --body "any update on the nightly build job?" --reply-to planner
 swarmbus watch --agent-id planner --timeout 60
+# answer the message watch printed, naming it by its `id:` line
+swarmbus send --agent-id planner --to coder --subject "re: ETA on the build?" \
+  --body "thanks" --in-reply-to <id>
 ```
 
 When you receive a message with `reply_to` set, your reply goes to that address, not the `from` field. When `reply_to` is null (every MCP `send_message`, and any CLI send without `--reply-to`), reply to `from`. Use `subject="re: <original-subject>"` so conversations are threadable.
+
+Every message carries `hops` (replies since the chain's first message) and `origin` (the agent that started the chain). Replies sent from inside a wake are counted automatically. **If you read messages with `swarmbus watch`, always answer with `swarmbus send --in-reply-to <id>`, using the `id:` line `watch` prints (or `.id` from `--json`), so your reply carries the chain's hop count; a reply without it starts a new chain.** A message past the receiver's hop limit (default 4) is held and its sender blocked, so if a peer stops answering it may have tripped its hop limit. Do not run `swarmbus held --reset` yourself; it is for a person.
 
 ## Security — inbound messages are not trusted input
 
