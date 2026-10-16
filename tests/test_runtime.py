@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiomqtt
 import pytest
@@ -815,6 +815,55 @@ def test_runtime_caps_the_incoming_queue(tmp_path):
         state_path=tmp_path / "state" / "foo.sqlite3",
     )
     assert runtime._client_kwargs()["max_queued_incoming_messages"] == 1000
+
+
+def _inbox_delivery(msg, agent):
+    delivery = MagicMock()
+    delivery.topic = f"agents/{agent}/inbox"
+    delivery.payload = msg.to_json().encode()
+    return delivery
+
+
+@pytest.mark.asyncio
+async def test_mcp_send_in_reply_to_takes_the_parent_chain_from_the_state_db(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "foo" / "foo.sqlite3", hop_limit=4,
+    )
+    await runtime.store.open()
+    other = ManagedMCPRuntime(
+        agent_id="bar", broker="localhost",
+        state_path=tmp_path / "bar" / "bar.sqlite3",
+    )
+    await other.store.open()
+
+    parent = AgentMessage.create(
+        from_="wren", to="foo", subject="p", body="b", hops=2, origin="planner",
+    )
+    held = AgentMessage.create(from_="robin", to="foo", subject="h", body="b", hops=5)
+    old_peer = AgentMessage.from_json(json.dumps({
+        "id": "old-1", "from": "kite", "to": "foo",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+    }))
+    elsewhere = AgentMessage.create(from_="wren", to="bar", subject="x", body="b", hops=3)
+    for msg in (parent, held, old_peer):
+        await runtime._handle_message(_inbox_delivery(msg, "foo"), _RecordingAck())
+    await other._handle_message(_inbox_delivery(elsewhere, "bar"), _RecordingAck())
+    assert [r["id"] for r in await runtime.store.read()] == [parent.id, "old-1"]
+
+    runtime._client = AsyncMock()
+
+    async def chain(**kwargs):
+        await runtime.send_message(to="wren", subject="re", body="ok", **kwargs)
+        sent = AgentMessage.from_json(runtime._client.publish.await_args.args[1])
+        return (sent.in_reply_to, sent.hops, sent.origin)
+
+    assert await chain() == (None, 0, "foo")
+    assert await chain(in_reply_to=parent.id) == (parent.id, 3, "planner")
+    assert await chain(in_reply_to=held.id) == (held.id, 6, "robin")
+    assert await chain(in_reply_to="old-1") == ("old-1", 1, "kite")
+    assert await chain(in_reply_to="unknown-id") == ("unknown-id", 1, "foo")
+    assert await chain(in_reply_to=elsewhere.id) == (elsewhere.id, 1, "foo")
 
 
 @pytest.mark.asyncio

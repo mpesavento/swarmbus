@@ -460,6 +460,8 @@ def start(
 @click.option("--port", default=1883, show_default=True)
 @click.option("--max", "max_messages", default=10, show_default=True, help="Max messages to drain")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON array (default: pretty)")
+@_state_dir_option
+@_hop_limit_option
 @_broker_auth_options
 def read(
     agent_id: str,
@@ -467,6 +469,8 @@ def read(
     port: int,
     max_messages: int,
     as_json: bool,
+    state_dir: str,
+    hop_limit: int,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -482,12 +486,18 @@ def read(
     already gone. For durable delivery, keep a listener daemon up:
     `swarmbus start --agent-id <me> --inbox <path>`.
 
-    Exit 0 always (empty inbox is not an error).
+    Messages past the hop limit are held and left out; every message read
+    is recorded in <state-dir>/<agent-id>.sqlite3 so a later
+    `swarmbus send --in-reply-to <id>` counts from it.
+
+    Exit 0 on success, including an empty inbox; exit 2 on broker or state
+    db error.
 
     \b
     swarmbus read --agent-id planner
     swarmbus read --agent-id planner --json | jq '.[] | .subject'
     """
+    holds_db = _state_db_path(state_dir, agent_id)
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -498,11 +508,15 @@ def read(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
     )
     try:
         messages = asyncio.run(bus.read_inbox(max_messages=max_messages))
     except aiomqtt.MqttError as exc:
         click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
+        sys.exit(2)
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        click.echo(f"[swarmbus] cannot open state db {holds_db}: {exc}", err=True)
         sys.exit(2)
     if as_json:
         click.echo(json.dumps(messages, indent=2))
@@ -514,6 +528,8 @@ def read(
         click.echo(f"--- from {sanitize_field(m['from'])} @ {sanitize_field(m['ts'])} ---")
         click.echo(UNTRUSTED_METADATA_LABEL)
         click.echo(f"subject: {sanitize_field(m['subject'])}")
+        click.echo(f"id: {sanitize_field(m.get('id'))}")
+        click.echo(f"hops: {sanitize_field(m.get('hops', 0))}")
         if m.get("reply_to"):
             click.echo(f"reply_to: {sanitize_field(m['reply_to'])}")
         click.echo(f"content-type: {sanitize_field(m.get('content_type', 'text/plain'))}")
