@@ -6,6 +6,7 @@ timeout and malformed-envelope branches directly.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import pytest
 from unittest.mock import patch
@@ -457,3 +458,57 @@ async def test_watch_inbox_non_persistent_never_touches_manual_ack():
     assert result["subject"] == "good"
     assert fake._client.manual_ack is None
     assert fake._client.acks == []
+
+
+def _topic_client(payloads):
+    class _Msg:
+        def __init__(self, payload):
+            self.topic = "agents/me/inbox"
+            self.payload = payload
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def subscribe(self, *_args, **_kwargs):
+            pass
+
+        @property
+        def messages(self):
+            async def _gen():
+                for p in payloads:
+                    yield _Msg(p)
+                await asyncio.sleep(30)
+            return _gen()
+
+    return _Client()
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_skips_held_messages_and_records_admitted_ones(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "me.sqlite3", managed=False, hop_limit=4)
+    bus = AgentBus(agent_id="me", broker="localhost", hold_store=store)
+    past = AgentMessage.create(from_="wren", to="me", subject="past", body="b", hops=5)
+    tripped = AgentMessage.create(from_="wren", to="me", subject="tripped", body="b")
+    ok = AgentMessage.create(from_="robin", to="me", subject="ok", body="b", hops=2, origin="planner")
+    payloads = [m.to_json().encode() for m in (past, tripped, ok)]
+
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_topic_client(payloads)):
+        result = await bus.read_inbox(max_messages=1, drain_timeout=0.2)
+
+    assert [m["subject"] for m in result] == ["ok"]
+    holds = await store.list_holds()
+    assert [t["sender"] for t in holds["tripped"]] == ["wren"]
+    assert holds["held_count"] == 2
+    assert await store.lookup(ok.id) == {"from": "robin", "hops": 2, "origin": "planner"}
+
+    empty = SQLiteMessageStore(tmp_path / "empty" / "me.sqlite3", managed=False)
+    bus = AgentBus(agent_id="me", broker="localhost", hold_store=empty)
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_topic_client([])):
+        assert await bus.read_inbox(drain_timeout=0.1) == []
+    assert (tmp_path / "empty" / "me.sqlite3").exists()

@@ -948,3 +948,46 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
         ):
             pass
         await _clear_retained(host, port, ["agents/pd-hold/presence"])
+
+
+def test_read_holds_retained_message_past_hop_limit_and_records_admitted_one(
+    mosquitto_broker, tmp_path,
+):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    host, port = mosquitto_broker
+    agent = "pr-read-hops"
+    state_dir = tmp_path / "state"
+    state = ["--state-dir", str(state_dir)]
+    read = ["read", "--agent-id", agent, "--broker", host, "--port", str(port), *state, "--json"]
+
+    async def retain(sender, subject, hops):
+        bus = AgentBus(agent_id=sender, broker=host, port=port, retain=True)
+        await bus.send(to=agent, subject=subject, body=subject, hops=hops, origin="planner")
+
+    async def clear():
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(AgentBus.topics.inbox(agent), payload=b"", qos=1, retain=True)
+
+    try:
+        asyncio.run(retain("pr-storm", "storm", 5))
+        first = CliRunner().invoke(main, read)
+        assert first.exit_code == 0, first.output
+        assert json.loads(first.stdout) == []
+
+        asyncio.run(retain("pr-calm", "calm", 2))
+        second = CliRunner().invoke(main, read)
+        assert second.exit_code == 0, second.output
+        [calm] = json.loads(second.stdout)
+        assert (calm["subject"], calm["hops"]) == ("calm", 2)
+
+        held = CliRunner().invoke(main, ["held", "--agent-id", agent, *state, "--json"])
+        assert held.exit_code == 0, held.output
+        assert [t["sender"] for t in json.loads(held.stdout)["tripped"]] == ["pr-storm"]
+        store = SQLiteMessageStore(state_dir / f"{agent}.sqlite3")
+        assert asyncio.run(store.lookup(calm["id"])) == {
+            "from": "pr-calm", "hops": 2, "origin": "planner",
+        }
+    finally:
+        asyncio.run(clear())
