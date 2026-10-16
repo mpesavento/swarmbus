@@ -6,7 +6,7 @@ import subprocess
 from typing import Dict, List, Optional
 
 from .base import BaseHandler
-from ..message import AgentMessage
+from ..message import AgentMessage, sanitize_field
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +73,12 @@ class DirectInvocationHandler(BaseHandler):
         if returncode is None:
             logger.warning(
                 "DirectInvocationHandler: command %s timed out after %ss for message %s; killed",
-                self.command, self.timeout, msg.id,
+                self.command, self.timeout, sanitize_field(msg.id),
             )
         elif returncode != 0:
             logger.warning(
                 "DirectInvocationHandler: command %s exited %d for message %s",
-                self.command, returncode, msg.id,
+                self.command, returncode, sanitize_field(msg.id),
             )
 
     def _run(self, body: bytes, env: Dict[str, str]) -> Optional[int]:

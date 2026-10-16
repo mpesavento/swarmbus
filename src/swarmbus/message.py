@@ -36,13 +36,15 @@ def sanitize_field(value: object) -> str:
     """Render one envelope field on a single line.
 
     Every control character (Unicode Cc) and line/paragraph separator
-    (Zl, Zp) becomes one space, so a peer cannot forge a new line.
-    None renders as the empty string.
+    (Zl, Zp) becomes one space, so a peer cannot forge a new line. Format
+    characters (Cf: bidi overrides such as U+202E and U+2066, zero-width
+    U+200B, U+FEFF) also become one space, so a peer cannot reorder or hide
+    text on a terminal. None renders as the empty string.
     """
     if value is None:
         return ""
     return "".join(
-        " " if unicodedata.category(ch) in ("Cc", "Zl", "Zp") else ch
+        " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
         for ch in str(value)
     )
 
@@ -56,9 +58,10 @@ def frame_body(body: str) -> str:
     """Wrap a peer body between the untrusted-body labels.
 
     Lines are split on "\\n" ("\\r\\n" counts as one). Every other
-    control character (Cc) and line/paragraph separator (Zl, Zp) except
-    tab is shown as a visible escape (\\x08, \\x0d, \\x1b, \\u2028), so
-    nothing in the body can move a terminal's cursor. Every line is
+    control character (Cc), format character (Cf, for example \\u202e) and
+    line/paragraph separator (Zl, Zp) except tab is shown as a visible
+    escape (\\x08, \\x0d, \\x1b, \\u202e, \\u2028), so nothing in the body
+    can move a terminal's cursor or reorder its text. Every line is
     prefixed with "| " ("|" for an empty line), so no body line can pass
     for a label, a header or the end marker.
     """
@@ -66,7 +69,7 @@ def frame_body(body: str) -> str:
     for line in body.replace("\r\n", "\n").split("\n"):
         shown = "".join(
             _escape_control(ch)
-            if ch != "\t" and unicodedata.category(ch) in ("Cc", "Zl", "Zp")
+            if ch != "\t" and unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
             else ch
             for ch in line
         )
@@ -98,13 +101,13 @@ def _validate_registered_agent_id(v: str) -> str:
 class AgentMessage(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), max_length=128)
     from_agent: str = Field(alias="from")
     to: str
     ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    subject: str
+    subject: str = Field(max_length=1024)
     body: str
-    content_type: str = "text/plain"
+    content_type: str = Field(default="text/plain", max_length=64)
     # `priority` is kept as `str` (not `Literal[...]`) on purpose: the wire
     # envelope must be forward/backward compatible across rolling upgrades.
     # Known values are "low", "normal", "high" (the wake wrappers gate on
@@ -113,15 +116,17 @@ class AgentMessage(BaseModel):
     # https://github.com/mpesavento/swarmbus — historical gotcha: an earlier
     # version used Literal["normal", "urgent"], which meant priority="high"
     # from a newer peer was silently discarded by older daemons.
-    priority: str = "normal"
-    reply_to: Optional[str] = None
+    priority: str = Field(default="normal", max_length=64)
+    reply_to: Optional[str] = Field(default=None, max_length=128)
     # Reply-chain fields. `in_reply_to` is a message id, unlike `reply_to`,
-    # which is an agent address. `origin` is a free string with no validator,
-    # so a future peer's value never makes this receiver drop the envelope.
-    in_reply_to: Optional[str] = None   # id of the message this one answers
+    # which is an agent address. `origin` is not checked against the agent-id
+    # format, so any string up to 128 characters without control characters
+    # passes, and a future peer's value does not make this receiver drop the
+    # envelope.
+    in_reply_to: Optional[str] = Field(default=None, max_length=128)  # id of the message this one answers
     # strict: "3", 3.0 and True are not integers, so they are invalid, not coerced
     hops: int = Field(default=0, ge=0, strict=True)  # replies since the first message of the chain
-    origin: Optional[str] = None        # agent id that sent the first message of the chain
+    origin: Optional[str] = Field(default=None, max_length=128)  # agent id that sent the first message of the chain
     envelope_version: int = 1           # absent on the wire = a pre-0.3.0 sender
 
     @field_validator("from_agent", mode="before")
@@ -134,7 +139,32 @@ class AgentMessage(BaseModel):
     def validate_to(cls, v: str) -> str:
         return _validate_agent_id(v)
 
-    @field_validator("body", mode="before")
+    @field_validator("id", mode="after")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        if not v or any(ch.isspace() or not ch.isprintable() for ch in v):
+            raise ValueError("id must be non-empty printable text with no whitespace")
+        return v
+
+    @field_validator("subject", mode="after")
+    @classmethod
+    def validate_subject(cls, v: str) -> str:
+        if any(ch == "\x00" or unicodedata.category(ch) == "Cs" for ch in v):
+            raise ValueError("subject must not contain NUL or a lone surrogate")
+        return v
+
+    @field_validator(
+        "reply_to", "in_reply_to", "origin", "content_type", "priority", mode="after"
+    )
+    @classmethod
+    def validate_metadata_text(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and any(
+            unicodedata.category(ch) in ("Cc", "Cs") for ch in v
+        ):
+            raise ValueError("must not contain control characters or lone surrogates")
+        return v
+
+    @field_validator("body", mode="after")
     @classmethod
     def validate_body_size(cls, v: str) -> str:
         if len(v.encode("utf-8")) > _MAX_BODY_BYTES:

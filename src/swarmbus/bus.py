@@ -436,7 +436,8 @@ class AgentBus:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
                         except Exception as exc:
                             logger.warning(
-                                "Discarding invalid message envelope: %s", exc
+                                "Discarding invalid message envelope: %s",
+                                sanitize_field(exc),
                             )
                             if not ack(mqtt_msg):
                                 leave = "ack"
@@ -476,7 +477,7 @@ class AgentBus:
                             except Exception as exc:
                                 logger.error(
                                     "Handler %s raised: %s",
-                                    handler.__class__.__name__, exc,
+                                    handler.__class__.__name__, sanitize_field(exc),
                                 )
                         # Even when a handler raised: a message that always
                         # breaks a handler must not be redelivered forever.
@@ -555,7 +556,10 @@ class AgentBus:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
                             messages.append(json.loads(msg.to_json()))
                         except Exception as exc:
-                            logger.warning("read_inbox: skipping bad envelope: %s", exc)
+                            logger.warning(
+                                "read_inbox: skipping bad envelope: %s",
+                                sanitize_field(exc),
+                            )
                         if len(messages) >= max_messages:
                             break
             except asyncio.TimeoutError:
@@ -616,7 +620,10 @@ class AgentBus:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
                             result = json.loads(msg.to_json())
                         except Exception as exc:
-                            logger.warning("watch_inbox: skipping bad envelope: %s", exc)
+                            logger.warning(
+                                "watch_inbox: skipping bad envelope: %s",
+                                sanitize_field(exc),
+                            )
                             if ack_adapter is not None:
                                 ack_adapter.ack(mqtt_msg)
                             continue
