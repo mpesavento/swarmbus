@@ -995,3 +995,49 @@ def test_send_rejects_over_long_subject_before_publishing():
     assert result.exit_code == 2, result.output
     assert "subject" in result.output
     client.assert_not_called()
+
+
+def test_held_reports_counts(tmp_path):
+    import asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state_dir = tmp_path / "state"
+    base = ["held", "--agent-id", "sparrow", "--state-dir", str(state_dir)]
+    runner = CliRunner()
+
+    empty = runner.invoke(main, [*base, "--json"])
+    assert empty.exit_code == 0, empty.output
+    assert json.loads(empty.stdout) == {
+        "tripped": [], "held_count": 0, "held": [],
+        "held_by_sender": [], "admitted_count": 0, "conflict_count": 0,
+    }
+
+    async def fill():
+        store = SQLiteMessageStore(state_dir / "sparrow.sqlite3", hop_limit=0)
+        topic = "agents/sparrow/inbox"
+
+        def m(sender, hops):
+            return AgentMessage.create(from_=sender, to="sparrow", subject="s", body="b", hops=hops)
+
+        assert await store.admit(m("wren", 1), source_topic=topic) is False
+        assert await store.admit(m("wren", 0), source_topic=topic) is False
+        assert await store.admit(m("robin", 1), source_topic=topic) is False
+        assert await store.admit(m("kestrel", 0), source_topic=topic) is True
+
+    asyncio.run(fill())
+
+    listed = runner.invoke(main, [*base, "--json"])
+    assert listed.exit_code == 0, listed.output
+    data = json.loads(listed.stdout)
+    assert data["held_count"] == 3
+    assert data["held_by_sender"] == [
+        {"sender": "wren", "count": 2}, {"sender": "robin", "count": 1},
+    ]
+    assert (data["admitted_count"], data["conflict_count"]) == (1, 0)
+
+    text = runner.invoke(main, base)
+    assert text.exit_code == 0, text.output
+    assert "held from wren: 2" in text.output
+    assert "held from robin: 1" in text.output
+    assert "admitted (last 30 days): 1, id conflicts: 0" in text.output

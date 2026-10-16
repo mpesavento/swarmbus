@@ -807,3 +807,11 @@ async def test_invalid_field_is_acked_not_stored_with_one_line_warning(override,
     warnings = [r.getMessage() for r in caplog.records if r.name == "swarmbus.runtime"]
     assert len(warnings) == 1
     assert "\n" not in warnings[0] and "\u202e" not in warnings[0]
+
+
+def test_runtime_caps_the_incoming_queue(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    assert runtime._client_kwargs()["max_queued_incoming_messages"] == 1000

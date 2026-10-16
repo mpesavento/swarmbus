@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import json
 import logging
 import os
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import aiosqlite
 from pydantic import ValidationError
@@ -85,7 +87,8 @@ CREATE TABLE IF NOT EXISTS held_messages (
     reason       TEXT NOT NULL,      -- 'hop-limit' | 'sender-tripped'
     source_topic TEXT NOT NULL,
     held_at      TEXT NOT NULL,
-    envelope     TEXT NOT NULL       -- msg.to_json()
+    envelope     TEXT NOT NULL,      -- msg.to_json(), or a stub without the body
+    stub         INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -103,7 +106,8 @@ CREATE TABLE IF NOT EXISTS admitted_messages (
     from_agent TEXT NOT NULL,
     hops       INTEGER NOT NULL,
     origin     TEXT,
-    seen_at    TEXT NOT NULL
+    seen_at    TEXT NOT NULL,
+    envelope_sha256 TEXT             -- NULL only on rows migrated from v1
 )
 """
 
@@ -122,9 +126,20 @@ class SQLiteMessageStore:
     SCHEMA_COMPONENT = "inbox"
     SCHEMA_VERSION = 1
     HOLDS_SCHEMA_COMPONENT = "holds"
-    HOLDS_SCHEMA_VERSION = 1
+    HOLDS_SCHEMA_VERSION = 2
     _MANAGED_DIRECTORY_MODE = 0o700
     _MANAGED_DATABASE_MODE = 0o600
+    _BUSY_TIMEOUT_SECONDS = 30.0
+
+    ADMITTED_RETENTION_DAYS = 30
+    PRUNE_EVERY_ADMISSIONS = 1000
+    HELD_FULL_ENVELOPES_PER_SENDER = 50
+    HELD_MAX_ROWS = 10_000
+    CONFLICTS_MAX_ROWS = 200
+    STUB_SUBJECT_CHARS = 200
+    _STUB_KEYS = (
+        "id", "from", "to", "ts", "subject", "hops", "origin", "in_reply_to",
+    )
 
     def __init__(
         self,
@@ -141,6 +156,15 @@ class SQLiteMessageStore:
         self._open_lock = asyncio.Lock()
         self._inbox_lock = asyncio.Lock()
         self._opened = False
+        self._admissions_since_prune = 0
+
+    @contextlib.asynccontextmanager
+    async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
+        async with aiosqlite.connect(
+            self.db_path, timeout=self._BUSY_TIMEOUT_SECONDS
+        ) as db:
+            await db.execute("PRAGMA synchronous=FULL")
+            yield db
 
     @staticmethod
     def _require_mode(path: Path, expected: int, label: str) -> None:
@@ -214,7 +238,19 @@ class SQLiteMessageStore:
             if self._opened:
                 return
             self._prepare_path()
-            async with aiosqlite.connect(self.db_path) as db:
+            self._admissions_since_prune = 0
+            async with self._connect() as db:
+                # The journal mode cannot change inside a transaction.
+                async with db.execute("PRAGMA journal_mode=WAL") as cursor:
+                    mode_row = await cursor.fetchone()
+                mode = str(mode_row[0]).lower() if mode_row else ""
+                if mode != "wal":
+                    logger.warning(
+                        "state db %s did not switch to WAL mode (journal mode "
+                        "is %r); readers may block the listener",
+                        self.db_path,
+                        mode,
+                    )
                 await db.execute("BEGIN IMMEDIATE")
                 committed = False
                 try:
@@ -239,6 +275,26 @@ class SQLiteMessageStore:
                     await db.execute(_CREATE_INBOX_TABLE)
                     await db.execute(_CREATE_QUARANTINE_TABLE)
                     await db.execute(_CREATE_CONFLICTS_TABLE)
+                    async with db.execute(
+                        """SELECT 1 FROM sqlite_master
+                           WHERE type = 'index'
+                             AND name = 'inbox_message_conflicts_once'"""
+                    ) as cursor:
+                        has_conflict_key = await cursor.fetchone() is not None
+                    if not has_conflict_key:
+                        await db.execute(
+                            """DELETE FROM inbox_message_conflicts
+                               WHERE rowid NOT IN (
+                                   SELECT MIN(rowid)
+                                   FROM inbox_message_conflicts
+                                   GROUP BY message_id, envelope
+                               )"""
+                        )
+                        await db.execute(
+                            """CREATE UNIQUE INDEX inbox_message_conflicts_once
+                               ON inbox_message_conflicts(message_id, envelope)"""
+                        )
+                    await self._cap_conflicts(db)
 
                     async with db.execute(
                         """SELECT version FROM swarmbus_schema
@@ -258,6 +314,17 @@ class SQLiteMessageStore:
                     await db.execute(_CREATE_HELD_TABLE)
                     await db.execute(_CREATE_TRIPS_TABLE)
                     await db.execute(_CREATE_ADMITTED_TABLE)
+                    if holds_version == 1:
+                        await self._migrate_holds_v1(db)
+                    await db.execute(
+                        """CREATE INDEX IF NOT EXISTS admitted_messages_seen_at
+                           ON admitted_messages(seen_at)"""
+                    )
+                    await db.execute(
+                        """CREATE INDEX IF NOT EXISTS held_messages_sender
+                           ON held_messages(from_agent, stub)"""
+                    )
+                    await self._prune_admitted(db)
                     if holds_version is None:
                         await db.execute(
                             """INSERT INTO swarmbus_schema
@@ -265,6 +332,15 @@ class SQLiteMessageStore:
                             (
                                 self.HOLDS_SCHEMA_COMPONENT,
                                 self.HOLDS_SCHEMA_VERSION,
+                            ),
+                        )
+                    elif holds_version == 1:
+                        await db.execute(
+                            """UPDATE swarmbus_schema SET version = ?
+                               WHERE component = ?""",
+                            (
+                                self.HOLDS_SCHEMA_VERSION,
+                                self.HOLDS_SCHEMA_COMPONENT,
                             ),
                         )
                     if schema_version is None:
@@ -283,6 +359,64 @@ class SQLiteMessageStore:
                         await db.rollback()
             self._opened = True
 
+    @staticmethod
+    async def _columns(db: aiosqlite.Connection, table: str) -> set[str]:
+        async with db.execute(f"PRAGMA table_info({table})") as cursor:
+            return {r[1] for r in await cursor.fetchall()}
+
+    async def _migrate_holds_v1(self, db: aiosqlite.Connection) -> None:
+        if "envelope_sha256" not in await self._columns(db, "admitted_messages"):
+            await db.execute(
+                "ALTER TABLE admitted_messages ADD COLUMN envelope_sha256 TEXT"
+            )
+        if "stub" not in await self._columns(db, "held_messages"):
+            await db.execute(
+                "ALTER TABLE held_messages "
+                "ADD COLUMN stub INTEGER NOT NULL DEFAULT 0"
+            )
+
+    async def _prune_admitted(self, db: aiosqlite.Connection) -> None:
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(days=self.ADMITTED_RETENTION_DAYS)
+        ).isoformat()
+        await db.execute(
+            "DELETE FROM admitted_messages WHERE seen_at < ?", (cutoff,)
+        )
+
+    async def _cap_conflicts(self, db: aiosqlite.Connection) -> None:
+        await db.execute(
+            """DELETE FROM inbox_message_conflicts
+               WHERE rowid NOT IN (
+                   SELECT rowid FROM inbox_message_conflicts
+                   ORDER BY recorded_at DESC, rowid DESC
+                   LIMIT ?
+               )""",
+            (self.CONFLICTS_MAX_ROWS,),
+        )
+
+    async def _cap_held(self, db: aiosqlite.Connection) -> None:
+        """Drop the oldest unprotected held rows past HELD_MAX_ROWS.
+
+        A row is protected when it is the message that tripped a sender.
+        """
+        async with db.execute(
+            """SELECT COUNT(*) FROM held_messages
+               WHERE id NOT IN (SELECT message_id FROM hop_trips)"""
+        ) as cursor:
+            unprotected = (await cursor.fetchone())[0]
+        excess = unprotected - self.HELD_MAX_ROWS
+        if excess > 0:
+            await db.execute(
+                """DELETE FROM held_messages WHERE rowid IN (
+                       SELECT rowid FROM held_messages
+                       WHERE id NOT IN (SELECT message_id FROM hop_trips)
+                       ORDER BY held_at, rowid
+                       LIMIT ?
+                   )""",
+                (excess,),
+            )
+
     async def close(self) -> None:
         self._opened = False
 
@@ -300,12 +434,13 @@ class SQLiteMessageStore:
         """Decide admission on a connection whose transaction is already open."""
         now = datetime.now(timezone.utc).isoformat()
         hops = min(msg.hops, _SQLITE_MAX_INTEGER)
+        sha = hashlib.sha256(msg.to_json().encode("utf-8")).hexdigest()
 
-        async with db.execute(
-            "SELECT 1 FROM admitted_messages WHERE id = ?", (msg.id,)
-        ) as cursor:
-            if await cursor.fetchone() is not None:
-                return True
+        self._admissions_since_prune += 1
+        if self._admissions_since_prune >= self.PRUNE_EVERY_ADMISSIONS:
+            await self._prune_admitted(db)
+            self._admissions_since_prune = 0
+
         async with db.execute(
             "SELECT 1 FROM held_messages WHERE id = ?", (msg.id,)
         ) as cursor:
@@ -316,35 +451,67 @@ class SQLiteMessageStore:
             "SELECT 1 FROM hop_trips WHERE sender = ?", (msg.from_agent,)
         ) as cursor:
             tripped = await cursor.fetchone() is not None
+        if tripped:
+            await self._hold_tripped_sender_message(
+                db, msg, hops=hops, source_topic=source_topic, now=now
+            )
+            await self._cap_held(db)
+            logger.debug(
+                "holding message %s from tripped sender %s",
+                sanitize_field(msg.id),
+                sanitize_field(msg.from_agent),
+            )
+            return False
 
-        if tripped or msg.hops > self.hop_limit:
+        async with db.execute(
+            """SELECT from_agent, hops, envelope_sha256
+               FROM admitted_messages WHERE id = ?""",
+            (msg.id,),
+        ) as cursor:
+            admitted_row = await cursor.fetchone()
+        if admitted_row is not None:
+            stored_from, stored_hops, stored_sha = admitted_row
+            if stored_sha is None:
+                # Migrated from holds v1: no hash, so compare what was kept.
+                redelivery = stored_from == msg.from_agent and stored_hops == hops
+            else:
+                redelivery = stored_sha == sha
+            if redelivery:
+                return True
+            if await self._record_conflict_in(
+                db, msg, source_topic=source_topic, now=now
+            ):
+                logger.warning(
+                    "discarding message %s from %s: its id is already bound "
+                    "to a different envelope; recorded in "
+                    "inbox_message_conflicts",
+                    sanitize_field(msg.id),
+                    sanitize_field(msg.from_agent),
+                )
+            return False
+
+        if msg.hops > self.hop_limit:
             await db.execute(
                 """INSERT INTO held_messages
                    (id, from_agent, hops, reason, source_topic, held_at,
-                    envelope)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    envelope, stub)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
                 (
                     msg.id,
                     msg.from_agent,
                     hops,
-                    "sender-tripped" if tripped else "hop-limit",
+                    "hop-limit",
                     source_topic,
                     now,
                     msg.to_json(),
                 ),
             )
-            if tripped:
-                logger.debug(
-                    "holding message %s from tripped sender %s",
-                    sanitize_field(msg.id),
-                    sanitize_field(msg.from_agent),
-                )
-                return False
             await db.execute(
                 """INSERT INTO hop_trips (sender, tripped_at, message_id)
                    VALUES (?, ?, ?)""",
                 (msg.from_agent, now, msg.id),
             )
+            await self._cap_held(db)
             sender = sanitize_field(msg.from_agent)
             logger.error(
                 "hop limit %s exceeded: holding message %s from %s "
@@ -363,16 +530,81 @@ class SQLiteMessageStore:
 
         await db.execute(
             """INSERT INTO admitted_messages
-               (id, from_agent, hops, origin, seen_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (msg.id, msg.from_agent, hops, msg.origin, now),
+               (id, from_agent, hops, origin, seen_at, envelope_sha256)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (msg.id, msg.from_agent, hops, msg.origin, now, sha),
         )
         return True
+
+    async def _hold_tripped_sender_message(
+        self,
+        db: aiosqlite.Connection,
+        msg: AgentMessage,
+        *,
+        hops: int,
+        source_topic: str,
+        now: str,
+    ) -> None:
+        async with db.execute(
+            """SELECT COUNT(*) FROM held_messages
+               WHERE from_agent = ? AND reason = 'sender-tripped'
+                 AND stub = 0""",
+            (msg.from_agent,),
+        ) as cursor:
+            full = (await cursor.fetchone())[0]
+        if full < self.HELD_FULL_ENVELOPES_PER_SENDER:
+            stub = 0
+            envelope = msg.to_json()
+        else:
+            stub = 1
+            data = json.loads(msg.to_json())
+            kept = {k: data[k] for k in self._STUB_KEYS if k in data}
+            kept["subject"] = str(kept.get("subject", ""))[
+                : self.STUB_SUBJECT_CHARS
+            ]
+            kept["stub"] = True
+            envelope = json.dumps(kept)
+        await db.execute(
+            """INSERT INTO held_messages
+               (id, from_agent, hops, reason, source_topic, held_at,
+                envelope, stub)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                msg.id,
+                msg.from_agent,
+                hops,
+                "sender-tripped",
+                source_topic,
+                now,
+                envelope,
+                stub,
+            ),
+        )
+
+    async def _record_conflict_in(
+        self,
+        db: aiosqlite.Connection,
+        msg: AgentMessage,
+        *,
+        source_topic: str,
+        now: str,
+    ) -> bool:
+        """Record a rejected envelope once; return whether a row was added."""
+        cursor = await db.execute(
+            """INSERT OR IGNORE INTO inbox_message_conflicts
+               (message_id, from_agent, source_topic, recorded_at, envelope)
+               VALUES (?, ?, ?, ?, ?)""",
+            (msg.id, msg.from_agent, source_topic, now, msg.to_json()),
+        )
+        inserted = cursor.rowcount == 1
+        if inserted:
+            await self._cap_conflicts(db)
+        return inserted
 
     async def admit(self, msg: AgentMessage, *, source_topic: str) -> bool:
         """Record a message and return whether it may be delivered."""
         await self._ensure_open()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
             try:
@@ -407,7 +639,7 @@ class SQLiteMessageStore:
             msg.priority,
             msg.reply_to,
         )
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
             try:
@@ -456,41 +688,36 @@ class SQLiteMessageStore:
         *,
         source_topic: str,
         recorded_at: datetime | None = None,
-    ) -> None:
+    ) -> bool:
         """Durably note a message whose id is already bound to another envelope.
 
         The stored envelope is untouched; the rejected one is kept in
         ``inbox_message_conflicts`` so a person can see who reused the id.
+        Each id and envelope is kept once; returns whether a row was added.
         """
         await self._ensure_open()
         recorded = recorded_at or datetime.now(timezone.utc)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
             try:
-                await db.execute(
-                    """INSERT INTO inbox_message_conflicts
-                       (message_id, from_agent, source_topic, recorded_at,
-                        envelope)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        msg.id,
-                        msg.from_agent,
-                        source_topic,
-                        recorded.isoformat(),
-                        msg.to_json(),
-                    ),
+                inserted = await self._record_conflict_in(
+                    db,
+                    msg,
+                    source_topic=source_topic,
+                    now=recorded.isoformat(),
                 )
                 await db.commit()
                 committed = True
             finally:
                 if not committed:
                     await db.rollback()
+        return inserted
 
     async def list_conflicts(self, limit: int = 20) -> list[dict]:
         """Return the newest recorded id conflicts, newest first."""
         await self._ensure_open()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """SELECT message_id, from_agent, source_topic, recorded_at,
                           envelope
@@ -513,7 +740,7 @@ class SQLiteMessageStore:
     async def list_holds(self, limit: int = 20) -> dict:
         """Report tripped senders and the newest held messages."""
         await self._ensure_open()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """SELECT sender, tripped_at, message_id
                    FROM hop_trips ORDER BY tripped_at"""
@@ -542,12 +769,36 @@ class SQLiteMessageStore:
                     }
                     for r in await cursor.fetchall()
                 ]
-        return {"tripped": tripped, "held_count": held_count, "held": held}
+            async with db.execute(
+                """SELECT from_agent, COUNT(*) FROM held_messages
+                   GROUP BY from_agent
+                   ORDER BY COUNT(*) DESC, from_agent ASC"""
+            ) as cursor:
+                held_by_sender = [
+                    {"sender": r[0], "count": r[1]}
+                    for r in await cursor.fetchall()
+                ]
+            async with db.execute(
+                "SELECT COUNT(*) FROM admitted_messages"
+            ) as cursor:
+                admitted_count = (await cursor.fetchone())[0]
+            async with db.execute(
+                "SELECT COUNT(*) FROM inbox_message_conflicts"
+            ) as cursor:
+                conflict_count = (await cursor.fetchone())[0]
+        return {
+            "tripped": tripped,
+            "held_count": held_count,
+            "held": held,
+            "held_by_sender": held_by_sender,
+            "admitted_count": admitted_count,
+            "conflict_count": conflict_count,
+        }
 
     async def lookup(self, message_id: str) -> dict | None:
         """Return from/hops/origin of an admitted or held message, if known."""
         await self._ensure_open()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             async with db.execute(
                 """SELECT from_agent, hops, origin
                    FROM admitted_messages WHERE id = ?""",
@@ -573,7 +824,7 @@ class SQLiteMessageStore:
     async def reset_trips(self, sender: str | None = None) -> int:
         """Clear one sender's trip, or every trip; held messages stay held."""
         await self._ensure_open()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
             try:
@@ -633,7 +884,7 @@ class SQLiteMessageStore:
         await self._ensure_open()
         messages: list[dict] = []
         async with self._inbox_lock:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
                 await db.execute("BEGIN IMMEDIATE")
                 committed = False
@@ -709,7 +960,7 @@ class SQLiteMessageStore:
         acknowledged_at = datetime.now(timezone.utc).isoformat()
         acknowledged = 0
         async with self._inbox_lock:
-            async with aiosqlite.connect(self.db_path) as db:
+            async with self._connect() as db:
                 await db.execute("BEGIN IMMEDIATE")
                 committed = False
                 try:

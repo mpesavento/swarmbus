@@ -912,3 +912,39 @@ def test_watch_to_watch_replies_accumulate_hops_and_trip_the_limit(
     finally:
         _drop_session(host, port, a)
         _drop_session(host, port, b)
+
+
+@pytest.mark.asyncio
+async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_broker, tmp_path):
+    host, port = mosquitto_broker
+    store = SQLiteMessageStore(tmp_path / "state" / "pd-hold.sqlite3", hop_limit=4)
+    real_admit = store.admit
+    failures = []
+
+    async def fail_once(msg, *, source_topic):
+        if not failures:
+            failures.append(msg.id)
+            raise OSError("disk I/O error")
+        return await real_admit(msg, source_topic=source_topic)
+
+    store.admit = fail_once
+    handler = CollectingHandler()
+    receiver = AgentBus(
+        agent_id="pd-hold", broker=host, port=port, persistent=True, hold_store=store,
+    )
+    receiver.register_handler(handler)
+    task = asyncio.create_task(receiver.listen(reconnect_initial=0.05))
+    try:
+        await asyncio.sleep(0.3)
+        sender = AgentBus(agent_id="pd-sender", broker=host, port=port)
+        await sender.send(to="pd-hold", subject="survives", body="b")
+        await handler.wait_for_message(timeout=5.0)
+        assert [m.subject for m in handler.received] == ["survives"]
+        assert failures == [handler.received[0].id]
+    finally:
+        await _stop(task)
+        async with aiomqtt.Client(
+            host, port=port, identifier="swarmbus-pd-hold", clean_session=True,
+        ):
+            pass
+        await _clear_retained(host, port, ["agents/pd-hold/presence"])
