@@ -6,17 +6,26 @@ import os
 import re as _re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 
 import aiomqtt
 import click
 
+from .archive import SQLiteMessageStore
 from .bus import AgentBus
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
-from .message import UNTRUSTED_METADATA_LABEL, frame_body, sanitize_field
+from .message import (
+    DEFAULT_HOP_LIMIT,
+    UNTRUSTED_METADATA_LABEL,
+    _validate_agent_id,
+    frame_body,
+    sanitize_field,
+)
 
 
 @click.group()
@@ -75,6 +84,34 @@ def _broker_auth_options(func):
         help="Broker username. [env: SWARMBUS_BROKER_USERNAME]",
     )(func)
     return func
+
+
+def _state_db_path(state_dir: str, agent_id: str) -> Path:
+    """Path of this agent's SQLite state db (inbox, holds, admitted ids)."""
+    return Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
+
+
+def _state_dir_option(func):
+    return click.option(
+        "--state-dir",
+        default="~/.local/state/swarmbus",
+        envvar="SWARMBUS_STATE_DIR",
+        show_default=True,
+        help="Directory for the agent's SQLite state db. [env: SWARMBUS_STATE_DIR]",
+    )(func)
+
+
+def _hop_limit_option(func):
+    return click.option(
+        "--hop-limit",
+        type=click.IntRange(min=0),
+        default=DEFAULT_HOP_LIMIT,
+        envvar="SWARMBUS_HOP_LIMIT",
+        show_default=True,
+        help="Hold any message more than this many replies deep and hold every "
+             "later message from its sender until a person resets it with "
+             "`swarmbus held`. [env: SWARMBUS_HOP_LIMIT]",
+    )(func)
 
 
 def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
@@ -136,6 +173,15 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
          "`{agent_id}` template. Resolution order: --outbox > "
          "SWARMBUS_OUTBOX_<UPPER_AGENT_ID> > SWARMBUS_OUTBOX.",
 )
+@click.option(
+    "--in-reply-to",
+    "in_reply_to",
+    default=None,
+    help="Id of the message this answers; its hops are looked up in this "
+         "agent's state db. Defaults to $SWARMBUS_ID when run inside a "
+         "swarmbus wake.",
+)
+@_state_dir_option
 @_broker_auth_options
 @click.pass_context
 def send(
@@ -151,6 +197,8 @@ def send(
     priority: str,
     reply_to: str | None,
     outbox: str | None,
+    in_reply_to: str | None,
+    state_dir: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -177,6 +225,13 @@ def send(
     if body_file is not None:
         body = body_file.read()
 
+    env_hops = os.environ.get("SWARMBUS_HOPS") or None
+    if env_hops is not None and not _re.fullmatch(r"[0-9]+", env_hops):
+        raise click.UsageError(
+            f"SWARMBUS_HOPS must be a non-negative integer, got {env_hops!r}"
+        )
+
+    # Building the bus validates --agent-id before a path is built from it.
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -188,6 +243,34 @@ def send(
         client_cert=client_cert,
         client_key=client_key,
     )
+
+    parent_id = in_reply_to or os.environ.get("SWARMBUS_ID") or None
+    local = None
+    if parent_id:
+        db = _state_db_path(state_dir, agent_id)
+        if db.exists():
+            try:
+                local = asyncio.run(SQLiteMessageStore(db).lookup(parent_id))
+            except (OSError, sqlite3.Error, RuntimeError) as exc:
+                click.echo(f"[swarmbus] cannot read state db {db}: {exc}", err=True)
+                sys.exit(2)
+
+    # The larger parent count wins, so neither source can lower it.
+    known = []
+    if env_hops is not None:
+        known.append(int(env_hops))
+    if local is not None:
+        known.append(local["hops"])
+    if known:
+        hops = 1 + max(known)
+    else:
+        hops = 1 if parent_id else 0
+
+    if local is not None:
+        origin = local["origin"] or local["from"]
+    else:
+        origin = os.environ.get("SWARMBUS_ORIGIN") or agent_id
+
     resolved_outbox = _resolve_outbox(outbox, agent_id)
     try:
         asyncio.run(bus.send(
@@ -198,6 +281,9 @@ def send(
             priority=priority.lower(),
             reply_to=reply_to,
             outbox_path=resolved_outbox,
+            in_reply_to=parent_id,
+            hops=hops,
+            origin=origin,
         ))
     except aiomqtt.MqttError as exc:
         click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
@@ -219,6 +305,8 @@ def send(
          "daemon restarts. Disable only if another process holds the same "
          "`swarmbus-<id>` client identifier.",
 )
+@_state_dir_option
+@_hop_limit_option
 @_broker_auth_options
 def start(
     agent_id: str,
@@ -227,6 +315,8 @@ def start(
     inbox: str | None,
     invoke_cmd: str | None,
     persistent: bool,
+    state_dir: str,
+    hop_limit: int,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -237,6 +327,7 @@ def start(
     """Start the swarmbus listener daemon."""
     from . import __version__
 
+    holds_db = _state_db_path(state_dir, agent_id)
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -248,6 +339,7 @@ def start(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
     )
 
     if inbox:
@@ -267,6 +359,8 @@ def start(
     click.echo(f"  persistent:  {'yes' if persistent else 'no'}")
     click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
     click.echo(f"  invoke:      {invoke_cmd or '(unset — no reactive wake)'}")
+    click.echo(f"  hop limit:   {hop_limit}")
+    click.echo(f"  holds:       {holds_db}")
     scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
     outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX") or "(unset)"
     click.echo(f"  outbox env:  {outbox_env}")
@@ -360,6 +454,8 @@ def read(
          "Only one client per agent id can hold the session -- do not "
          "combine with a running daemon or `mcp-server --persistent`.",
 )
+@_state_dir_option
+@_hop_limit_option
 @_broker_auth_options
 def watch(
     agent_id: str,
@@ -368,6 +464,8 @@ def watch(
     timeout: float,
     as_json: bool,
     persistent: bool,
+    state_dir: str,
+    hop_limit: int,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -384,13 +482,18 @@ def watch(
     running for the same agent-id, the two will race for each incoming
     message — use one mechanism per id at a time.
 
-    Exit 0 on message, exit 1 on timeout, exit 2 on broker error. Use in
-    shell pipelines when you want to wait for a specific reply.
+    Messages past the hop limit are held and skipped; a timeout where only
+    held messages arrived still exits 1.
+
+    Exit 0 on message, exit 1 on timeout, exit 2 on broker or state db
+    error. Use in shell pipelines when you want to wait for a specific
+    reply.
 
     \b
     swarmbus watch --agent-id planner --timeout 60
     swarmbus watch --agent-id planner --persistent --timeout 60
     """
+    holds_db = _state_db_path(state_dir, agent_id)
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -402,11 +505,15 @@ def watch(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
     )
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
     except aiomqtt.MqttError as exc:
         click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
+        sys.exit(2)
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        click.echo(f"[swarmbus] cannot open state db {holds_db}: {exc}", err=True)
         sys.exit(2)
     if msg is None:
         click.echo(f"[swarmbus] {agent_id}: timeout after {timeout}s", err=True)
@@ -417,6 +524,8 @@ def watch(
     click.echo(f"--- from {sanitize_field(msg['from'])} @ {sanitize_field(msg['ts'])} ---")
     click.echo(UNTRUSTED_METADATA_LABEL)
     click.echo(f"subject: {sanitize_field(msg['subject'])}")
+    click.echo(f"id: {sanitize_field(msg.get('id'))}")
+    click.echo(f"hops: {sanitize_field(msg.get('hops', 0))}")
     if msg.get("reply_to"):
         click.echo(f"reply_to: {sanitize_field(msg['reply_to'])}")
     click.echo("")
@@ -969,6 +1078,7 @@ def _detect_agent_id() -> str:
     show_default=True,
     help="Directory for the durable SQLite inbox. [env: SWARMBUS_STATE_DIR]",
 )
+@_hop_limit_option
 @_broker_auth_options
 def mcp_server(
     agent_id: str,
@@ -977,6 +1087,7 @@ def mcp_server(
     persistent: bool,
     presence: bool,
     state_dir: str,
+    hop_limit: int,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -993,6 +1104,7 @@ def mcp_server(
         persistent=persistent,
         presence=presence,
         state_dir=state_dir,
+        hop_limit=hop_limit,
         username=username,
         password=password,
         tls=tls,
@@ -1000,6 +1112,103 @@ def mcp_server(
         client_cert=client_cert,
         client_key=client_key,
     )
+
+
+@main.command()
+@click.option("--agent-id", required=True, help="This agent's ID")
+@_state_dir_option
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON (default: pretty)")
+@click.option(
+    "--reset",
+    "reset_sender",
+    default=None,
+    help="Clear the trip for this sender so its new messages are admitted again.",
+)
+@click.option("--reset-all", is_flag=True, help="Clear every trip.")
+def held(
+    agent_id: str,
+    state_dir: str,
+    as_json: bool,
+    reset_sender: str | None,
+    reset_all: bool,
+) -> None:
+    """List senders tripped by the hop limit and the held messages, or clear a trip.
+
+    This is for a person, not an agent. Held messages stay held after a
+    reset; only new messages from that sender are admitted again. A running
+    daemon, sidecar or watch picks the reset up without a restart.
+
+    \b
+    swarmbus held --agent-id planner
+    swarmbus held --agent-id planner --json
+    swarmbus held --agent-id planner --reset coder
+    swarmbus held --agent-id planner --reset-all
+    """
+    if reset_sender is not None and reset_all:
+        raise click.UsageError("--reset and --reset-all are mutually exclusive")
+    try:
+        _validate_agent_id(agent_id)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-id")
+
+    db = _state_db_path(state_dir, agent_id)
+    if not db.exists():
+        if reset_sender is not None:
+            click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped")
+            sys.exit(1)
+        if reset_all:
+            click.echo("[swarmbus] reset 0 trip(s)")
+            return
+        if as_json:
+            click.echo(json.dumps({"tripped": [], "held_count": 0, "held": []}, indent=2))
+        else:
+            click.echo(f"[swarmbus] {agent_id}: no holds")
+        return
+
+    store = SQLiteMessageStore(db)
+    try:
+        if reset_sender is not None:
+            count = asyncio.run(store.reset_trips(reset_sender))
+        elif reset_all:
+            count = asyncio.run(store.reset_trips())
+        else:
+            holds = asyncio.run(store.list_holds())
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        click.echo(f"[swarmbus] cannot open state db {db}: {exc}", err=True)
+        sys.exit(2)
+
+    if reset_sender is not None:
+        if count:
+            click.echo(f"[swarmbus] reset {sanitize_field(reset_sender)}")
+            return
+        click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped")
+        sys.exit(1)
+    if reset_all:
+        click.echo(f"[swarmbus] reset {count} trip(s)")
+        return
+
+    if as_json:
+        click.echo(json.dumps(holds, indent=2))
+        return
+    if not holds["tripped"] and not holds["held_count"]:
+        click.echo(f"[swarmbus] {agent_id}: no holds")
+        return
+    for t in holds["tripped"]:
+        click.echo(
+            f"tripped: {sanitize_field(t['sender'])} at {sanitize_field(t['tripped_at'])} "
+            f"by message {sanitize_field(t['message_id'])}"
+        )
+    for h in holds["held"]:
+        click.echo(
+            f"held: {sanitize_field(h['id'])} from {sanitize_field(h['from'])} "
+            f"hops={sanitize_field(h['hops'])} reason={sanitize_field(h['reason'])} "
+            f"at {sanitize_field(h['held_at'])} subject: {sanitize_field(h['subject'])}"
+        )
+    if holds["held_count"] > len(holds["held"]):
+        click.echo(
+            f"[swarmbus] showing newest {len(holds['held'])} of "
+            f"{holds['held_count']} held message(s)"
+        )
 
 
 # ---------------------------------------------------------------------------

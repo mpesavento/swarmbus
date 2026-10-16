@@ -27,3 +27,8 @@ def mosquitto_broker():
     yield ("localhost", port)
     proc.terminate()
     proc.wait()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARMBUS_STATE_DIR", str(tmp_path / "swarmbus-state"))

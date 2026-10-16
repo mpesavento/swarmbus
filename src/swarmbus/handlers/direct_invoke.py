@@ -27,6 +27,8 @@ class DirectInvocationHandler(BaseHandler):
             "SWARMBUS_CONTENT_TYPE": msg.content_type,
             "SWARMBUS_PRIORITY": msg.priority,
             "SWARMBUS_TS": msg.ts.isoformat(),
+            "SWARMBUS_HOPS": str(msg.hops),
+            "SWARMBUS_ORIGIN": msg.origin or msg.from_agent,
         }
         if msg.reply_to:
             env["SWARMBUS_REPLY_TO"] = msg.reply_to

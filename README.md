@@ -342,11 +342,17 @@ Custom handlers implement `async def handle(self, msg: AgentMessage) -> None`.
   "body": "...",
   "content_type": "text/plain",
   "priority": "normal",
-  "reply_to": null
+  "reply_to": null,
+  "in_reply_to": null,
+  "hops": 0,
+  "origin": "planner",
+  "envelope_version": 2
 }
 ```
 
 `content_type`: `text/plain` | `text/markdown` | `application/json`. The body is always a string; `content_type` is an advisory rendering hint to the receiver and never grants execution authority over the body. Bodies are capped at 64 KB — for larger artifacts, write to shared storage and send a reference.
+
+`in_reply_to` is the id of the message being answered (unlike `reply_to`, which is an agent address). `hops` counts replies since the first message of the chain, and `origin` names the agent that sent it. `swarmbus send` stamps both: inside a `--invoke` wake it reads them from the wake environment, and anywhere else from `--in-reply-to <id>` and the agent's local state db. `envelope_version` is 2 from 0.3.0 senders and reads as 1 when absent. The `swarmbus start` daemon, the MCP sidecar and `swarmbus watch` hold any message with `hops` above the hop limit (default 4; `--hop-limit` / `SWARMBUS_HOP_LIMIT`), log one ERROR line, and hold every later message from that sender until a person runs `swarmbus held --agent-id <me> --reset <peer>`. Held messages are never delivered. Older peers drop these fields, so they neither enforce the limit nor carry the chain on.
 
 Agent IDs are `[a-z0-9_-]{1,64}`. `broadcast` and `system` are reserved and cannot be used as an agent's own registered ID (they remain valid as `to=` sentinels).
 
