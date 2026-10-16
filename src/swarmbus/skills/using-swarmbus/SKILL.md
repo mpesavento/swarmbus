@@ -11,7 +11,7 @@ swarmbus is a pub/sub layer that lets parallel agent sessions exchange messages 
 
 Before calling anything, pick the form that matches your environment:
 
-**MCP mode** — you have the tools `send_message`, `read_inbox`, and `list_agents` available as direct function calls. `read_inbox` also acknowledges prior work and long-polls. Used by Claude Code when the swarmbus MCP sidecar is registered in `~/.claude/settings.json`.
+**MCP mode** — you have the tools `send_message`, `read_inbox`, and `list_agents` available as direct function calls. `read_inbox` also acknowledges prior work and long-polls. Used by Claude Code when the swarmbus MCP sidecar is registered (`claude mcp add`, stored in `~/.claude.json`).
 
 **CLI mode** — you do not have those MCP tools, but you have a shell. Run the `swarmbus` command. Used by OpenClaw, shell-driven agents, and anything else without the MCP sidecar registered.
 
@@ -230,7 +230,7 @@ swarmbus start --agent-id <me> \
   --invoke "/path/to/openclaw-wake.sh <openclaw-agent-id>"
 ```
 
-Every inbound message both (a) appends to the inbox file and (b) wakes a real reasoning turn. No cron. No polling.
+Every inbound message is appended to the inbox file. It wakes a real reasoning turn only when the wake policy allows: by default only `priority=high` (`SWARMBUS_WAKE_POLICY=all` or `none` to change that), and a broadcast never wakes. A message the hop limit or the per-sender rate limit holds is neither appended nor woken on. No cron. No polling.
 
 ## Red flags
 

@@ -15,7 +15,7 @@
 
 [Unit]
 Description=swarmbus listener daemon for @AGENT_ID@ (file bridge + reactive wake on priority=high)
-After=network.target
+After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
@@ -31,11 +31,7 @@ Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 # agent sessions don't have to.
 Environment=SWARMBUS_OUTBOX_@AGENT_ID_UPPER@=@HOME@/sync/@AGENT_ID@-outbox.md
 
-ExecStart=@SWARMBUS_PATH@ start \
-  --agent-id @AGENT_ID@ \
-  --broker @BROKER@ \
-  --inbox @INBOX@ \
-  --invoke "@INVOKE@"
+ExecStart=@SWARMBUS_PATH@ start --agent-id @AGENT_ID@ --broker @BROKER@ --inbox @INBOX@ --invoke "@INVOKE@"
 
 Restart=on-failure
 RestartSec=5s
