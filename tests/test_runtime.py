@@ -786,7 +786,7 @@ async def test_identical_redelivery_is_acked_without_conflict_record():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("override", [
     {"body": 5},
-    {"subject": "x‮" * 600},
+    {"subject": "x\u202e" * 600},
     {"id": "m\x00-1"},
 ])
 async def test_invalid_field_is_acked_not_stored_with_one_line_warning(override, caplog):
@@ -806,4 +806,4 @@ async def test_invalid_field_is_acked_not_stored_with_one_line_warning(override,
     assert ack.messages == [message]
     warnings = [r.getMessage() for r in caplog.records if r.name == "swarmbus.runtime"]
     assert len(warnings) == 1
-    assert "\n" not in warnings[0] and "‮" not in warnings[0]
+    assert "\n" not in warnings[0] and "\u202e" not in warnings[0]

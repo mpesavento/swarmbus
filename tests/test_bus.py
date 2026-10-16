@@ -523,7 +523,7 @@ def _raw_client(payloads):
 
 _OLD_PEER_LONG_SUBJECT = json.dumps({
     "id": "m-1", "from": "wren", "to": "sparrow",
-    "subject": "x‮" * 600, "body": "b",
+    "subject": "x\u202e" * 600, "body": "b",
 }).encode()
 
 
@@ -536,7 +536,7 @@ def _single_one_line_warning(caplog):
     ]
     assert len(records) == 1
     text = records[0].getMessage()
-    assert "\n" not in text and "‮" not in text
+    assert "\n" not in text and "\u202e" not in text
     return text
 
 

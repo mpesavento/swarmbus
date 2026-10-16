@@ -219,7 +219,7 @@ def test_metadata_fields_reject_control_characters(field, bad):
 
 
 @pytest.mark.parametrize("bad", [
-    "", " ", "a b", "a\nb", "a\tb", "a‮b", "a​b", "a b", "a b",
+    "", " ", "a b", "a\nb", "a\tb", "a\u202eb", "a\u200bb", "a\u00a0b", "a\u2028b",
 ])
 def test_id_must_be_printable_and_non_empty(bad):
     with pytest.raises(ValidationError):
@@ -235,5 +235,5 @@ def test_non_string_body_is_an_invalid_envelope(bad):
 def test_sanitize_field_and_frame_body_neutralise_format_characters():
     from swarmbus.message import frame_body, sanitize_field
 
-    assert sanitize_field("a‮b​c﻿d⁦e") == "a b c d e"
-    assert frame_body("a‮b​c﻿d").split("\n")[1] == "| a\\u202eb\\u200bc\\ufeffd"
+    assert sanitize_field("a\u202eb\u200bc\ufeffd\u2066e") == "a b c d e"
+    assert frame_body("a\u202eb\u200bc\ufeffd").split("\n")[1] == "| a\\u202eb\\u200bc\\ufeffd"
