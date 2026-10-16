@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch, AsyncMock
 from click.testing import CliRunner
 import aiomqtt
@@ -800,3 +801,156 @@ def test_watch_frames_body_and_flattens_envelope():
         result = CliRunner().invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
     assert result.exit_code == 0, result.output
     _assert_framed(result.output)
+
+
+def _send_with_env(env, extra=()):
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        instance = MockBus.return_value
+        instance.send = AsyncMock()
+        result = runner.invoke(main, [
+            "send", "--agent-id", "sparrow", "--to", "wren",
+            "--subject", "s", "--body", "b", *extra,
+        ], env=env)
+    return result, instance.send
+
+
+def test_send_stamps_chain_from_wake_env(monkeypatch):
+    for key in ("SWARMBUS_ID", "SWARMBUS_HOPS", "SWARMBUS_ORIGIN"):
+        monkeypatch.delenv(key, raising=False)
+
+    def chain(send):
+        kw = send.call_args.kwargs
+        return (kw["in_reply_to"], kw["hops"], kw["origin"])
+
+    result, send = _send_with_env({})
+    assert result.exit_code == 0, result.output
+    assert chain(send) == (None, 0, "sparrow")
+
+    result, send = _send_with_env({}, ["--in-reply-to", "abc"])
+    assert result.exit_code == 0, result.output
+    assert chain(send) == ("abc", 1, "sparrow")
+
+    result, send = _send_with_env(
+        {"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "2", "SWARMBUS_ORIGIN": "planner"}
+    )
+    assert result.exit_code == 0, result.output
+    assert chain(send) == ("parent-1", 3, "planner")
+
+    result, send = _send_with_env({"SWARMBUS_ID": "parent-1"})
+    assert result.exit_code == 0, result.output
+    assert chain(send) == ("parent-1", 1, "sparrow")
+
+    result, send = _send_with_env({"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "lots"})
+    assert result.exit_code == 2
+    send.assert_not_called()
+
+
+def test_held_lists_and_resets_trips(tmp_path):
+    import asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state_dir = tmp_path / "state"
+    base = ["held", "--agent-id", "sparrow", "--state-dir", str(state_dir)]
+    runner = CliRunner()
+
+    empty = runner.invoke(main, base)
+    assert empty.exit_code == 0, empty.output
+    assert not (state_dir / "sparrow.sqlite3").exists()
+
+    store = SQLiteMessageStore(state_dir / "sparrow.sqlite3", hop_limit=4)
+    past = AgentMessage.create(from_="wren", to="sparrow", subject="past", body="b", hops=5)
+    assert asyncio.run(store.admit(past, source_topic="agents/sparrow/inbox")) is False
+
+    listed = runner.invoke(main, [*base, "--json"])
+    assert listed.exit_code == 0, listed.output
+    data = json.loads(listed.stdout)
+    assert [t["sender"] for t in data["tripped"]] == ["wren"]
+    assert [h["id"] for h in data["held"]] == [past.id]
+
+    assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 0
+    assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 1
+    assert json.loads(runner.invoke(main, [*base, "--json"]).stdout)["tripped"] == []
+
+
+def test_watch_text_output_prints_id_and_hops():
+    runner = CliRunner()
+    msg = {
+        "id": "msg-123", "from": "wren", "to": "sparrow",
+        "ts": "2026-10-15T05:00:00Z", "subject": "pong", "body": "got it",
+        "content_type": "text/plain", "priority": "normal", "reply_to": None,
+        "in_reply_to": None, "hops": 3, "origin": "wren", "envelope_version": 2,
+    }
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        MockBus.return_value.watch_inbox = AsyncMock(return_value=msg)
+        result = runner.invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
+    assert result.exit_code == 0, result.output
+    assert "id: msg-123" in result.output
+    assert "hops: 3" in result.output
+
+
+def test_send_in_reply_to_takes_parent_hops_from_local_record(tmp_path, monkeypatch):
+    import asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    for key in ("SWARMBUS_ID", "SWARMBUS_HOPS", "SWARMBUS_ORIGIN"):
+        monkeypatch.delenv(key, raising=False)
+    state_dir = tmp_path / "state"
+    store = SQLiteMessageStore(state_dir / "sparrow.sqlite3")
+    parent = AgentMessage.create(from_="wren", to="sparrow", subject="p", body="b", hops=3, origin="planner")
+    assert asyncio.run(store.admit(parent, source_topic="agents/sparrow/inbox")) is True
+
+    base = ["--state-dir", str(state_dir), "--in-reply-to", parent.id]
+
+    def chain(send):
+        kw = send.call_args.kwargs
+        return (kw["in_reply_to"], kw["hops"], kw["origin"])
+
+    result, send = _send_with_env({}, base)
+    assert result.exit_code == 0, result.output
+    assert chain(send) == (parent.id, 4, "planner")
+
+    result, send = _send_with_env({"SWARMBUS_HOPS": "6"}, base)
+    assert result.exit_code == 0, result.output
+    assert chain(send)[1] == 7
+
+    result, send = _send_with_env({"SWARMBUS_HOPS": "1"}, base)
+    assert result.exit_code == 0, result.output
+    assert chain(send)[1] == 4
+
+
+def test_watch_passes_hold_store_and_hop_limit(tmp_path):
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore") as MockStore:
+        MockBus.return_value.watch_inbox = AsyncMock(return_value=None)
+        result = runner.invoke(main, [
+            "watch", "--agent-id", "sparrow", "--timeout", "1",
+            "--state-dir", str(tmp_path), "--hop-limit", "2",
+        ])
+    assert result.exit_code == 1
+    assert MockStore.call_args.args[0] == tmp_path / "sparrow.sqlite3"
+    assert MockStore.call_args.kwargs["hop_limit"] == 2
+    assert MockBus.call_args.kwargs["hold_store"] is MockStore.return_value
+
+
+def test_start_and_mcp_server_pass_hop_limit(tmp_path):
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore") as MockStore:
+        MockBus.return_value.run = lambda: None
+        result = runner.invoke(main, [
+            "start", "--agent-id", "t",
+            "--state-dir", str(tmp_path), "--hop-limit", "2",
+        ])
+    assert result.exit_code == 0, result.output
+    assert MockStore.call_args.args[0] == tmp_path / "t.sqlite3"
+    assert MockStore.call_args.kwargs["hop_limit"] == 2
+    assert MockBus.call_args.kwargs["hold_store"] is MockStore.return_value
+
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = runner.invoke(main, ["mcp-server", "--agent-id", "sparrow", "--hop-limit", "2"])
+    assert result.exit_code == 0, result.output
+    assert run_server.call_args.kwargs["hop_limit"] == 2
