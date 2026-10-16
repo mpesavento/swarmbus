@@ -209,3 +209,6 @@ __marimo__/
 
 # drydock: the harness environment, built in the bind-mounted worktree (Dockerfile.harness)
 .venv-harness/
+
+# macOS
+.DS_Store
