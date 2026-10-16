@@ -845,8 +845,8 @@ def test_watch_persistent_holds_past_hop_limit_and_does_not_redeliver(
         storm = CliRunner().invoke(main, [
             "send", "--agent-id", "pw-storm", "--to", agent,
             "--broker", host, "--port", str(port),
-            "--subject", "storm", "--body", "again",
-        ], env={"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "4", "SWARMBUS_ORIGIN": "pw-storm"})
+            "--subject", "storm", "--body", "again", "--force",
+        ], env={"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "8", "SWARMBUS_ORIGIN": "pw-storm"})
         assert storm.exit_code == 0, storm.output
         _cli_send(host, port, agent, "calm", "fresh chain")
 
@@ -870,6 +870,7 @@ def test_watch_to_watch_replies_accumulate_hops_and_trip_the_limit(
 
     for key in ("SWARMBUS_ID", "SWARMBUS_HOPS", "SWARMBUS_ORIGIN"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SWARMBUS_HOP_LIMIT", "4")
     host, port = mosquitto_broker
     a, b = "pw-chain-a", "pw-chain-b"
     state = ["--state-dir", str(tmp_path / "state")]
@@ -901,7 +902,7 @@ def test_watch_to_watch_replies_accumulate_hops_and_trip_the_limit(
         four = json.loads(got_b.stdout)
         assert (four["hops"], four["in_reply_to"]) == (4, three["id"])
 
-        send(b, a, "five", ["--in-reply-to", four["id"]])
+        send(b, a, "five", ["--in-reply-to", four["id"], "--force"])
         assert watch(a, "1").exit_code == 1
 
         held = CliRunner().invoke(main, ["held", "--agent-id", a, *state, "--json"])
@@ -948,3 +949,37 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
         ):
             pass
         await _clear_retained(host, port, ["agents/pd-hold/presence"])
+
+
+def test_watch_persistent_rate_limits_a_flooding_sender(mosquitto_broker, tmp_path):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    host, port = mosquitto_broker
+    agent = "pw-rate"
+    state = ["--state-dir", str(tmp_path / "state")]
+    opts = [*state, "--rate-limit", "2", "--json"]
+    try:
+        assert _watch_persistent(host, port, agent, *opts, "--timeout", "0.5").exit_code == 1
+        for subject in ("one", "two", "three"):
+            _cli_send(host, port, agent, subject, "flood")
+        calm = CliRunner().invoke(main, [
+            "send", "--agent-id", "pw-calm", "--to", agent,
+            "--broker", host, "--port", str(port), "--subject", "calm", "--body", "b",
+        ])
+        assert calm.exit_code == 0, calm.output
+
+        got = []
+        for _ in range(3):
+            result = _watch_persistent(host, port, agent, *opts, "--timeout", "5")
+            assert result.exit_code == 0, result.output
+            got.append(json.loads(result.stdout)["subject"])
+        assert got == ["one", "two", "calm"]
+        assert _watch_persistent(host, port, agent, *opts, "--timeout", "1").exit_code == 1
+
+        held = CliRunner().invoke(main, ["held", "--agent-id", agent, *state, "--json"])
+        data = json.loads(held.stdout)
+        assert data["tripped"] == []
+        assert [c["sender"] for c in data["cooling"]] == ["pw-sender"]
+    finally:
+        _drop_session(host, port, agent)
