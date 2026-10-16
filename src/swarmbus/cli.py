@@ -16,6 +16,7 @@ from .bus import AgentBus
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
+from .message import UNTRUSTED_METADATA_LABEL, frame_body, sanitize_field
 
 
 @click.group()
@@ -332,13 +333,14 @@ def read(
         click.echo(f"[swarmbus] {agent_id}: inbox empty")
         return
     for m in messages:
-        click.echo(f"--- from {m['from']} @ {m['ts']} ---")
-        click.echo(f"subject: {m['subject']}")
+        click.echo(f"--- from {sanitize_field(m['from'])} @ {sanitize_field(m['ts'])} ---")
+        click.echo(UNTRUSTED_METADATA_LABEL)
+        click.echo(f"subject: {sanitize_field(m['subject'])}")
         if m.get("reply_to"):
-            click.echo(f"reply_to: {m['reply_to']}")
-        click.echo(f"content-type: {m.get('content_type', 'text/plain')}")
+            click.echo(f"reply_to: {sanitize_field(m['reply_to'])}")
+        click.echo(f"content-type: {sanitize_field(m.get('content_type', 'text/plain'))}")
         click.echo("")
-        click.echo(m["body"])
+        click.echo(frame_body(m["body"]))
         click.echo("")
 
 
@@ -412,12 +414,13 @@ def watch(
     if as_json:
         click.echo(json.dumps(msg, indent=2))
         return
-    click.echo(f"--- from {msg['from']} @ {msg['ts']} ---")
-    click.echo(f"subject: {msg['subject']}")
+    click.echo(f"--- from {sanitize_field(msg['from'])} @ {sanitize_field(msg['ts'])} ---")
+    click.echo(UNTRUSTED_METADATA_LABEL)
+    click.echo(f"subject: {sanitize_field(msg['subject'])}")
     if msg.get("reply_to"):
-        click.echo(f"reply_to: {msg['reply_to']}")
+        click.echo(f"reply_to: {sanitize_field(msg['reply_to'])}")
     click.echo("")
-    click.echo(msg["body"])
+    click.echo(frame_body(msg["body"]))
 
 
 @main.command("list")
