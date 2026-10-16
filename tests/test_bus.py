@@ -1,4 +1,5 @@
 # tests/test_bus.py
+import asyncio
 import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -384,3 +385,110 @@ async def test_listen_preserves_handler_registration_order():
         await bus.listen()
 
     assert order_recorded == ["A", "B", "C"]
+
+
+@pytest.mark.asyncio
+async def test_listen_holds_messages_past_hop_limit(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "sparrow.sqlite3", managed=False, hop_limit=1)
+    bus = AgentBus(agent_id="sparrow", broker="localhost", hold_store=store)
+    handler = RecordingHandler()
+    bus.register_handler(handler)
+    sent = [
+        AgentMessage.create(from_="wren", to="sparrow", subject="one", body="b", hops=1),
+        AgentMessage.create(from_="wren", to="sparrow", subject="two", body="b", hops=2),
+        AgentMessage.create(from_="wren", to="sparrow", subject="three", body="b", hops=0),
+        AgentMessage.create(from_="robin", to="sparrow", subject="four", body="b", hops=0),
+    ]
+
+    class FakeMessage:
+        def __init__(self, m):
+            self.topic = "agents/sparrow/inbox"
+            self.payload = m.to_json().encode()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, *args, **kwargs):
+            pass
+        async def subscribe(self, *args, **kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _gen():
+                for m in sent:
+                    yield FakeMessage(m)
+            return _gen()
+
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
+        await bus.listen()
+
+    assert [m.subject for m in handler.received] == ["one", "four"]
+    holds = await store.list_holds()
+    assert [t["sender"] for t in holds["tripped"]] == ["wren"]
+    assert holds["held_count"] == 2
+
+
+def _watch_client(sent, then_block=False):
+    class FakeMessage:
+        def __init__(self, m):
+            self.topic = "agents/sparrow/inbox"
+            self.payload = m.to_json().encode()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def subscribe(self, *args, **kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _gen():
+                for m in sent:
+                    yield FakeMessage(m)
+                if then_block:
+                    await asyncio.sleep(30)
+            return _gen()
+
+    return FakeClient()
+
+
+@pytest.mark.asyncio
+async def test_watch_skips_held_messages_and_returns_next_admissible(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "sparrow.sqlite3", managed=False, hop_limit=4)
+    bus = AgentBus(agent_id="sparrow", broker="localhost", hold_store=store)
+    past = AgentMessage.create(from_="wren", to="sparrow", subject="past", body="b", hops=5)
+    tripped = AgentMessage.create(from_="wren", to="sparrow", subject="tripped", body="b", hops=0)
+    ok = AgentMessage.create(from_="robin", to="sparrow", subject="ok", body="b", hops=4)
+
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_watch_client([past, tripped, ok])):
+        result = await bus.watch_inbox(timeout=5)
+
+    assert result["subject"] == "ok"
+    holds = await store.list_holds()
+    assert [t["sender"] for t in holds["tripped"]] == ["wren"]
+    assert holds["held_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_watch_times_out_when_only_held_messages_arrive(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "sparrow.sqlite3", managed=False, hop_limit=4)
+    bus = AgentBus(agent_id="sparrow", broker="localhost", hold_store=store)
+    past = AgentMessage.create(from_="wren", to="sparrow", subject="past", body="b", hops=5)
+
+    with patch(
+        "swarmbus.bus.aiomqtt.Client",
+        return_value=_watch_client([past], then_block=True),
+    ):
+        result = await bus.watch_inbox(timeout=0.5)
+
+    assert result is None
+    assert (await store.list_holds())["held_count"] == 1
