@@ -226,20 +226,56 @@ framed_body=$(frame_body "$body")
 # Tier 3: fire Telegram push immediately, before contacting the gateway.
 # Mirrors examples/claude-code-wake.sh so priority=high reaches the operator
 # even if the OpenClaw turn is slow, fails, or triggers a security refusal.
-# Bot token + chat_id read from ~/.secrets/ so they're never hardcoded or logged.
+# Bot token + chat_id read from ~/.secrets/ so they're never hardcoded or
+# logged; the token reaches curl on stdin, not its command line. At most one
+# push per 60 s per agent: the rest are counted onto the next ("(+N more)").
+# The throttle never stops the wake.
 if [ "${SWARMBUS_PRIORITY:-normal}" = "high" ]; then
   TG_TOKEN_FILE="$HOME/.secrets/TELEGRAM_BOT_TOKEN"
   TG_CHAT_FILE="$HOME/.secrets/TELEGRAM_CHAT_ID"
+  TG_LAST="$LOG_DIR/${OPENCLAW_AGENT}-wake.tg-last"
   if [ -f "$TG_TOKEN_FILE" ] && [ -f "$TG_CHAT_FILE" ]; then
     TG_TOKEN=$(cat "$TG_TOKEN_FILE")
     TG_CHAT=$(cat "$TG_CHAT_FILE")
-    TG_MSG="⚡ priority:high from ${safe_from}: ${safe_subject}"
-    curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-      -d "chat_id=${TG_CHAT}" \
-      --data-urlencode "text=${TG_MSG}" \
-      > /dev/null 2>&1 \
-      && _log "tier3 TG push sent" \
-      || _log "tier3 TG push failed (curl error)"
+    case "$TG_TOKEN" in
+      ""|*[!A-Za-z0-9:_-]*)
+        # The token becomes part of a curl config line on stdin: anything
+        # outside a bot token's alphabet could inject a second config line.
+        _log "tier3 TG push skipped: token file malformed"
+        TG_TOKEN="" ;;
+    esac
+    if [ -n "$TG_TOKEN" ]; then
+      TG_MSG="⚡ priority:high from ${safe_from}: ${safe_subject}"
+      # State file: "<epoch of the last push> <pushes held back since>".
+      last=""; held=""
+      now=$(date +%s)
+      if [ -f "$TG_LAST" ]; then
+        read -r last held _ < "$TG_LAST" || true
+        if [[ $last =~ ^[0-9]{1,12}$ ]] && [[ $held =~ ^[0-9]{1,9}$ ]]; then
+          last=$((10#$last)); held=$((10#$held))
+        else
+          _log "tier3 TG throttle file corrupt; treating as no recent push"
+          last=""; held=""
+        fi
+      fi
+      if [ -n "$last" ] && [ "$now" -ge "$last" ] && [ $((now - last)) -lt 60 ]; then
+        printf '%s %s\n' "$last" $((held + 1)) > "$TG_LAST.tmp"
+        mv -f "$TG_LAST.tmp" "$TG_LAST"
+        _log "tier3 TG push throttled (one per 60s; $((held + 1)) held back)"
+      else
+        if [ -n "$held" ] && [ "$held" -gt 0 ]; then
+          TG_MSG="${TG_MSG} (+${held} more)"
+        fi
+        printf '%s 0\n' "$now" > "$TG_LAST.tmp"
+        mv -f "$TG_LAST.tmp" "$TG_LAST"
+        # The token goes to curl on stdin (--config -), never on its argv.
+        printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
+          | curl -s --config - -X POST -d "chat_id=${TG_CHAT}" --data-urlencode "text=${TG_MSG}" \
+          > /dev/null 2>&1 \
+          && _log "tier3 TG push sent" \
+          || _log "tier3 TG push failed (curl error)"
+      fi
+    fi
   else
     _log "tier3 TG push skipped: missing $TG_TOKEN_FILE or $TG_CHAT_FILE"
   fi
