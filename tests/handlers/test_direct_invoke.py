@@ -1,3 +1,4 @@
+import json
 import pytest
 from unittest.mock import patch, MagicMock
 from swarmbus.handlers.direct_invoke import DirectInvocationHandler
@@ -97,3 +98,27 @@ async def test_markdown_body_passed_verbatim(msg):
 
     assert b"```python" in captured["input"]
     assert b"print('hello')" in captured["input"]
+
+
+@pytest.mark.asyncio
+async def test_env_carries_chain_fields_to_the_wake():
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return MagicMock(returncode=0)
+
+    handler = DirectInvocationHandler(command=["true"])
+    chained = AgentMessage.create(
+        from_="wren", to="sparrow", subject="s", body="b", hops=3, origin="planner",
+    )
+    old_peer = AgentMessage.from_json(json.dumps({
+        "id": "old-1", "from": "wren", "to": "sparrow",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+    }))
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+        await handler.handle(chained)
+    assert (captured["env"]["SWARMBUS_HOPS"], captured["env"]["SWARMBUS_ORIGIN"]) == ("3", "planner")
+    with patch("swarmbus.handlers.direct_invoke.subprocess.run", side_effect=fake_run):
+        await handler.handle(old_peer)
+    assert (captured["env"]["SWARMBUS_HOPS"], captured["env"]["SWARMBUS_ORIGIN"]) == ("0", "wren")

@@ -142,3 +142,32 @@ def test_frame_body_prefixes_every_line_between_labels():
         "| a\tb\\x1b[2Jc\\x00d\\x7fe\\x85f\\u2028g"
     )
     assert frame_body("\x1b\x08\x00").split("\n")[1] == "| \\x1b\\x08\\x00"
+
+
+def test_create_stamps_chain_fields_and_version():
+    msg = AgentMessage.create(from_="wren", to="sparrow", subject="s", body="b")
+    assert (msg.in_reply_to, msg.hops, msg.origin, msg.envelope_version) == (None, 0, "wren", 2)
+    data = json.loads(msg.to_json())
+    assert (data["in_reply_to"], data["hops"], data["origin"], data["envelope_version"]) == (None, 0, "wren", 2)
+
+    reply = AgentMessage.create(
+        from_="sparrow", to="wren", subject="re: s", body="ok",
+        in_reply_to=msg.id, hops=1, origin="wren",
+    )
+    back = AgentMessage.from_json(reply.to_json())
+    assert (back.in_reply_to, back.hops, back.origin) == (msg.id, 1, "wren")
+
+
+def test_envelope_without_chain_fields_reads_as_old_peer():
+    raw = json.dumps({
+        "id": "old-1", "from": "wren", "to": "sparrow",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+        "content_type": "text/plain", "priority": "normal", "reply_to": None,
+    })
+    msg = AgentMessage.from_json(raw)
+    assert (msg.in_reply_to, msg.hops, msg.origin, msg.envelope_version) == (None, 0, None, 1)
+
+
+def test_negative_hops_is_an_invalid_envelope():
+    with pytest.raises(ValueError):
+        AgentMessage.create(from_="wren", to="sparrow", subject="s", body="b", hops=-1)
