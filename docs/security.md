@@ -171,7 +171,7 @@ mosquitto 2.x warns about a password or ACL file it does not own or that others 
 ### What this does not stop
 
 - **Writing into another agent's inbox.** Every login may publish to `agents/+/inbox`, because that is how `send` works. What the ACL stops is a process with no login connecting at all, an agent reading another agent's inbox, and an agent publishing another agent's presence.
-- **Lying in `from`.** The broker checks topics, not message bodies. A process holding the `coder` login can still send an envelope with `"from": "planner"` and it is delivered. A swarmbus-side check that `from` matches the login is planned separately.
+- **Lying in `from`.** The broker checks topics, not message bodies. A process holding the `coder` login can still send an envelope with `"from": "planner"` and it is delivered. A swarmbus-side check that `from` matches the login is planned separately. A spoofed `from` on a receiver's inbox topic can trip that sender there or start its cool-down; `--on-trip` tells a person when it happens, and alerts are capped (one per trip, 64 queued).
 - **Floods.** Any login can publish as fast as it likes, including to `agents/broadcast`. See "Broker limits" in the README and [#26](https://github.com/mpesavento/swarmbus/issues/26).
 - **Anyone who can read the credentials.** That means the unit file, the drop-in, the MCP host config, or root on the box. Passwords cross loopback in plain text; add TLS (above) if the broker listens anywhere but `127.0.0.1`.
 - **Silent denials.** mosquitto drops a denied publish without telling the client, so `swarmbus send` still prints `Sent to …`. A login that does not match `--agent-id` connects without error but never receives anything, and its presence never shows in `swarmbus list`.

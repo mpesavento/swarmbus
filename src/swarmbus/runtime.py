@@ -22,6 +22,7 @@ from .message import (
     sanitize_field,
 )
 from .topics import DEFAULT_TOPICS
+from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ class ManagedMCPRuntime:
         hop_limit: int = DEFAULT_HOP_LIMIT,
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+        on_trip: list[str] | None = None,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -132,6 +134,11 @@ class ManagedMCPRuntime:
             hop_limit=hop_limit,
             rate_limit=rate_limit,
             rate_cooldown=rate_cooldown,
+        )
+        self._trip_alerter: TripAlerter | None = (
+            TripAlerter(on_trip, agent_id=agent_id, listener="mcp-server")
+            if on_trip
+            else None
         )
         self.topics = DEFAULT_TOPICS
         self._online_agents: set[str] = set()
@@ -317,7 +324,11 @@ class ManagedMCPRuntime:
                 self._client = None
                 self._pending_client = None
                 self._pending_ack_adapter = None
-                await self.store.close()
+                try:
+                    await self.store.close()
+                finally:
+                    if self._trip_alerter is not None:
+                        await self._trip_alerter.aclose()
                 if self._state is not RuntimeState.FATAL:
                     self._state = RuntimeState.STOPPED
 
@@ -441,6 +452,9 @@ class ManagedMCPRuntime:
             else:
                 self._last_store_error = None
                 self._state = RuntimeState.CONNECTED
+                if self._trip_alerter is not None:
+                    for trip in self.store.pop_trips():
+                        self._trip_alerter.submit(trip)
                 return inserted
         raise asyncio.CancelledError
 
