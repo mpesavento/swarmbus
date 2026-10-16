@@ -625,3 +625,22 @@ def test_presence_controls_last_will():
     will = with_presence._client_kwargs()["will"]
     assert str(will.topic) == "agents/foo/presence"
     assert json.loads(will.payload)["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_runtime_holds_message_past_hop_limit_and_acks_it(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", hop_limit=2,
+    )
+    assert runtime.store.hop_limit == 2
+    await runtime.store.open()
+    ack = _RecordingAck()
+    over = AgentMessage.create(from_="wren", to="foo", subject="over", body="b", hops=3)
+
+    await runtime._handle_message(_FakeMqttMessage(over), ack)
+
+    assert len(ack.messages) == 1
+    assert await runtime.store.read() == []
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert default.store.hop_limit == 4
