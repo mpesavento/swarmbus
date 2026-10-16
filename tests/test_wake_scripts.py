@@ -149,3 +149,24 @@ def test_claude_wake_puts_receive_protocol_before_peer_sections(tmp_path):
 
 def test_openclaw_wake_puts_receive_protocol_before_peer_sections(tmp_path):
     _check_receive_protocol(tmp_path, OPENCLAW_WAKE, "main", "node")
+
+
+REPO = EXAMPLES.parent
+
+
+def test_docs_describe_wake_policy_broadcast_and_receive_protocol():
+    openclaw_doc = (REPO / "docs" / "openclaw-wake.md").read_text()
+    readme = (REPO / "README.md").read_text()
+    changelog = (REPO / "CHANGELOG.md").read_text()
+
+    for var in ("SWARMBUS_WAKE_POLICY", "SWARMBUS_RECEIVE_PROTOCOL"):
+        assert var in openclaw_doc
+        assert var in readme
+        assert var in changelog
+    assert "every\nswarmbus message wakes" not in openclaw_doc
+    assert "broadcast" in openclaw_doc
+    assert "receive-protocol-" in openclaw_doc
+    assert "receive-protocol-example.md" in readme
+    assert "never wakes" in readme
+    unreleased = changelog.index("## [Unreleased]")
+    assert unreleased < changelog.index("## [0.2.0]")
