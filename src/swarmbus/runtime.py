@@ -13,7 +13,7 @@ import aiomqtt
 
 from .archive import SQLiteMessageStore
 from .bus import _build_tls_context
-from .message import AgentMessage, _validate_registered_agent_id
+from .message import DEFAULT_HOP_LIMIT, AgentMessage, _validate_registered_agent_id
 from .topics import DEFAULT_TOPICS
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,7 @@ class ManagedMCPRuntime:
         client_cert: str | None = None,
         client_key: str | None = None,
         store: SQLiteMessageStore | Any | None = None,
+        hop_limit: int = DEFAULT_HOP_LIMIT,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -117,7 +118,7 @@ class ManagedMCPRuntime:
             client_cert=client_cert,
             client_key=client_key,
         )
-        self.store = store or SQLiteMessageStore(state_path)
+        self.store = store or SQLiteMessageStore(state_path, hop_limit=hop_limit)
         self.topics = DEFAULT_TOPICS
         self._online_agents: set[str] = set()
         self._client: aiomqtt.Client | None = None

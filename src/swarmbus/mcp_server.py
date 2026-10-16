@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Protocol
 
 import aiomqtt
 
+from .message import DEFAULT_HOP_LIMIT
 from .runtime import ManagedMCPRuntime, TransportUnavailable
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,7 @@ def run_mcp_server(
     ca_cert: str | None = None,
     client_cert: str | None = None,
     client_key: str | None = None,
+    hop_limit: int = DEFAULT_HOP_LIMIT,
 ) -> None:
     """Start the MCP sidecar with one managed MQTT connection."""
     if not _MCP_AVAILABLE:
@@ -161,6 +163,7 @@ def run_mcp_server(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        hop_limit=hop_limit,
     )
 
     @asynccontextmanager
