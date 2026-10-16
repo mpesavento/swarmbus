@@ -660,8 +660,38 @@ def test_start_invoke_uses_shlex_split():
             "--invoke", "bash -c 'echo $SWARMBUS_FROM'",
         ])
         MockHandler.assert_called_once_with(
-            command=["bash", "-c", "echo $SWARMBUS_FROM"]
+            command=["bash", "-c", "echo $SWARMBUS_FROM"], timeout=900.0,
         )
+
+
+def test_start_invoke_timeout_from_flag_and_env():
+    """--invoke-timeout / SWARMBUS_INVOKE_TIMEOUT reach the handler; 0 means no limit."""
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.DirectInvocationHandler") as MockHandler:
+        MockBus.return_value.run = lambda: None
+        result = runner.invoke(main, [
+            "start", "--agent-id", "t", "--invoke", "wake.sh t", "--invoke-timeout", "120",
+        ])
+        assert result.exit_code == 0, result.output
+        assert MockHandler.call_args.kwargs["timeout"] == 120.0
+        assert "invoke t/o:  120s" in result.output
+
+        result = runner.invoke(main, ["start", "--agent-id", "t", "--invoke", "wake.sh t"],
+                               env={"SWARMBUS_INVOKE_TIMEOUT": "45.5"})
+        assert result.exit_code == 0, result.output
+        assert MockHandler.call_args.kwargs["timeout"] == 45.5
+
+        result = runner.invoke(main, ["start", "--agent-id", "t", "--invoke", "wake.sh t"],
+                               env={"SWARMBUS_INVOKE_TIMEOUT": "0"})
+        assert result.exit_code == 0, result.output
+        assert MockHandler.call_args.kwargs["timeout"] == 0
+        assert "invoke t/o:  none" in result.output
+
+        result = runner.invoke(main, ["start", "--agent-id", "t", "--invoke", "wake.sh t"],
+                               env={"SWARMBUS_INVOKE_TIMEOUT": "-1"})
+        assert result.exit_code == 2
+        assert "SWARMBUS_INVOKE_TIMEOUT" in result.output or "--invoke-timeout" in result.output
 
 
 def test_list_json():
