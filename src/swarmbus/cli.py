@@ -996,8 +996,7 @@ def doctor(
     # 3. Systemd daemon state
     unit_name = f"swarmbus-{agent_id_resolved}.service"
     try:
-        env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
-               "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
+        env = _systemd_user_env()
         probe = subprocess.run(
             ["systemctl", "--user", "show", unit_name,
              "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecStart"],
@@ -1109,12 +1108,26 @@ def doctor(
         resolved = outbox_env.replace("{agent_id}", agent_id_resolved)
         try:
             p = Path(resolved).expanduser()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.touch(exist_ok=True)
-            results.append((
-                f"outbox env resolvable... {resolved}",
-                "ok", None,
-            ))
+            if p.exists():
+                writable = p.is_file() and os.access(p, os.W_OK)
+            else:
+                # _append_outbox_entry creates missing parents on the first send,
+                # so a writable existing ancestor directory is enough.
+                ancestor = p.parent
+                while not ancestor.exists() and ancestor != ancestor.parent:
+                    ancestor = ancestor.parent
+                writable = ancestor.is_dir() and os.access(ancestor, os.W_OK | os.X_OK)
+            if writable:
+                results.append((
+                    f"outbox env resolvable... {resolved}",
+                    "ok", None,
+                ))
+            else:
+                results.append((
+                    f"outbox env resolvable... {resolved}: NOT WRITABLE",
+                    "fail",
+                    "check parent dir permissions",
+                ))
         except Exception as exc:
             results.append((
                 f"outbox env resolvable... {resolved}: NOT WRITABLE ({exc})",
@@ -1202,12 +1215,24 @@ def doctor(
         sys.exit(0)
 
 
+def _systemd_user_env() -> dict[str, str]:
+    """The caller's environment, with the systemd user-bus variables defaulted only when unset or empty."""
+    env = dict(os.environ)
+    uid = os.getuid()
+    for key, default in (
+        ("XDG_RUNTIME_DIR", f"/run/user/{uid}"),
+        ("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"),
+    ):
+        if not env.get(key):
+            env[key] = default
+    return env
+
+
 def _detect_agent_id() -> str:
     """Best-effort agent-id detection: look for an active systemd user
     unit named swarmbus-*.service. Error out if ambiguous or none."""
     import subprocess
-    env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
-           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
+    env = _systemd_user_env()
     res = subprocess.run(
         ["systemctl", "--user", "list-units", "--type=service", "--no-legend",
          "--no-pager", "swarmbus-*.service"],
