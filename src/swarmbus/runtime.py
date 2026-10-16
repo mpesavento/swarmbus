@@ -470,7 +470,9 @@ class ManagedMCPRuntime:
             try:
                 message = AgentMessage.from_json(mqtt_message.payload)
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
-                logger.warning("discarding invalid message envelope: %s", exc)
+                logger.warning(
+                    "discarding invalid message envelope: %s", sanitize_field(exc)
+                )
                 ack_adapter.ack(mqtt_message)
                 return
             inserted = await self._store_inbox_message(
@@ -504,7 +506,9 @@ class ManagedMCPRuntime:
                 ValueError,
                 UnicodeDecodeError,
             ) as exc:
-                logger.warning("discarding invalid presence record: %s", exc)
+                logger.warning(
+                    "discarding invalid presence record: %s", sanitize_field(exc)
+                )
             ack_adapter.ack(mqtt_message)
             return
 
