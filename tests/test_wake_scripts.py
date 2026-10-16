@@ -297,7 +297,7 @@ def _log_path(home, script, agent_id):
     return home / ".local/state/swarmbus-wake" / name
 
 
-SNEAKY_SUBJECT = "a‮b c\x85d​eé"
+SNEAKY_SUBJECT = "a\N{RIGHT-TO-LEFT OVERRIDE}b\N{LINE SEPARATOR}c\x85d\N{ZERO WIDTH SPACE}e\xe9"
 LONG_ID = "m-" + "x" * 98    # 100 characters: past the old 64 cut, inside #40's 128
 
 
@@ -310,7 +310,7 @@ def test_wake_metadata_matches_sanitize_field(tmp_path, script, agent_id, stub, 
     prompt = (bin_dir / f"{stub}.stdin").read_text(encoding="utf-8")
     lines = prompt.split("\n")
     assert "subject: " + sanitize_field(SNEAKY_SUBJECT) in lines
-    assert "subject: a b c d eé" in lines
+    assert "subject: a b c d e\xe9" in lines
     assert f"id: {LONG_ID}" in lines
     assert f"--in-reply-to {LONG_ID}" in prompt[prompt.index(FOOTER):]
     assert "sanitized in shell" not in _log_path(tmp_path, script, agent_id).read_text()
@@ -330,7 +330,7 @@ def test_wake_metadata_drops_non_ascii_when_python3_fails(tmp_path, script, agen
 @pytest.mark.parametrize("python3", ["import", "inline"])
 @BOTH
 def test_wake_frames_format_characters_like_read(tmp_path, script, agent_id, stub, python3):
-    body = "a‮b​c﻿d⁦e\n"
+    body = "a\N{RIGHT-TO-LEFT OVERRIDE}b\N{ZERO WIDTH SPACE}c\N{ZERO WIDTH NO-BREAK SPACE}d\N{LEFT-TO-RIGHT ISOLATE}e\n"
     result, bin_dir = _run(tmp_path, script, agent_id, to="bob", priority="high", body=body, python3=python3)
     assert result.returncode == 0, result.stderr
     prompt = (bin_dir / f"{stub}.stdin").read_text(encoding="utf-8")
@@ -527,7 +527,7 @@ def test_claude_wake_pushes_telegram_only_on_priority_high(tmp_path):
 def test_wake_telegram_token_goes_on_stdin_and_subject_is_sanitized(tmp_path, script, agent_id, stub):
     home = tmp_path / "h"
     _real_telegram_secrets(home)
-    subject = "urgent‮ \x85x"
+    subject = "urgent\N{RIGHT-TO-LEFT OVERRIDE}\N{LINE SEPARATOR}\x85x"
     result, bin_dir = _run(home, script, agent_id, to="bob", priority="high",
                            extra_env={"SWARMBUS_SUBJECT": subject})
     assert result.returncode == 0, result.stderr
@@ -537,7 +537,7 @@ def test_wake_telegram_token_goes_on_stdin_and_subject_is_sanitized(tmp_path, sc
     assert 'url = "https://api.telegram.org/bot123456:SECRET-tok_en/sendMessage"' in (
         bin_dir / "curl.stdin").read_text()
     assert "chat_id=42" in args
-    assert "text=⚡ priority:high from alice: " + sanitize_field(subject) in args
+    assert "text=\N{HIGH VOLTAGE SIGN} priority:high from alice: " + sanitize_field(subject) in args
 
 
 @BOTH
