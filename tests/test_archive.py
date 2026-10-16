@@ -867,3 +867,74 @@ async def test_two_listeners_on_one_state_db_share_one_bucket(db_path):
     assert await watch.reset_trips("wren") == 1
     assert (await daemon.list_holds())["cooling"] == []
     assert await daemon.admit(_from("wren", "4"), source_topic=INBOX) is True
+
+
+@pytest.mark.asyncio
+async def test_pop_trips_reports_each_new_trip_once(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=1)
+    assert store.pop_trips() == []
+
+    past = _chain_msg("wren", 2, "past")
+    assert await store.admit(past, source_topic=topic) is False
+    assert await store.admit(past, source_topic=topic) is False  # redelivery
+    assert await store.admit(_chain_msg("wren", 0, "after"), source_topic=topic) is False
+    robin = _chain_msg("robin", 3, "robin-past")
+    assert await store.store(robin, source_topic=topic) is False
+    assert await store.admit(_chain_msg("robin", 1, "robin-ok"), source_topic=topic) is False
+
+    trips = store.pop_trips()
+    assert [(t.sender, t.kind, t.message_id, t.hops, t.source_topic, t.until) for t in trips] == [
+        ("wren", "hop-limit", past.id, 2, topic, None),
+        ("robin", "hop-limit", robin.id, 3, topic, None),
+    ]
+    assert store.pop_trips() == []
+
+    other = SQLiteMessageStore(db_path, managed=False, hop_limit=1)
+    assert await other.admit(_chain_msg("wren", 9), source_topic=topic) is False
+    assert other.pop_trips() == []
+
+    assert await store.reset_trips("wren") == 1
+    again = _chain_msg("wren", 5, "again")
+    assert await other.admit(again, source_topic=topic) is False
+    assert [t.message_id for t in other.pop_trips()] == [again.id]
+    assert store.pop_trips() == []
+
+
+@pytest.mark.asyncio
+async def test_pop_trips_reports_a_rate_limit_trip_once_per_cooldown(db_path):
+    inbox, broadcast = "agents/sparrow/inbox", "agents/broadcast"
+    now = [1000.0]
+    store = SQLiteMessageStore(
+        db_path, managed=False, rate_limit=2, rate_cooldown=600, clock=lambda: now[0],
+    )
+
+    def wren(subject):
+        return _chain_msg("wren", 0, subject)
+
+    def robin(subject, hops=0):
+        return _chain_msg("robin", hops, subject)
+
+    assert [await store.admit(wren(s), source_topic=inbox) for s in ("1", "2")] == [True, True]
+    over = wren("3")
+    assert await store.admit(over, source_topic=inbox) is False
+    assert await store.admit(wren("4"), source_topic=inbox) is False  # cooling
+    now[0] = 1200.0
+    assert await store.admit(wren("5"), source_topic=inbox) is False  # still cooling
+    until = datetime.fromtimestamp(1600.0, timezone.utc).isoformat()
+    assert [(t.sender, t.kind, t.message_id, t.until) for t in store.pop_trips()] == [
+        ("wren", "rate-limit", over.id, until),
+    ]
+
+    # Broadcasts are held but never trip anyone, so they never alert.
+    assert await store.admit(robin("deep", hops=99), source_topic=broadcast) is False
+    assert [await store.admit(robin(s), source_topic=broadcast) for s in ("b1", "b2", "b3")] == [
+        True, True, False,
+    ]
+    assert store.pop_trips() == []
+
+    now[0] = 1600.0  # cool-down over: a full bucket, then one new trip
+    assert [await store.admit(wren(s), source_topic=inbox) for s in ("6", "7")] == [True, True]
+    again = wren("8")
+    assert await store.admit(again, source_topic=inbox) is False
+    assert [(t.kind, t.message_id) for t in store.pop_trips()] == [("rate-limit", again.id)]
