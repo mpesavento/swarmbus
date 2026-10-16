@@ -17,7 +17,7 @@ import click
 from .archive import SQLiteMessageStore
 from .bus import AgentBus
 from .handlers.file_bridge import FileBridgeHandler
-from .handlers.direct_invoke import DirectInvocationHandler
+from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
 from .message import (
     DEFAULT_HOP_LIMIT,
@@ -298,6 +298,16 @@ def send(
 @click.option("--inbox", default=None, help="Path for file bridge (inbox.md)")
 @click.option("--invoke", "invoke_cmd", default=None, help="Command to invoke on message")
 @click.option(
+    "--invoke-timeout",
+    type=click.FloatRange(min=0),
+    default=DEFAULT_INVOKE_TIMEOUT,
+    envvar="SWARMBUS_INVOKE_TIMEOUT",
+    show_default=True,
+    help="Seconds a --invoke command may run before the daemon kills it "
+         "(and everything it spawned) and goes on to the next message. "
+         "0 waits forever. [env: SWARMBUS_INVOKE_TIMEOUT]",
+)
+@click.option(
     "--persistent/--no-persistent",
     default=True,
     show_default=True,
@@ -314,6 +324,7 @@ def start(
     port: int,
     inbox: str | None,
     invoke_cmd: str | None,
+    invoke_timeout: float,
     persistent: bool,
     state_dir: str,
     hop_limit: int,
@@ -345,7 +356,9 @@ def start(
     if inbox:
         bus.register_handler(FileBridgeHandler(inbox))
     if invoke_cmd:
-        bus.register_handler(DirectInvocationHandler(command=shlex.split(invoke_cmd)))
+        bus.register_handler(DirectInvocationHandler(
+            command=shlex.split(invoke_cmd), timeout=invoke_timeout,
+        ))
 
     bus.register_handler(PersistentListenerHandler())
 
@@ -359,6 +372,8 @@ def start(
     click.echo(f"  persistent:  {'yes' if persistent else 'no'}")
     click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
     click.echo(f"  invoke:      {invoke_cmd or '(unset — no reactive wake)'}")
+    if invoke_cmd:
+        click.echo(f"  invoke t/o:  {f'{invoke_timeout:g}s' if invoke_timeout else 'none'}")
     click.echo(f"  hop limit:   {hop_limit}")
     click.echo(f"  holds:       {holds_db}")
     scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
