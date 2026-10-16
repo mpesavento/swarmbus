@@ -1,6 +1,7 @@
 """Tests for swarmbus init command and helpers."""
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -433,3 +434,79 @@ class TestStepDoctor:
         for element in cmd:
             assert " " not in element, f"Element {element!r} contains space — subprocess would fail"
         assert "doctor" in cmd
+
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+
+
+def _stub_bin(home, names):
+    """Stub executables that append their argv (space-joined) to <name>.calls."""
+    bin_dir = home / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        stub = bin_dir / name
+        stub.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "$(dirname "$0")/{name}.calls"\n'
+        )
+        stub.chmod(0o755)
+    return bin_dir
+
+
+def _run_script(home, script, *args):
+    bin_dir = home / "bin"
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "HOME": str(home)}
+    return subprocess.run(
+        ["bash", str(SCRIPTS / script), *args],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+
+
+def _render_unit(home, *extra):
+    home.mkdir(parents=True)
+    _stub_bin(home, ("swarmbus", "systemctl", "sleep"))
+    result = _run_script(home, "install-systemd.sh", "planner", *extra)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return (home / ".config/systemd/user/swarmbus-planner.service").read_text()
+
+
+def test_install_systemd_renders_one_line_execstart(tmp_path):
+    bare = _render_unit(tmp_path / "bare")
+    lines = bare.splitlines()
+    execs = [line for line in lines if line.startswith("ExecStart=")]
+    assert len(execs) == 1, bare
+    assert " start --agent-id planner --broker localhost --inbox " in execs[0]
+    assert "--invoke" not in execs[0]
+    assert not [line for line in lines if line.lstrip().startswith("--")]
+    assert not [line for line in lines if line.rstrip().endswith("\\")]
+
+    wake = tmp_path / "wake.sh"
+    woke = _render_unit(tmp_path / "woke", "--invoke", f"{wake} planner")
+    execs = [line for line in woke.splitlines() if line.startswith("ExecStart=")]
+    assert len(execs) == 1, woke
+    assert " start --agent-id planner --broker localhost --inbox " in execs[0]
+    assert execs[0].endswith(f' --invoke "{wake} planner"')
+
+
+def test_install_systemd_unit_orders_after_network_online(tmp_path):
+    unit = _render_unit(tmp_path / "home")
+    after = [line for line in unit.splitlines() if line.startswith("After=")]
+    assert after and "network-online.target" in after[0].split("=", 1)[1].split()
+    assert "Wants=network-online.target" in unit.splitlines()
+
+
+def test_setup_cc_plugin_uses_claude_mcp_add_and_rerun_does_not_nest(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = _stub_bin(home, ("claude",))
+    for _ in range(2):
+        result = _run_script(home, "setup-cc-plugin.sh", "planner", "localhost")
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    skill = home / ".claude/skills/using-swarmbus"
+    assert (skill / "SKILL.md").is_file()
+    assert not (skill / "using-swarmbus").exists()
+    assert not (home / ".claude/settings.json").exists()
+    remove = "mcp remove --scope user swarmbus"
+    add = "mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id planner --broker localhost"
+    assert (bin_dir / "claude.calls").read_text().splitlines() == [remove, add, remove, add]
