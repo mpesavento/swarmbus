@@ -986,6 +986,17 @@ def test_start_and_mcp_server_pass_hop_limit(tmp_path):
     assert run_server.call_args.kwargs["hop_limit"] == 2
 
 
+def test_send_rejects_over_long_subject_before_publishing():
+    with patch("swarmbus.bus.aiomqtt.Client") as client:
+        result = CliRunner().invoke(main, [
+            "send", "--agent-id", "sparrow", "--to", "wren",
+            "--subject", "x" * 1025, "--body", "b",
+        ], env={"SWARMBUS_ID": "", "SWARMBUS_HOPS": ""})
+    assert result.exit_code == 2, result.output
+    assert "subject" in result.output
+    client.assert_not_called()
+
+
 def test_held_reports_counts(tmp_path):
     import asyncio
     from swarmbus.archive import SQLiteMessageStore

@@ -494,6 +494,33 @@ async def test_watch_times_out_when_only_held_messages_arrive(tmp_path):
     assert (await store.list_holds())["held_count"] == 1
 
 
+def _raw_client(payloads):
+    class FakeMessage:
+        def __init__(self, payload):
+            self.topic = "agents/sparrow/inbox"
+            self.payload = payload
+            self.mid = 1
+            self.qos = 1
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, *args, **kwargs):
+            pass
+        async def subscribe(self, *args, **kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _gen():
+                for p in payloads:
+                    yield FakeMessage(p)
+            return _gen()
+
+    return FakeClient()
+
+
 class _AckRecordingPaho:
     def __init__(self):
         self.manual_ack = None
@@ -539,6 +566,55 @@ def _persistent_listen_client(deliveries):
             return _gen()
 
     return FakeClient()
+
+
+_OLD_PEER_LONG_SUBJECT = json.dumps({
+    "id": "m-1", "from": "wren", "to": "sparrow",
+    "subject": "x\u202e" * 600, "body": "b",
+}).encode()
+
+
+def _single_one_line_warning(caplog):
+    import logging
+
+    records = [
+        r for r in caplog.records
+        if r.name == "swarmbus.bus" and r.levelno == logging.WARNING
+    ]
+    assert len(records) == 1
+    text = records[0].getMessage()
+    assert "\n" not in text and "\u202e" not in text
+    return text
+
+
+@pytest.mark.asyncio
+async def test_listen_discards_over_long_subject_with_one_line_warning(caplog):
+    import logging
+
+    bus = AgentBus(agent_id="sparrow", broker="localhost")
+    handler = RecordingHandler()
+    bus.register_handler(handler)
+    with caplog.at_level(logging.WARNING, logger="swarmbus.bus"), \
+         patch("swarmbus.bus.aiomqtt.Client", return_value=_raw_client([_OLD_PEER_LONG_SUBJECT])):
+        await bus.listen()
+    assert handler.received == []
+    assert "subject" in _single_one_line_warning(caplog)
+
+
+@pytest.mark.asyncio
+async def test_read_and_watch_skip_over_long_subject_with_one_line_warning(caplog):
+    import logging
+
+    bus = AgentBus(agent_id="sparrow", broker="localhost")
+    with caplog.at_level(logging.WARNING, logger="swarmbus.bus"), \
+         patch("swarmbus.bus.aiomqtt.Client", return_value=_raw_client([_OLD_PEER_LONG_SUBJECT])):
+        assert await bus.read_inbox(drain_timeout=1) == []
+    _single_one_line_warning(caplog)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="swarmbus.bus"), \
+         patch("swarmbus.bus.aiomqtt.Client", return_value=_raw_client([_OLD_PEER_LONG_SUBJECT])):
+        assert await bus.watch_inbox(timeout=1) is None
+    _single_one_line_warning(caplog)
 
 
 @pytest.mark.asyncio

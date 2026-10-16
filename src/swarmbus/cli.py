@@ -13,6 +13,7 @@ from pathlib import Path
 
 import aiomqtt
 import click
+from pydantic import ValidationError
 
 from .archive import SQLiteMessageStore
 from .bus import AgentBus
@@ -288,6 +289,8 @@ def send(
     except aiomqtt.MqttError as exc:
         click.echo(f"[swarmbus] broker unreachable ({broker}:{port}): {exc}", err=True)
         sys.exit(2)
+    except ValidationError as exc:
+        raise click.UsageError(f"invalid message: {sanitize_field(exc)}")
     click.echo(f"Sent to {to_agent}")
 
 

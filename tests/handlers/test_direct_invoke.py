@@ -193,3 +193,17 @@ async def test_fast_command_under_timeout_logs_nothing(msg, caplog):
     with caplog.at_level(logging.WARNING, logger="swarmbus.handlers.direct_invoke"):
         await handler.handle(msg)
     assert caplog.text == ""
+
+
+@pytest.mark.asyncio
+async def test_wake_failure_log_line_sanitizes_the_message_id(caplog):
+    msg = AgentMessage.create(from_="wren", to="sparrow", subject="s", body="b")
+    msg = msg.model_copy(update={"id": "m-1\nFORGED log line"})
+    proc = MagicMock(returncode=3)
+    proc.communicate.return_value = (None, None)
+    with caplog.at_level(logging.WARNING, logger="swarmbus.handlers.direct_invoke"), \
+         patch(POPEN, return_value=proc):
+        await DirectInvocationHandler(command=["false"]).handle(msg)
+    [record] = [r for r in caplog.records if r.name == "swarmbus.handlers.direct_invoke"]
+    assert "\n" not in record.getMessage()
+    assert "m-1 FORGED log line" in record.getMessage()
