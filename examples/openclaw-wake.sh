@@ -45,9 +45,13 @@
 #
 # SECURITY: Envelope fields and body both come from peer agents and must
 # be treated as untrusted. The header below is explicitly labelled so
-# the receiving model does not mistake peer metadata for authority. We
-# also strip control characters and truncate long fields so a hostile
-# peer can't inject newlines that fake the prompt structure. The body is
+# the receiving model does not mistake peer metadata for authority. Each
+# envelope field goes through swarmbus.message.sanitize_field (or a
+# byte-identical inline copy; if python3 is missing or fails, an
+# ASCII-only shell fallback, logged once) and is truncated, so a hostile
+# peer can't inject newlines that fake the prompt structure. The log
+# directory is created 0700 and the log 0600 (umask 077; an existing
+# directory or log is tightened). The body is
 # framed exactly as `swarmbus read` frames it (see frame_body below):
 # every line prefixed with "| " between the [UNTRUSTED PEER BODY ...]
 # and [END UNTRUSTED PEER BODY] labels, with control characters escaped,
@@ -57,12 +61,16 @@
 # with `swarmbus send --in-reply-to <id>`.
 
 set -euo pipefail
+umask 077
 
 OPENCLAW_AGENT="${1:?Usage: openclaw-wake.sh <openclaw-agent-id>}"
 
 LOG_DIR="$HOME/.local/state/swarmbus-wake"
 mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
 LOG="$LOG_DIR/${OPENCLAW_AGENT}-wake.log"
+touch "$LOG"
+chmod 600 "$LOG"
 _log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"; }
 
 # Millisecond epoch, portable across GNU date (Linux) and BSD date (macOS) —
@@ -70,29 +78,72 @@ _log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"; }
 # (no %N support), which then blows up the elapsed_ms arithmetic below.
 _now_ms() { python3 -c 'import time; print(int(time.time() * 1000))' 2>/dev/null || echo "$(($(date +%s) * 1000))"; }
 
-# Sanitizer: strip C0/C1 control chars, collapse whitespace, cap length.
+# Envelope field sanitizer: swarmbus.message.sanitize_field when this python3
+# can import swarmbus, otherwise a byte-identical inline copy (every Cc, Cf,
+# Zl and Zp character becomes one space). Probed once, here at the top level;
+# if python3 is missing or fails, a shell fallback keeps printable ASCII only
+# (logged once). `sanitize VALUE MAX` caps the result at MAX characters.
+SANITIZE_PY=$(cat <<'PY'
+import sys, unicodedata
+try:
+    from swarmbus.message import sanitize_field
+except Exception:
+    def sanitize_field(value):
+        if value is None:
+            return ""
+        return "".join(
+            " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
+            for ch in str(value)
+        )
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stdout.write(sanitize_field(sys.argv[2])[: int(sys.argv[1])])
+PY
+)
+
+SANITIZE_IN_PYTHON=0
+if command -v python3 >/dev/null 2>&1 \
+   && python3 -I -c "$SANITIZE_PY" 1 x >/dev/null 2>>"$LOG" </dev/null; then
+  SANITIZE_IN_PYTHON=1
+else
+  _log "python3 unavailable; envelope fields sanitized in shell (non-ASCII dropped)"
+fi
+
 sanitize() {
-  local max="${2:-200}"
+  # $1: raw value, $2: max length. stdout: one line, no trailing newline.
+  local max="${2:-200}" out
+  if [ "$SANITIZE_IN_PYTHON" = "1" ] \
+     && out=$(python3 -I -c "$SANITIZE_PY" "$max" "$1" 2>>"$LOG" </dev/null); then
+    printf '%s' "$out"
+    return 0
+  fi
   printf '%s' "$1" \
-    | tr -d '\000-\010\013-\037\177' \
-    | tr '\n\r' '  ' \
+    | LC_ALL=C tr -d '\000-\010\013-\037\177-\377' \
+    | LC_ALL=C tr '\t\n' '  ' \
     | head -c "$max"
 }
 
+PRIORITY="${SWARMBUS_PRIORITY:-normal}"
+safe_from=$(sanitize "${SWARMBUS_FROM:-?}" 64)
+safe_subject=$(sanitize "${SWARMBUS_SUBJECT:-?}" 200)
+safe_reply_to=$(sanitize "${SWARMBUS_REPLY_TO:-}" 64)
+safe_priority=$(sanitize "${PRIORITY}" 16)
+safe_id=$(sanitize "${SWARMBUS_ID:-}" 128)
+safe_hops=$(sanitize "${SWARMBUS_HOPS:-0}" 16)
+
 # Broadcast never wakes (any policy). Still archived by FileBridgeHandler.
 if [ "${SWARMBUS_TO:-}" = "broadcast" ]; then
-  _log "broadcast ${SWARMBUS_ID:-?} from=${SWARMBUS_FROM:-?}; archive-only (broadcast never wakes)"
+  _log "broadcast ${safe_id:-?} from=${safe_from}; archive-only (broadcast never wakes)"
   cat > /dev/null
   exit 0
 fi
 
 # Policy gate (same as examples/claude-code-wake.sh)
 POLICY="${SWARMBUS_WAKE_POLICY:-priority-high}"
-PRIORITY="${SWARMBUS_PRIORITY:-normal}"
 
 case "$POLICY" in
   none)
-    _log "policy=none; dropping ${SWARMBUS_ID:-?} from=${SWARMBUS_FROM:-?}"
+    _log "policy=none; dropping ${safe_id:-?} from=${safe_from}"
     cat > /dev/null  # drain stdin so the daemon's subprocess.run completes
     exit 0
     ;;
@@ -100,7 +151,7 @@ case "$POLICY" in
     ;;  # wake unconditionally
   priority-high)
     if [ "$PRIORITY" != "high" ]; then
-      _log "policy=priority-high; priority=${PRIORITY}; archive-only"
+      _log "policy=priority-high; priority=${safe_priority}; archive-only"
       cat > /dev/null
       exit 0
     fi
@@ -118,12 +169,6 @@ esac
 # frame below matches `swarmbus read` byte for byte.
 body=$(cat; printf x)
 body=${body%x}
-safe_from=$(sanitize "${SWARMBUS_FROM:-?}" 64)
-safe_subject=$(sanitize "${SWARMBUS_SUBJECT:-?}" 200)
-safe_reply_to=$(sanitize "${SWARMBUS_REPLY_TO:-}" 64)
-safe_priority=$(sanitize "${SWARMBUS_PRIORITY:-normal}" 16)
-safe_id=$(sanitize "${SWARMBUS_ID:-}" 64)
-safe_hops=$(sanitize "${SWARMBUS_HOPS:-0}" 16)
 
 # Body framing: the same frame_body() as `swarmbus read`, `swarmbus watch`
 # and the inbox file. The body goes between the two labels with every line
@@ -150,7 +195,7 @@ except Exception:
         framed = []
         for line in body.replace("\r\n", "\n").split("\n"):
             shown = "".join(
-                _esc(ch) if ch != "\t" and unicodedata.category(ch) in ("Cc", "Zl", "Zp") else ch
+                _esc(ch) if ch != "\t" and unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
                 for ch in line
             )
             framed.append("| " + shown if shown else "|")
@@ -262,7 +307,7 @@ PROMPT
 # CLI fallback: shell out to the full openclaw command. Slow (~24s on
 # RPi 5) but does not require a running gateway daemon.
 if [ "${OPENCLAW_WAKE_USE_CLI:-0}" = "1" ]; then
-  _log "wake (cli fallback) for ${SWARMBUS_ID:-?} from=${safe_from} subject=\"${safe_subject}\""
+  _log "wake (cli fallback) for ${safe_id:-?} from=${safe_from} subject=\"${safe_subject}\""
   set +e
   start=$(_now_ms)
   openclaw agent --agent "$OPENCLAW_AGENT" --message "$prompt" >> "$LOG" 2>&1
@@ -280,7 +325,7 @@ if [ ! -f "$HELPER" ]; then
   exit 2
 fi
 
-_log "wake (bridge) for ${SWARMBUS_ID:-?} from=${safe_from} subject=\"${safe_subject}\""
+_log "wake (bridge) for ${safe_id:-?} from=${safe_from} subject=\"${safe_subject}\""
 
 # `set -e` + `pipefail` would exit before we logged the failure. Disable
 # them around the pipeline so we always record the exit code and elapsed

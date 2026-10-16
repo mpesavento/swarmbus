@@ -47,10 +47,14 @@
 #
 # SECURITY.
 #   Envelope fields and body come from peer agents and are untrusted.
-#   Same rules as openclaw-wake.sh: we strip control chars and cap length
-#   on each envelope field before embedding into the prompt, and we
-#   explicitly label the section as "[UNTRUSTED PEER METADATA]" so the
-#   receiving model doesn't mistake peer text for system instruction.
+#   Same rules as openclaw-wake.sh: each envelope field goes through
+#   swarmbus.message.sanitize_field (or a byte-identical inline copy; if
+#   python3 is missing or fails, an ASCII-only shell fallback, logged once)
+#   and is capped in length before it is embedded into the prompt or the
+#   log, and we explicitly label the section as "[UNTRUSTED PEER METADATA]"
+#   so the receiving model doesn't mistake peer text for system instruction.
+#   The log directory is created 0700 and the log 0600 (umask 077; an
+#   existing directory or log is tightened).
 #   The body is framed exactly as `swarmbus read` frames it (see
 #   frame_body below): every line prefixed with "| " between the
 #   [UNTRUSTED PEER BODY ...] and [END UNTRUSTED PEER BODY] labels, with
@@ -66,30 +70,86 @@
 #   simultaneously interacting via a different shell.
 
 set -euo pipefail
+umask 077
 
 AGENT_ID="${1:?Usage: claude-code-wake.sh <agent-id>}"
 LOG_DIR="$HOME/.local/state/swarmbus-wake"
 mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR"
 LOG="$LOG_DIR/${AGENT_ID}.log"
+touch "$LOG"
+chmod 600 "$LOG"
 
 _log() {
   printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG"
 }
 
+# Envelope field sanitizer: swarmbus.message.sanitize_field when this python3
+# can import swarmbus, otherwise a byte-identical inline copy (every Cc, Cf,
+# Zl and Zp character becomes one space). Probed once, here at the top level;
+# if python3 is missing or fails, a shell fallback keeps printable ASCII only
+# (logged once). `sanitize VALUE MAX` caps the result at MAX characters.
+SANITIZE_PY=$(cat <<'PY'
+import sys, unicodedata
+try:
+    from swarmbus.message import sanitize_field
+except Exception:
+    def sanitize_field(value):
+        if value is None:
+            return ""
+        return "".join(
+            " " if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
+            for ch in str(value)
+        )
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stdout.write(sanitize_field(sys.argv[2])[: int(sys.argv[1])])
+PY
+)
+
+SANITIZE_IN_PYTHON=0
+if command -v python3 >/dev/null 2>&1 \
+   && python3 -I -c "$SANITIZE_PY" 1 x >/dev/null 2>>"$LOG" </dev/null; then
+  SANITIZE_IN_PYTHON=1
+else
+  _log "python3 unavailable; envelope fields sanitized in shell (non-ASCII dropped)"
+fi
+
+sanitize() {
+  # $1: raw value, $2: max length. stdout: one line, no trailing newline.
+  local max="${2:-200}" out
+  if [ "$SANITIZE_IN_PYTHON" = "1" ] \
+     && out=$(python3 -I -c "$SANITIZE_PY" "$max" "$1" 2>>"$LOG" </dev/null); then
+    printf '%s' "$out"
+    return 0
+  fi
+  printf '%s' "$1" \
+    | LC_ALL=C tr -d '\000-\010\013-\037\177-\377' \
+    | LC_ALL=C tr '\t\n' '  ' \
+    | head -c "$max"
+}
+
+PRIORITY="${SWARMBUS_PRIORITY:-normal}"
+safe_from=$(sanitize "${SWARMBUS_FROM:-?}" 64)
+safe_subject=$(sanitize "${SWARMBUS_SUBJECT:-?}" 200)
+safe_reply_to=$(sanitize "${SWARMBUS_REPLY_TO:-}" 64)
+safe_priority=$(sanitize "${PRIORITY}" 16)
+safe_id=$(sanitize "${SWARMBUS_ID:-}" 128)
+safe_hops=$(sanitize "${SWARMBUS_HOPS:-0}" 16)
+
 # Broadcast never wakes (any policy). Still archived by FileBridgeHandler.
 if [ "${SWARMBUS_TO:-}" = "broadcast" ]; then
-  _log "broadcast ${SWARMBUS_ID:-?} from=${SWARMBUS_FROM:-?}; archive-only (broadcast never wakes)"
+  _log "broadcast ${safe_id:-?} from=${safe_from}; archive-only (broadcast never wakes)"
   cat > /dev/null
   exit 0
 fi
 
 # Policy gate
 POLICY="${SWARMBUS_WAKE_POLICY:-priority-high}"
-PRIORITY="${SWARMBUS_PRIORITY:-normal}"
 
 case "$POLICY" in
   none)
-    _log "policy=none; dropping ${SWARMBUS_ID:-?} from=${SWARMBUS_FROM:-?}"
+    _log "policy=none; dropping ${safe_id:-?} from=${safe_from}"
     cat > /dev/null  # drain stdin so the daemon's subprocess.run completes
     exit 0
     ;;
@@ -97,7 +157,7 @@ case "$POLICY" in
     ;;  # wake unconditionally
   priority-high)
     if [ "$PRIORITY" != "high" ]; then
-      _log "policy=priority-high; priority=${PRIORITY}; archive-only"
+      _log "policy=priority-high; priority=${safe_priority}; archive-only"
       cat > /dev/null
       exit 0
     fi
@@ -136,21 +196,6 @@ else
   _log "tier3 TG push skipped: missing $TG_TOKEN_FILE or $TG_CHAT_FILE"
 fi
 
-sanitize() {
-  local max="${2:-200}"
-  printf '%s' "$1" \
-    | tr -d '\000-\010\013-\037\177' \
-    | tr '\n\r' '  ' \
-    | head -c "$max"
-}
-
-safe_from=$(sanitize "${SWARMBUS_FROM:-?}" 64)
-safe_subject=$(sanitize "${SWARMBUS_SUBJECT:-?}" 200)
-safe_reply_to=$(sanitize "${SWARMBUS_REPLY_TO:-}" 64)
-safe_priority=$(sanitize "${PRIORITY}" 16)
-safe_id=$(sanitize "${SWARMBUS_ID:-}" 64)
-safe_hops=$(sanitize "${SWARMBUS_HOPS:-0}" 16)
-
 # Body framing: the same frame_body() as `swarmbus read`, `swarmbus watch`
 # and the inbox file. The body goes between the two labels with every line
 # prefixed by "| " ("|" when empty) and every control character except tab
@@ -176,7 +221,7 @@ except Exception:
         framed = []
         for line in body.replace("\r\n", "\n").split("\n"):
             shown = "".join(
-                _esc(ch) if ch != "\t" and unicodedata.category(ch) in ("Cc", "Zl", "Zp") else ch
+                _esc(ch) if ch != "\t" and unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") else ch
                 for ch in line
             )
             framed.append("| " + shown if shown else "|")
@@ -268,7 +313,7 @@ else
   exit 1
 fi
 
-_log "wake spawning for ${SWARMBUS_ID:-?} from=${safe_from} subject=\"${safe_subject}\""
+_log "wake spawning for ${safe_id:-?} from=${safe_from} subject=\"${safe_subject}\""
 
 # Pipe the prompt to claude --print so the model sees it as a user turn.
 # bypassPermissions because we're running unattended; the wake turn's own
