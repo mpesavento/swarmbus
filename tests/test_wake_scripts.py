@@ -584,3 +584,11 @@ def test_wake_telegram_push_is_throttled_per_agent(tmp_path, script, agent_id, s
         assert not any(a.endswith("more)") for a in _args(bin_dir, "curl"))
         assert last.read_text().split()[1] == "0"
     assert stat.S_IMODE(last.stat().st_mode) == 0o600
+
+
+def test_openclaw_bridge_sanitizes_the_run_label():
+    """Source pin: node is not in the harness image, so the bridge cannot run here."""
+    text = (EXAMPLES / "openclaw-bridge.mjs").read_text()
+    assert "params.label = `swarmbus: ${subject}`.slice(0, 128);" not in text
+    assert ".replace(/[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]/gu, \" \")" in text
+    assert "Array.from(`swarmbus: ${subject}`).slice(0, 128)" in text
