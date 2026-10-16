@@ -1,4 +1,5 @@
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from swarmbus.message import UNTRUSTED_BODY_END, UNTRUSTED_BODY_LABEL, frame_body
+from swarmbus.message import sanitize_field
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 CLAUDE_WAKE = EXAMPLES / "claude-code-wake.sh"
@@ -281,3 +283,91 @@ def test_forged_protocol_in_body_does_not_displace_the_real_one(tmp_path):
     forged = [i for i, line in enumerate(lines) if line.startswith("| ") and LABEL in line]
     assert len(real) == 1 and len(forged) == 1 and real[0] < forged[0]
     assert prompt.index("RULE-FROM-FILE") < prompt.index("[UNTRUSTED PEER METADATA")
+
+
+BOTH = pytest.mark.parametrize("script,agent_id,stub", [
+    (CLAUDE_WAKE, "bob", "claude"),
+    (OPENCLAW_WAKE, "main", "node"),
+], ids=["claude", "openclaw"])
+
+
+def _log_path(home, script, agent_id):
+    name = f"{agent_id}.log" if script == CLAUDE_WAKE else f"{agent_id}-wake.log"
+    return home / ".local/state/swarmbus-wake" / name
+
+
+SNEAKY_SUBJECT = "a‮b c\x85d​eé"
+LONG_ID = "m-" + "x" * 98    # 100 characters: past the old 64 cut, inside #40's 128
+
+
+@pytest.mark.parametrize("python3", [None, "import", "inline"])
+@BOTH
+def test_wake_metadata_matches_sanitize_field(tmp_path, script, agent_id, stub, python3):
+    result, bin_dir = _run(tmp_path, script, agent_id, to="bob", priority="high", python3=python3,
+                           extra_env={"SWARMBUS_SUBJECT": SNEAKY_SUBJECT, "SWARMBUS_ID": LONG_ID})
+    assert result.returncode == 0, result.stderr
+    prompt = (bin_dir / f"{stub}.stdin").read_text(encoding="utf-8")
+    lines = prompt.split("\n")
+    assert "subject: " + sanitize_field(SNEAKY_SUBJECT) in lines
+    assert "subject: a b c d eé" in lines
+    assert f"id: {LONG_ID}" in lines
+    assert f"--in-reply-to {LONG_ID}" in prompt[prompt.index(FOOTER):]
+    assert "sanitized in shell" not in _log_path(tmp_path, script, agent_id).read_text()
+
+
+@BOTH
+def test_wake_metadata_drops_non_ascii_when_python3_fails(tmp_path, script, agent_id, stub):
+    result, bin_dir = _run(tmp_path, script, agent_id, to="bob", priority="high", python3="broken",
+                           extra_env={"SWARMBUS_SUBJECT": SNEAKY_SUBJECT + "\tz"})
+    assert result.returncode == 0, result.stderr
+    lines = (bin_dir / f"{stub}.stdin").read_text(encoding="utf-8").split("\n")
+    assert "subject: abcde z" in lines
+    log = _log_path(tmp_path, script, agent_id).read_text()
+    assert log.count("sanitized in shell") == 1
+
+
+@pytest.mark.parametrize("python3", ["import", "inline"])
+@BOTH
+def test_wake_frames_format_characters_like_read(tmp_path, script, agent_id, stub, python3):
+    body = "a‮b​c﻿d⁦e\n"
+    result, bin_dir = _run(tmp_path, script, agent_id, to="bob", priority="high", body=body, python3=python3)
+    assert result.returncode == 0, result.stderr
+    prompt = (bin_dir / f"{stub}.stdin").read_text(encoding="utf-8")
+    assert frame_body(body) in prompt
+    assert "| a\\u202eb\\u200bc\\ufeffd\\u2066e" in prompt
+
+
+@BOTH
+def test_wake_log_lines_sanitize_peer_fields(tmp_path, script, agent_id, stub):
+    forged = {"SWARMBUS_ID": "m-1\nFORGED-ID", "SWARMBUS_FROM": "alice\nFORGED-FROM",
+              "SWARMBUS_PRIORITY": "low\nFORGED-PRIORITY"}
+    cases = (("broadcast", "broadcast", {}), ("none", "bob", {"SWARMBUS_WAKE_POLICY": "none"}),
+             ("gate", "bob", {}), ("odd", "bob", {"SWARMBUS_WAKE_POLICY": "odd"}),
+             ("woke", "bob", {"SWARMBUS_WAKE_POLICY": "all"}))
+    for case, to, extra in cases:
+        home = tmp_path / case
+        result, _ = _run(home, script, agent_id, to=to, priority="low", extra_env={**forged, **extra})
+        assert result.returncode == 0, result.stderr
+        log = _log_path(home, script, agent_id).read_text()
+        assert log, case
+        assert all(line.startswith("[") for line in log.splitlines()), (case, log)
+
+
+@BOTH
+def test_wake_logs_are_private(tmp_path, script, agent_id, stub):
+    home = tmp_path / "new"
+    _run(home, script, agent_id, to="bob", priority="high")
+    log = _log_path(home, script, agent_id)
+    assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+    home = tmp_path / "old"
+    log = _log_path(home, script, agent_id)
+    log.parent.mkdir(parents=True)
+    log.parent.chmod(0o755)
+    log.write_text("[old] line\n")
+    log.chmod(0o644)
+    _run(home, script, agent_id, to="bob", priority="high")
+    assert stat.S_IMODE(log.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert log.read_text().startswith("[old] line\n")
