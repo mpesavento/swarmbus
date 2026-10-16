@@ -276,7 +276,9 @@ class SQLiteMessageStore:
                 "reply_to": row["reply_to"],
             },
         )
-        return message.model_dump(by_alias=True, mode="json")
+        row = message.model_dump(by_alias=True, mode="json")
+        row["untrusted"] = True
+        return row
 
     @staticmethod
     def _quarantine_error(exc: ValidationError) -> str:

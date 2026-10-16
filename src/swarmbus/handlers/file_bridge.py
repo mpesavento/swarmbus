@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 from .base import BaseHandler
-from ..message import AgentMessage
+from ..message import AgentMessage, frame_body, sanitize_field
 
 
 class FileBridgeHandler(BaseHandler):
@@ -13,8 +13,8 @@ class FileBridgeHandler(BaseHandler):
     async def handle(self, msg: AgentMessage) -> None:
         entry = (
             f"\n## [{msg.ts.strftime('%Y-%m-%d %H:%M')}] "
-            f"From: {msg.from_agent} | {msg.subject}\n"
-            f"{msg.body}\n"
+            f"From: {sanitize_field(msg.from_agent)} | {sanitize_field(msg.subject)}\n"
+            f"{frame_body(msg.body)}\n"
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._append, entry)

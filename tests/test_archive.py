@@ -396,3 +396,17 @@ async def test_read_quarantines_invalid_row_and_continues(db_path, msg):
         assert msg.body not in row[3]
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_message_store_rows_are_marked_untrusted(db_path, msg):
+    store = SQLiteMessageStore(db_path)
+    await store.open()
+    try:
+        await store.store(msg, source_topic="agents/sparrow/inbox")
+        rows = await store.read()
+        assert rows[0]["untrusted"] is True
+        assert rows[0]["body"] == msg.body
+        assert rows[0]["subject"] == msg.subject
+    finally:
+        await store.close()
