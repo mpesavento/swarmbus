@@ -11,9 +11,14 @@ from typing import Any
 
 import aiomqtt
 
-from .archive import SQLiteMessageStore
+from .archive import MessageConflictError, SQLiteMessageStore
 from .bus import _build_tls_context
-from .message import DEFAULT_HOP_LIMIT, AgentMessage, _validate_registered_agent_id
+from .message import (
+    DEFAULT_HOP_LIMIT,
+    AgentMessage,
+    _validate_registered_agent_id,
+    sanitize_field,
+)
 from .topics import DEFAULT_TOPICS
 
 logger = logging.getLogger(__name__)
@@ -404,7 +409,7 @@ class ManagedMCPRuntime:
         backoff = 1.0
         while not self._stopping.is_set():
             try:
-                inserted = await self.store.store(
+                inserted = await self._commit_inbox_message(
                     message,
                     source_topic=source_topic,
                 )
@@ -427,6 +432,33 @@ class ManagedMCPRuntime:
                 self._state = RuntimeState.CONNECTED
                 return inserted
         raise asyncio.CancelledError
+
+    async def _commit_inbox_message(
+        self,
+        message: AgentMessage,
+        *,
+        source_topic: str,
+    ) -> bool:
+        """Commit one envelope; a reused id is recorded and dropped, not fatal.
+
+        A peer can send two different envelopes under one ``id``. The first
+        one is already in the inbox and stays there; the second is written to
+        ``inbox_message_conflicts`` and reported as not inserted, so the caller
+        acknowledges it and the broker does not redeliver it. A byte-identical
+        redelivery still returns False from ``store`` without raising.
+        """
+        try:
+            return await self.store.store(message, source_topic=source_topic)
+        except MessageConflictError:
+            await self.store.record_conflict(message, source_topic=source_topic)
+            logger.warning(
+                "discarding message %s from %s: its id is already bound to a "
+                "different envelope; the rejected envelope is recorded in "
+                "inbox_message_conflicts",
+                sanitize_field(message.id),
+                sanitize_field(message.from_agent),
+            )
+            return False
 
     async def _handle_message(
         self,
