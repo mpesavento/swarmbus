@@ -16,6 +16,19 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- Docs: the README no longer tells users to set `message_rate_limit` (mosquitto has no such option and refuses to start with it); it lists the queue and size caps mosquitto does have and points at #26 for rate limits. `docs/security.md` gains a single-box setup with one mosquitto login per agent id and an ACL file that limits each login to its own inbox and presence plus broadcast, and says what that does not stop. (#30)
+
+### Wire-compat
+1. **Envelope shape — no change.**
+2. **Topic layout — no change.**
+3. **Retain/QoS defaults — no change.**
+4. **MCP tool contract — no change.**
+
+---
+
 ## [0.2.0] — 2026-10-14
 
 ### Added

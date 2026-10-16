@@ -402,7 +402,7 @@ swarmbus start --agent-id laptop-cc --broker mqtt.example.com --port 8883 \
   --inbox ~/sync/laptop-cc-inbox.md
 ```
 
-For the full reference — env-var table, systemd unit example, working broker config for both **Mosquitto** and **EMQX**, and the threat model — see [docs/security.md](docs/security.md).
+For the full reference (env-var table, systemd unit example, and per-agent logins with topic permissions on a single Mosquitto broker), see [docs/security.md](docs/security.md).
 
 ## Troubleshooting
 
@@ -424,19 +424,22 @@ Symptoms we hit during real deployment and the first thing to check. In every ca
 
 For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journalctl --user -u swarmbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
 
-### Rate limiting (broker-side)
+### Broker limits
 
-swarmbus itself has no built-in rate limiter — the right place to enforce limits is the MQTT broker, which applies them to all clients regardless of library. Add to your `mosquitto.conf` (or a file in `/etc/mosquitto/conf.d/`):
+swarmbus has no rate limiter of its own, and mosquitto has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps, set in `mosquitto.conf` or a file in `/etc/mosquitto/conf.d/`:
 
 ```
-# Max messages per second any single client can publish (0 = unlimited)
-message_rate_limit 50
-
-# Max queued messages for a subscriber before the broker starts dropping
+# QoS 1/2 messages queued per client beyond those in flight (default 1000; 0 = no cap)
 max_queued_messages 1000
+# Byte cap on the same queue (default 0 = no cap). Whichever limit is hit first applies.
+max_queued_bytes 0
+# QoS 1/2 messages in flight per client (default 20)
+max_inflight_messages 20
+# Largest packet the broker accepts, in bytes (default 2000000 since mosquitto 2.1)
+max_packet_size 2000000
 ```
 
-Restart mosquitto after changing: `sudo systemctl restart mosquitto`. Library-level rate limiting is on the roadmap for a future release.
+Messages over a queue cap are dropped by the broker. Restart mosquitto after changing: `sudo systemctl restart mosquitto`. A per-client publish-rate limit needs a mosquitto plugin or a broker that supports it natively; [#26](https://github.com/mpesavento/swarmbus/issues/26) tracks that.
 
 ## Onboarding a new agent
 
