@@ -186,7 +186,7 @@ swarmbus start \
   --invoke "$(pwd)/examples/claude-code-wake.sh <me>"
 ```
 
-Defaults to "wake only on priority=high" — spawning a fresh Claude Code session bootstraps ~100k tokens, so invoking on every message rapidly burns money on broadcast/heartbeat traffic. Low-priority messages still get archived by the file bridge; they're picked up on the next operator-initiated turn. Override with `SWARMBUS_WAKE_POLICY=all` for dev/testing, `=none` to disable spawning. Wake output logs to `~/.local/state/swarmbus-wake/<agent-id>.log`.
+Defaults to "wake only on priority=high" — spawning a fresh Claude Code session bootstraps ~100k tokens, so invoking on every message rapidly burns money on broadcast/heartbeat traffic. Low-priority messages still get archived by the file bridge; they're picked up on the next operator-initiated turn. Override with `SWARMBUS_WAKE_POLICY=all` for dev/testing, `=none` to disable spawning. A broadcast never wakes, under any policy (the daemon still archives it). The receiver's own standing rules, from `~/.swarmbus/receive-protocol-<agent-id>.md` (or `$SWARMBUS_RECEIVE_PROTOCOL`), go at the top of the wake prompt, labelled as trusted, ahead of the untrusted peer sections; see `examples/receive-protocol-example.md`. Wake output logs to `~/.local/state/swarmbus-wake/<agent-id>.log`.
 
 ### 2. OpenClaw — skill + listener daemon
 
@@ -200,7 +200,7 @@ bash scripts/setup-openclaw-plugin.sh coder localhost
 
 This copies the skill to `~/.openclaw/skills/using-swarmbus/` and prints the `swarmbus start` command you need to run (typically under byobu or systemd-user). From then on, the OpenClaw agent uses `swarmbus send` / `swarmbus read` / `swarmbus list` via its shell tool.
 
-**For reactive wake-up** (message arrives → OpenClaw agent takes a real turn, no polling), combine the listener daemon with `examples/openclaw-wake.sh`:
+**For reactive wake-up** (message arrives → OpenClaw agent takes a real turn on `priority=high` by default, no polling; override with `SWARMBUS_WAKE_POLICY=all` or `=none`; a broadcast never wakes), combine the listener daemon with `examples/openclaw-wake.sh`:
 
 ```bash
 swarmbus start \
@@ -209,7 +209,7 @@ swarmbus start \
   --invoke "$(pwd)/examples/openclaw-wake.sh main"
 ```
 
-The `--inbox` half persists every message to a file (durability). The `--invoke` half dispatches the prompt directly to the OpenClaw gateway over its WebSocket protocol — ~0.8 s of dispatch overhead on a Raspberry Pi 5, vs ~24 s for the legacy CLI cold-start. Set `OPENCLAW_WAKE_USE_CLI=1` to fall back to the legacy `openclaw agent --message` path on hosts without a running gateway daemon. See [docs/openclaw-wake.md](docs/openclaw-wake.md) for the full design and troubleshooting.
+The `--inbox` half persists every message to a file (durability). The `--invoke` half wakes on `priority=high` only by default (`SWARMBUS_WAKE_POLICY=all`/`none` to change it, never on broadcast) and dispatches the prompt directly to the OpenClaw gateway over its WebSocket protocol — ~0.8 s of dispatch overhead on a Raspberry Pi 5, vs ~24 s for the legacy CLI cold-start. Set `OPENCLAW_WAKE_USE_CLI=1` to fall back to the legacy `openclaw agent --message` path on hosts without a running gateway daemon. See [docs/openclaw-wake.md](docs/openclaw-wake.md) for the full design and troubleshooting.
 
 Also set `SWARMBUS_OUTBOX=~/sync/coder-outbox.md` in the OpenClaw agent's shell env so every `swarmbus send` from that agent archives outbound messages symmetrically with the inbox file. See [docs/notification-patterns.md](docs/notification-patterns.md) for the full archive + user-notification protocol.
 
@@ -408,7 +408,7 @@ swarmbus start --agent-id laptop-cc --broker mqtt.example.com --port 8883 \
   --inbox ~/sync/laptop-cc-inbox.md
 ```
 
-For the full reference — env-var table, systemd unit example, working broker config for both **Mosquitto** and **EMQX**, and the threat model — see [docs/security.md](docs/security.md).
+For the full reference (env-var table, systemd unit example, and per-agent logins with topic permissions on a single Mosquitto broker), see [docs/security.md](docs/security.md).
 
 ## Troubleshooting
 
@@ -430,19 +430,22 @@ Symptoms we hit during real deployment and the first thing to check. In every ca
 
 For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journalctl --user -u swarmbus-<agent>.service -f`, and the daemon's own structured startup line (from `0.1.0`+) which names version, broker, invoke, and outbox env at the top of every boot.
 
-### Rate limiting (broker-side)
+### Broker limits
 
-swarmbus itself has no built-in rate limiter — the right place to enforce limits is the MQTT broker, which applies them to all clients regardless of library. Add to your `mosquitto.conf` (or a file in `/etc/mosquitto/conf.d/`):
+swarmbus has no rate limiter of its own, and mosquitto has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps, set in `mosquitto.conf` or a file in `/etc/mosquitto/conf.d/`:
 
 ```
-# Max messages per second any single client can publish (0 = unlimited)
-message_rate_limit 50
-
-# Max queued messages for a subscriber before the broker starts dropping
+# QoS 1/2 messages queued per client beyond those in flight (default 1000; 0 = no cap)
 max_queued_messages 1000
+# Byte cap on the same queue (default 0 = no cap). Whichever limit is hit first applies.
+max_queued_bytes 0
+# QoS 1/2 messages in flight per client (default 20)
+max_inflight_messages 20
+# Largest packet the broker accepts, in bytes (default 2000000 since mosquitto 2.1)
+max_packet_size 2000000
 ```
 
-Restart mosquitto after changing: `sudo systemctl restart mosquitto`. Library-level rate limiting is on the roadmap for a future release.
+Messages over a queue cap are dropped by the broker. Restart mosquitto after changing: `sudo systemctl restart mosquitto`. A per-client publish-rate limit needs a mosquitto plugin or a broker that supports it natively; [#26](https://github.com/mpesavento/swarmbus/issues/26) tracks that.
 
 ## Onboarding a new agent
 
