@@ -21,6 +21,8 @@ from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHand
 from .handlers.persistent import PersistentListenerHandler
 from .message import (
     DEFAULT_HOP_LIMIT,
+    DEFAULT_RATE_COOLDOWN,
+    DEFAULT_RATE_LIMIT,
     UNTRUSTED_METADATA_LABEL,
     _validate_agent_id,
     frame_body,
@@ -114,6 +116,29 @@ def _hop_limit_option(func):
     )(func)
 
 
+def _rate_limit_options(func):
+    func = click.option(
+        "--rate-cooldown",
+        type=click.FloatRange(min=0),
+        default=DEFAULT_RATE_COOLDOWN,
+        envvar="SWARMBUS_RATE_COOLDOWN",
+        show_default=True,
+        help="Seconds a sender that went over --rate-limit stays held. "
+             "[env: SWARMBUS_RATE_COOLDOWN]",
+    )(func)
+    return click.option(
+        "--rate-limit",
+        type=click.IntRange(min=0),
+        default=DEFAULT_RATE_LIMIT,
+        envvar="SWARMBUS_RATE_LIMIT",
+        show_default=True,
+        help="Most messages one sender may deliver per 60 s on each topic (its "
+             "inbox, broadcast). A sender that goes over is held for "
+             "--rate-cooldown seconds, then admitted again on its own. 0 turns "
+             "it off. [env: SWARMBUS_RATE_LIMIT]",
+    )(func)
+
+
 def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
     """Resolve the outbox path with this precedence:
 
@@ -181,6 +206,13 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
          "agent's state db. Defaults to $SWARMBUS_ID when run inside a "
          "swarmbus wake.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Send even when this message's hops are past --hop-limit; the "
+         "receiver will hold it and trip you.",
+)
+@_hop_limit_option
 @_state_dir_option
 @_broker_auth_options
 @click.pass_context
@@ -198,6 +230,8 @@ def send(
     reply_to: str | None,
     outbox: str | None,
     in_reply_to: str | None,
+    force: bool,
+    hop_limit: int,
     state_dir: str,
     username: str | None,
     password: str | None,
@@ -216,6 +250,10 @@ def send(
     swarmbus send --agent-id planner --to coder --subject report --body-file report.md
     swarmbus send --agent-id planner --to coder --subject report --body-file -
     cat report.md | swarmbus send --agent-id planner --to coder --subject report --body-file -
+
+    Exit 0 when sent; 2 on a usage, state db or broker error; 3, sending
+    nothing, when this message's hops would be past --hop-limit (the
+    receiver would hold it and trip you; --force sends it anyway).
     """
     if body is not None and body_file is not None:
         raise click.UsageError("--body and --body-file are mutually exclusive")
@@ -265,6 +303,22 @@ def send(
         hops = 1 + max(known)
     else:
         hops = 1 if parent_id else 0
+
+    if hops > hop_limit:
+        if not force:
+            click.echo(
+                f"[swarmbus] not sent: this message would be hops {hops}, past the "
+                f"hop limit {hop_limit}; the receiver would hold it and every later "
+                "message from you. Stop replying and tell your operator. "
+                "(--force sends it anyway.)",
+                err=True,
+            )
+            sys.exit(3)
+        click.echo(
+            f"[swarmbus] warning: sending hops {hops}, past the hop limit "
+            f"{hop_limit} (--force)",
+            err=True,
+        )
 
     if local is not None:
         origin = local["origin"] or local["from"]
@@ -317,6 +371,7 @@ def send(
 )
 @_state_dir_option
 @_hop_limit_option
+@_rate_limit_options
 @_broker_auth_options
 def start(
     agent_id: str,
@@ -328,6 +383,8 @@ def start(
     persistent: bool,
     state_dir: str,
     hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -350,7 +407,12 @@ def start(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
+        hold_store=SQLiteMessageStore(
+            holds_db,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+        ),
     )
 
     if inbox:
@@ -375,6 +437,10 @@ def start(
     if invoke_cmd:
         click.echo(f"  invoke t/o:  {f'{invoke_timeout:g}s' if invoke_timeout else 'none'}")
     click.echo(f"  hop limit:   {hop_limit}")
+    if rate_limit:
+        click.echo(f"  rate limit:  {rate_limit}/60s, cool-down {rate_cooldown:g}s")
+    else:
+        click.echo("  rate limit:  off")
     click.echo(f"  holds:       {holds_db}")
     scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
     outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX") or "(unset)"
@@ -471,6 +537,7 @@ def read(
 )
 @_state_dir_option
 @_hop_limit_option
+@_rate_limit_options
 @_broker_auth_options
 def watch(
     agent_id: str,
@@ -481,6 +548,8 @@ def watch(
     persistent: bool,
     state_dir: str,
     hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -497,8 +566,9 @@ def watch(
     running for the same agent-id, the two will race for each incoming
     message — use one mechanism per id at a time.
 
-    Messages past the hop limit are held and skipped; a timeout where only
-    held messages arrived still exits 1.
+    Messages past the hop limit, or from a sender held by the rate limit,
+    are held and skipped; a timeout where only held messages arrived still
+    exits 1.
 
     Exit 0 on message, exit 1 on timeout, exit 2 on broker or state db
     error. Use in shell pipelines when you want to wait for a specific
@@ -520,7 +590,12 @@ def watch(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
+        hold_store=SQLiteMessageStore(
+            holds_db,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+        ),
     )
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
@@ -1094,6 +1169,7 @@ def _detect_agent_id() -> str:
     help="Directory for the durable SQLite inbox. [env: SWARMBUS_STATE_DIR]",
 )
 @_hop_limit_option
+@_rate_limit_options
 @_broker_auth_options
 def mcp_server(
     agent_id: str,
@@ -1103,6 +1179,8 @@ def mcp_server(
     presence: bool,
     state_dir: str,
     hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1120,6 +1198,8 @@ def mcp_server(
         presence=presence,
         state_dir=state_dir,
         hop_limit=hop_limit,
+        rate_limit=rate_limit,
+        rate_cooldown=rate_cooldown,
         username=username,
         password=password,
         tls=tls,
@@ -1137,7 +1217,7 @@ def mcp_server(
     "--reset",
     "reset_sender",
     default=None,
-    help="Clear the trip for this sender so its new messages are admitted again.",
+    help="Clear the trip or cool-down for this sender so its new messages are admitted again.",
 )
 @click.option("--reset-all", is_flag=True, help="Clear every trip.")
 def held(
@@ -1147,11 +1227,12 @@ def held(
     reset_sender: str | None,
     reset_all: bool,
 ) -> None:
-    """List senders tripped by the hop limit and the held messages, or clear a trip.
+    """List senders tripped by the hop limit or cooling off after the rate limit, and the held messages, or clear a trip or cool-down.
 
-    This is for a person, not an agent. Held messages stay held after a
-    reset; only new messages from that sender are admitted again. A running
-    daemon, sidecar or watch picks the reset up without a restart.
+    This is for a person, not an agent. A rate-limit cool-down ends on its
+    own; a hop-limit trip stays until a person resets it. Held messages stay
+    held either way; only new messages from that sender are admitted again.
+    A running daemon, sidecar or watch picks the reset up without a restart.
 
     \b
     swarmbus held --agent-id planner
@@ -1169,7 +1250,7 @@ def held(
     db = _state_db_path(state_dir, agent_id)
     if not db.exists():
         if reset_sender is not None:
-            click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped")
+            click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped or cooling")
             sys.exit(1)
         if reset_all:
             click.echo("[swarmbus] reset 0 trip(s)")
@@ -1179,6 +1260,7 @@ def held(
                 json.dumps(
                     {
                         "tripped": [],
+                        "cooling": [],
                         "held_count": 0,
                         "held": [],
                         "held_by_sender": [],
@@ -1208,7 +1290,7 @@ def held(
         if count:
             click.echo(f"[swarmbus] reset {sanitize_field(reset_sender)}")
             return
-        click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped")
+        click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped or cooling")
         sys.exit(1)
     if reset_all:
         click.echo(f"[swarmbus] reset {count} trip(s)")
@@ -1217,13 +1299,18 @@ def held(
     if as_json:
         click.echo(json.dumps(holds, indent=2))
         return
-    if not holds["tripped"] and not holds["held_count"]:
+    if not holds["tripped"] and not holds["cooling"] and not holds["held_count"]:
         click.echo(f"[swarmbus] {agent_id}: no holds")
     else:
         for t in holds["tripped"]:
             click.echo(
                 f"tripped: {sanitize_field(t['sender'])} at {sanitize_field(t['tripped_at'])} "
                 f"by message {sanitize_field(t['message_id'])}"
+            )
+        for c in holds["cooling"]:
+            click.echo(
+                f"cooling: {sanitize_field(c['sender'])} until {sanitize_field(c['until'])} "
+                f"by message {sanitize_field(c['message_id'])}"
             )
         for h in holds["held"]:
             click.echo(

@@ -15,6 +15,8 @@ from .archive import MessageConflictError, SQLiteMessageStore
 from .bus import MAX_QUEUED_INCOMING_MESSAGES, _build_tls_context
 from .message import (
     DEFAULT_HOP_LIMIT,
+    DEFAULT_RATE_COOLDOWN,
+    DEFAULT_RATE_LIMIT,
     AgentMessage,
     _validate_registered_agent_id,
     sanitize_field,
@@ -108,6 +110,8 @@ class ManagedMCPRuntime:
         client_key: str | None = None,
         store: SQLiteMessageStore | Any | None = None,
         hop_limit: int = DEFAULT_HOP_LIMIT,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -123,7 +127,12 @@ class ManagedMCPRuntime:
             client_cert=client_cert,
             client_key=client_key,
         )
-        self.store = store or SQLiteMessageStore(state_path, hop_limit=hop_limit)
+        self.store = store or SQLiteMessageStore(
+            state_path,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+        )
         self.topics = DEFAULT_TOPICS
         self._online_agents: set[str] = set()
         self._client: aiomqtt.Client | None = None
