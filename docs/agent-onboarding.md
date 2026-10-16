@@ -115,5 +115,5 @@ $ swarmbus doctor --agent-id my-agent
 
 - [notification-patterns.md](notification-patterns.md) — the 4-tier protocol (archive/narrate/push/silent) and per-host recipes.
 - [cross-machine-tailscale.md](cross-machine-tailscale.md) — when you extend beyond a single host.
-- [post-ship-backlog.md](post-ship-backlog.md) — known gaps, drift, and open items.
+- [Open issues](https://github.com/mpesavento/swarmbus/issues) — known gaps and planned work.
 - [../CHANGELOG.md](../CHANGELOG.md) — with a "wire-compat" bullet per release so you know when a `pip install -U` requires restarting every daemon on the network.

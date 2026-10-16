@@ -93,7 +93,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - `scripts/setup-openclaw-plugin.sh` — install the `using-swarmbus` skill into `~/.openclaw/skills/` and print byobu/systemd-user startup hints.
 - `docs/cross-machine-tailscale.md` — full walkthrough for Tailscale-based multi-host deployments (topology, verification, security model, failure modes, 7-item preflight).
 - `docs/notification-patterns.md` — 4-tier notification protocol (archive always, narrate when mid-chat, push on priority=high, silent otherwise) with per-agent-system recipes.
-- `docs/post-ship-backlog.md` — living ledger of gaps / drift / follow-ups found after initial deployment.
+- `docs/post-ship-backlog.md` — living ledger of gaps / drift / follow-ups found after initial deployment. (Removed 2026-10-16; its open items live in GitHub issues.)
 
 ### Changed
 - **[breaking for pre-this-release daemons]** `AgentMessage.priority` is now a bare `str`, not `Literal["normal", "urgent"]`. Unknown values pass through rather than raising a pydantic `ValidationError`. See Wire-compat below.
@@ -154,7 +154,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ## [v0.1.0] — 2026-04-14 (initial)
 
-First functional release as described in `docs/superpowers/specs/2026-04-14-swarmbus-design.md` and `docs/superpowers/plans/2026-04-14-swarmbus-build.md`. Peer-symmetric pub/sub over mosquitto, no orchestrator, `send` / `listen` / `mcp-server` / `start` CLI, `FileBridgeHandler` / `DirectInvocationHandler` / `PersistentListenerHandler` / `SQLiteArchive` handlers, MCP sidecar with 4 tools.
+First functional release as described in the original design spec and build plan (under `docs/superpowers/` until 2026-10-16; see git history). Peer-symmetric pub/sub over mosquitto, no orchestrator, `send` / `listen` / `mcp-server` / `start` CLI, `FileBridgeHandler` / `DirectInvocationHandler` / `PersistentListenerHandler` / `SQLiteArchive` handlers, MCP sidecar with 4 tools.
 
 ### Wire-compat
 Baseline release — nothing to be compatible with.
