@@ -7,15 +7,24 @@ import json
 import logging
 import os
 import stat
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional
 
 import aiosqlite
 from pydantic import ValidationError
 
 from .handlers.base import BaseHandler
-from .message import DEFAULT_HOP_LIMIT, AgentMessage, sanitize_field
+from .message import (
+    DEFAULT_HOP_LIMIT,
+    DEFAULT_RATE_COOLDOWN,
+    DEFAULT_RATE_LIMIT,
+    RATE_WINDOW,
+    AgentMessage,
+    sanitize_field,
+)
+from .topics import BROADCAST_TOPIC
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +93,7 @@ CREATE TABLE IF NOT EXISTS held_messages (
     id           TEXT PRIMARY KEY,
     from_agent   TEXT NOT NULL,
     hops         INTEGER NOT NULL,
-    reason       TEXT NOT NULL,      -- 'hop-limit' | 'sender-tripped'
+    reason       TEXT NOT NULL,      -- 'hop-limit' | 'sender-tripped' | 'rate-limit'
     source_topic TEXT NOT NULL,
     held_at      TEXT NOT NULL,
     envelope     TEXT NOT NULL,      -- msg.to_json(), or a stub without the body
@@ -108,6 +117,25 @@ CREATE TABLE IF NOT EXISTS admitted_messages (
     origin     TEXT,
     seen_at    TEXT NOT NULL,
     envelope_sha256 TEXT             -- NULL only on rows migrated from v1
+)
+"""
+
+_CREATE_RATE_BUCKETS_TABLE = """
+CREATE TABLE IF NOT EXISTS rate_buckets (
+    sender       TEXT NOT NULL,
+    source_topic TEXT NOT NULL,     -- one bucket per (sender, topic it arrived on)
+    tokens       REAL NOT NULL,
+    updated_at   REAL NOT NULL,     -- epoch seconds from self._clock()
+    PRIMARY KEY (sender, source_topic)
+)
+"""
+
+_CREATE_RATE_HOLDS_TABLE = """
+CREATE TABLE IF NOT EXISTS rate_holds (
+    sender      TEXT PRIMARY KEY,
+    held_until  REAL NOT NULL,      -- epoch seconds
+    held_at     TEXT NOT NULL,      -- ISO UTC
+    message_id  TEXT NOT NULL       -- the message that went over
 )
 """
 
@@ -147,10 +175,20 @@ class SQLiteMessageStore:
         *,
         managed: bool = True,
         hop_limit: int = DEFAULT_HOP_LIMIT,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if hop_limit < 0:
             raise ValueError("hop_limit must not be negative")
+        if rate_limit < 0:
+            raise ValueError("rate_limit must not be negative")
+        if rate_cooldown < 0:
+            raise ValueError("rate_cooldown must not be negative")
         self.hop_limit = hop_limit
+        self.rate_limit = rate_limit
+        self.rate_cooldown = rate_cooldown
+        self._clock = clock
         self.db_path = Path(db_path).expanduser()
         self._managed = managed
         self._open_lock = asyncio.Lock()
@@ -314,6 +352,8 @@ class SQLiteMessageStore:
                     await db.execute(_CREATE_HELD_TABLE)
                     await db.execute(_CREATE_TRIPS_TABLE)
                     await db.execute(_CREATE_ADMITTED_TABLE)
+                    await db.execute(_CREATE_RATE_BUCKETS_TABLE)
+                    await db.execute(_CREATE_RATE_HOLDS_TABLE)
                     if holds_version == 1:
                         await self._migrate_holds_v1(db)
                     await db.execute(
@@ -377,7 +417,7 @@ class SQLiteMessageStore:
 
     async def _prune_admitted(self, db: aiosqlite.Connection) -> None:
         cutoff = (
-            datetime.now(timezone.utc)
+            datetime.fromtimestamp(self._clock(), timezone.utc)
             - timedelta(days=self.ADMITTED_RETENTION_DAYS)
         ).isoformat()
         await db.execute(
@@ -432,7 +472,9 @@ class SQLiteMessageStore:
         source_topic: str,
     ) -> bool:
         """Decide admission on a connection whose transaction is already open."""
-        now = datetime.now(timezone.utc).isoformat()
+        now_ts = self._clock()
+        now = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
+        broadcast = source_topic == BROADCAST_TOPIC
         hops = min(msg.hops, _SQLITE_MAX_INTEGER)
         sha = hashlib.sha256(msg.to_json().encode("utf-8")).hexdigest()
 
@@ -452,8 +494,13 @@ class SQLiteMessageStore:
         ) as cursor:
             tripped = await cursor.fetchone() is not None
         if tripped:
-            await self._hold_tripped_sender_message(
-                db, msg, hops=hops, source_topic=source_topic, now=now
+            await self._hold_sender_message(
+                db,
+                msg,
+                reason="sender-tripped",
+                hops=hops,
+                source_topic=source_topic,
+                now=now,
             )
             await self._cap_held(db)
             logger.debug(
@@ -488,6 +535,26 @@ class SQLiteMessageStore:
                     sanitize_field(msg.id),
                     sanitize_field(msg.from_agent),
                 )
+            return False
+
+        if msg.hops > self.hop_limit and broadcast:
+            await self._hold_sender_message(
+                db,
+                msg,
+                reason="hop-limit",
+                hops=hops,
+                source_topic=source_topic,
+                now=now,
+            )
+            await self._cap_held(db)
+            logger.warning(
+                "holding broadcast %s from %s: hops=%s is past the hop "
+                "limit %s; a broadcast never trips its sender",
+                sanitize_field(msg.id),
+                sanitize_field(msg.from_agent),
+                msg.hops,
+                self.hop_limit,
+            )
             return False
 
         if msg.hops > self.hop_limit:
@@ -528,6 +595,112 @@ class SQLiteMessageStore:
             )
             return False
 
+        if self.rate_limit > 0:
+            async with db.execute(
+                "SELECT held_until FROM rate_holds WHERE sender = ?",
+                (msg.from_agent,),
+            ) as cursor:
+                hold_row = await cursor.fetchone()
+            if hold_row is not None:
+                held_until = hold_row[0]
+                if now_ts < held_until:
+                    if held_until - now_ts > self.rate_cooldown:
+                        # The clock jumped back: never hold past one cool-down.
+                        await db.execute(
+                            "UPDATE rate_holds SET held_until = ? "
+                            "WHERE sender = ?",
+                            (now_ts + self.rate_cooldown, msg.from_agent),
+                        )
+                    await self._hold_sender_message(
+                        db,
+                        msg,
+                        reason="rate-limit",
+                        hops=hops,
+                        source_topic=source_topic,
+                        now=now,
+                    )
+                    await self._cap_held(db)
+                    logger.debug(
+                        "holding message %s from cooling sender %s",
+                        sanitize_field(msg.id),
+                        sanitize_field(msg.from_agent),
+                    )
+                    return False
+                await db.execute(
+                    "DELETE FROM rate_holds WHERE sender = ?",
+                    (msg.from_agent,),
+                )
+                await db.execute(
+                    "DELETE FROM rate_buckets WHERE sender = ?",
+                    (msg.from_agent,),
+                )
+
+            async with db.execute(
+                """SELECT tokens, updated_at FROM rate_buckets
+                   WHERE sender = ? AND source_topic = ?""",
+                (msg.from_agent, source_topic),
+            ) as cursor:
+                bucket_row = await cursor.fetchone()
+            tokens, updated_at = (
+                (float(self.rate_limit), now_ts)
+                if bucket_row is None
+                else (bucket_row[0], bucket_row[1])
+            )
+            elapsed = max(0.0, now_ts - updated_at)
+            tokens = min(
+                float(self.rate_limit),
+                tokens + elapsed * self.rate_limit / RATE_WINDOW,
+            )
+            admit = tokens >= 1 - 1e-9
+            if admit:
+                tokens -= 1
+            await db.execute(
+                """INSERT INTO rate_buckets
+                   (sender, source_topic, tokens, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(sender, source_topic) DO UPDATE SET
+                       tokens = excluded.tokens,
+                       updated_at = excluded.updated_at""",
+                (msg.from_agent, source_topic, tokens, now_ts),
+            )
+            if not admit:
+                await self._hold_sender_message(
+                    db,
+                    msg,
+                    reason="rate-limit",
+                    hops=hops,
+                    source_topic=source_topic,
+                    now=now,
+                )
+                await self._cap_held(db)
+                if broadcast or self.rate_cooldown <= 0:
+                    logger.debug(
+                        "holding message %s from %s: over the rate limit",
+                        sanitize_field(msg.id),
+                        sanitize_field(msg.from_agent),
+                    )
+                    return False
+                held_until = now_ts + self.rate_cooldown
+                await db.execute(
+                    """INSERT OR REPLACE INTO rate_holds
+                       (sender, held_until, held_at, message_id)
+                       VALUES (?, ?, ?, ?)""",
+                    (msg.from_agent, held_until, now, msg.id),
+                )
+                sender = sanitize_field(msg.from_agent)
+                logger.warning(
+                    "rate limit %s per %ss exceeded by %s: holding message "
+                    "%s and every message from %s until %s; they are "
+                    "admitted again on their own after that",
+                    self.rate_limit,
+                    f"{RATE_WINDOW:g}",
+                    sender,
+                    sanitize_field(msg.id),
+                    sender,
+                    datetime.fromtimestamp(held_until, timezone.utc).isoformat(),
+                )
+                return False
+
         await db.execute(
             """INSERT INTO admitted_messages
                (id, from_agent, hops, origin, seen_at, envelope_sha256)
@@ -536,20 +709,21 @@ class SQLiteMessageStore:
         )
         return True
 
-    async def _hold_tripped_sender_message(
+    async def _hold_sender_message(
         self,
         db: aiosqlite.Connection,
         msg: AgentMessage,
         *,
+        reason: str,
         hops: int,
         source_topic: str,
         now: str,
     ) -> None:
         async with db.execute(
             """SELECT COUNT(*) FROM held_messages
-               WHERE from_agent = ? AND reason = 'sender-tripped'
+               WHERE from_agent = ? AND reason = ?
                  AND stub = 0""",
-            (msg.from_agent,),
+            (msg.from_agent, reason),
         ) as cursor:
             full = (await cursor.fetchone())[0]
         if full < self.HELD_FULL_ENVELOPES_PER_SENDER:
@@ -573,7 +747,7 @@ class SQLiteMessageStore:
                 msg.id,
                 msg.from_agent,
                 hops,
-                "sender-tripped",
+                reason,
                 source_topic,
                 now,
                 envelope,
@@ -738,9 +912,25 @@ class SQLiteMessageStore:
                 ]
 
     async def list_holds(self, limit: int = 20) -> dict:
-        """Report tripped senders and the newest held messages."""
+        """Report tripped and cooling senders and the newest held messages."""
         await self._ensure_open()
         async with self._connect() as db:
+            async with db.execute(
+                """SELECT sender, held_until, message_id
+                   FROM rate_holds WHERE held_until > ?
+                   ORDER BY held_until""",
+                (self._clock(),),
+            ) as cursor:
+                cooling = [
+                    {
+                        "sender": r[0],
+                        "until": datetime.fromtimestamp(
+                            r[1], timezone.utc
+                        ).isoformat(),
+                        "message_id": r[2],
+                    }
+                    for r in await cursor.fetchall()
+                ]
             async with db.execute(
                 """SELECT sender, tripped_at, message_id
                    FROM hop_trips ORDER BY tripped_at"""
@@ -788,6 +978,7 @@ class SQLiteMessageStore:
                 conflict_count = (await cursor.fetchone())[0]
         return {
             "tripped": tripped,
+            "cooling": cooling,
             "held_count": held_count,
             "held": held,
             "held_by_sender": held_by_sender,
@@ -822,7 +1013,7 @@ class SQLiteMessageStore:
         }
 
     async def reset_trips(self, sender: str | None = None) -> int:
-        """Clear one sender's trip, or every trip; held messages stay held."""
+        """Clear one sender's trip and cool-down, or every one; held messages stay held."""
         await self._ensure_open()
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
@@ -830,11 +1021,22 @@ class SQLiteMessageStore:
             try:
                 if sender is None:
                     cursor = await db.execute("DELETE FROM hop_trips")
+                    removed = cursor.rowcount
+                    cursor = await db.execute("DELETE FROM rate_holds")
+                    removed += cursor.rowcount
+                    await db.execute("DELETE FROM rate_buckets")
                 else:
                     cursor = await db.execute(
                         "DELETE FROM hop_trips WHERE sender = ?", (sender,)
                     )
-                removed = cursor.rowcount
+                    removed = cursor.rowcount
+                    cursor = await db.execute(
+                        "DELETE FROM rate_holds WHERE sender = ?", (sender,)
+                    )
+                    removed += cursor.rowcount
+                    await db.execute(
+                        "DELETE FROM rate_buckets WHERE sender = ?", (sender,)
+                    )
                 await db.commit()
                 committed = True
             finally:

@@ -13,7 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _AGENT_ID_RE = re.compile(r'^[a-z0-9_-]{1,64}$')
 _MAX_BODY_BYTES = 64 * 1024  # 64KB
 ENVELOPE_VERSION = 2      # what this code stamps on a new message
-DEFAULT_HOP_LIMIT = 4     # Mike, 2026-10-15
+DEFAULT_HOP_LIMIT = 8     # Mike, 2026-10-16: 4 until the rate limit exists, then 8
+DEFAULT_RATE_LIMIT = 20       # messages one sender may deliver per RATE_WINDOW, per topic
+DEFAULT_RATE_COOLDOWN = 600.0 # seconds a sender that goes over is held (Mike: "say 10 minutes")
+RATE_WINDOW = 60.0            # seconds; the bucket refills DEFAULT_RATE_LIMIT tokens per window
 
 # Reserved — these collide with topic semantics and cannot be used as an
 # agent's own registered ID. They are still valid as a `to` field on a

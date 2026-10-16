@@ -1009,7 +1009,7 @@ def test_held_reports_counts(tmp_path):
     empty = runner.invoke(main, [*base, "--json"])
     assert empty.exit_code == 0, empty.output
     assert json.loads(empty.stdout) == {
-        "tripped": [], "held_count": 0, "held": [],
+        "tripped": [], "cooling": [], "held_count": 0, "held": [],
         "held_by_sender": [], "admitted_count": 0, "conflict_count": 0,
     }
 
@@ -1073,3 +1073,99 @@ def test_read_passes_hold_store_and_prints_id_and_hops(tmp_path):
         failed = runner.invoke(main, ["read", "--agent-id", "sparrow", "--state-dir", str(tmp_path)])
     assert failed.exit_code == 2
     assert "cannot open state db" in failed.output
+
+
+def test_send_refuses_past_its_hop_limit_unless_forced(monkeypatch):
+    for key in ("SWARMBUS_ID", "SWARMBUS_HOPS", "SWARMBUS_ORIGIN", "SWARMBUS_HOP_LIMIT"):
+        monkeypatch.delenv(key, raising=False)
+    wake = {"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "8"}
+
+    result, send = _send_with_env(wake)
+    assert result.exit_code == 3, result.output
+    send.assert_not_called()
+    assert "hop limit 8" in result.stderr
+
+    result, send = _send_with_env(wake, ["--force"])
+    assert result.exit_code == 0, result.output
+    assert send.call_args.kwargs["hops"] == 9
+
+    result, send = _send_with_env(wake, ["--hop-limit", "9"])
+    assert result.exit_code == 0, result.output
+
+    result, send = _send_with_env({"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "7"})
+    assert result.exit_code == 0, result.output
+    assert send.call_args.kwargs["hops"] == 8
+
+
+def test_listeners_take_rate_limit_options_and_default_hop_limit_is_8(tmp_path, monkeypatch):
+    from swarmbus.message import DEFAULT_HOP_LIMIT
+
+    for key in ("SWARMBUS_HOP_LIMIT", "SWARMBUS_RATE_LIMIT", "SWARMBUS_RATE_COOLDOWN"):
+        monkeypatch.delenv(key, raising=False)
+    assert DEFAULT_HOP_LIMIT == 8
+    runner = CliRunner()
+    rate = ["--rate-limit", "5", "--rate-cooldown", "30"]
+
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore") as MockStore:
+        MockBus.return_value.run = lambda: None
+        result = runner.invoke(main, ["start", "--agent-id", "t", "--state-dir", str(tmp_path), *rate])
+        assert result.exit_code == 0, result.output
+        kw = MockStore.call_args.kwargs
+        assert (kw["hop_limit"], kw["rate_limit"], kw["rate_cooldown"]) == (8, 5, 30)
+
+        result = runner.invoke(
+            main, ["start", "--agent-id", "t", "--state-dir", str(tmp_path)],
+            env={"SWARMBUS_RATE_LIMIT": "7"},
+        )
+        assert result.exit_code == 0, result.output
+        kw = MockStore.call_args.kwargs
+        assert (kw["rate_limit"], kw["rate_cooldown"]) == (7, 600)
+
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore") as MockStore:
+        MockBus.return_value.watch_inbox = AsyncMock(return_value=None)
+        result = runner.invoke(main, [
+            "watch", "--agent-id", "sparrow", "--timeout", "1",
+            "--state-dir", str(tmp_path), *rate,
+        ])
+    assert result.exit_code == 1
+    kw = MockStore.call_args.kwargs
+    assert (kw["rate_limit"], kw["rate_cooldown"]) == (5, 30)
+
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = runner.invoke(main, ["mcp-server", "--agent-id", "sparrow", *rate])
+    assert result.exit_code == 0, result.output
+    kw = run_server.call_args.kwargs
+    assert (kw["rate_limit"], kw["rate_cooldown"]) == (5, 30)
+
+
+def test_held_lists_and_resets_a_rate_cooldown(tmp_path):
+    import asyncio
+    from datetime import datetime, timezone
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state_dir = tmp_path / "state"
+    base = ["held", "--agent-id", "sparrow", "--state-dir", str(state_dir)]
+    runner = CliRunner()
+    assert json.loads(runner.invoke(main, [*base, "--json"]).stdout)["cooling"] == []
+
+    store = SQLiteMessageStore(state_dir / "sparrow.sqlite3", rate_limit=1)
+
+    async def flood():
+        for subject in ("one", "two"):
+            msg = AgentMessage.create(from_="wren", to="sparrow", subject=subject, body="b")
+            await store.admit(msg, source_topic="agents/sparrow/inbox")
+
+    asyncio.run(flood())
+
+    data = json.loads(runner.invoke(main, [*base, "--json"]).stdout)
+    assert data["tripped"] == []
+    assert [c["sender"] for c in data["cooling"]] == ["wren"]
+    assert datetime.fromisoformat(data["cooling"][0]["until"]) > datetime.now(timezone.utc)
+    assert "cooling: wren until" in runner.invoke(main, base).stdout
+
+    assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 0
+    assert json.loads(runner.invoke(main, [*base, "--json"]).stdout)["cooling"] == []
+    assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 1

@@ -644,7 +644,7 @@ async def test_runtime_holds_message_past_hop_limit_and_acks_it(tmp_path):
     assert len(ack.messages) == 1
     assert await runtime.store.read() == []
     default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
-    assert default.store.hop_limit == 4
+    assert default.store.hop_limit == 8
 
 
 def _conflicting_pair():
@@ -864,3 +864,23 @@ async def test_mcp_send_in_reply_to_takes_the_parent_chain_from_the_state_db(tmp
     assert await chain(in_reply_to="old-1") == ("old-1", 1, "kite")
     assert await chain(in_reply_to="unknown-id") == ("unknown-id", 1, "foo")
     assert await chain(in_reply_to=elsewhere.id) == (elsewhere.id, 1, "foo")
+
+
+@pytest.mark.asyncio
+async def test_runtime_rate_limits_a_sender_and_acks_the_held_message(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+        rate_limit=1, rate_cooldown=30,
+    )
+    assert (runtime.store.rate_limit, runtime.store.rate_cooldown) == (1, 30)
+    await runtime.store.open()
+    ack = _RecordingAck()
+    for subject in ("first", "second"):
+        msg = AgentMessage.create(from_="wren", to="foo", subject=subject, body="b")
+        await runtime._handle_message(_FakeMqttMessage(msg), ack)
+
+    assert len(ack.messages) == 2
+    assert [r["subject"] for r in await runtime.store.read()] == ["first"]
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert (default.store.hop_limit, default.store.rate_limit, default.store.rate_cooldown) == (8, 20, 600)
