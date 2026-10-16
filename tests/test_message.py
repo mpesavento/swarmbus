@@ -1,6 +1,7 @@
 # tests/test_message.py
 import json
 import pytest
+from pydantic import ValidationError
 from swarmbus.message import AgentMessage
 
 def test_create_sets_id_and_ts():
@@ -182,3 +183,57 @@ def test_non_integer_hops_is_an_invalid_envelope(bad):
     })
     with pytest.raises(ValueError):
         AgentMessage.from_json(raw)
+
+
+_BASE = {"id": "m-1", "from": "wren", "to": "sparrow", "subject": "s", "body": "b"}
+
+
+@pytest.mark.parametrize("field,limit", [
+    ("id", 128), ("subject", 1024), ("reply_to", 128), ("in_reply_to", 128),
+    ("origin", 128), ("content_type", 64), ("priority", 64),
+])
+def test_envelope_string_fields_are_capped(field, limit):
+    at_limit = AgentMessage.from_json(json.dumps({**_BASE, field: "a" * limit}))
+    assert getattr(at_limit, field) == "a" * limit
+    with pytest.raises(ValidationError):
+        AgentMessage.from_json(json.dumps({**_BASE, field: "a" * (limit + 1)}))
+    if field in ("reply_to", "in_reply_to", "origin"):
+        empty = AgentMessage.from_json(json.dumps({**_BASE, field: ""}))
+        assert getattr(empty, field) == ""
+
+
+@pytest.mark.parametrize("field", [
+    "id", "subject", "reply_to", "in_reply_to", "origin", "content_type", "priority",
+])
+@pytest.mark.parametrize("bad", ["a\x00b", "a\ud800b"])
+def test_envelope_fields_reject_nul_and_lone_surrogates(field, bad):
+    with pytest.raises(ValidationError):
+        AgentMessage.from_json(json.dumps({**_BASE, field: bad}))
+
+
+@pytest.mark.parametrize("field", ["reply_to", "in_reply_to", "origin", "content_type", "priority"])
+@pytest.mark.parametrize("bad", ["a\nb", "a\rb", "a\tb", "a\x1bb", "a\x85b"])
+def test_metadata_fields_reject_control_characters(field, bad):
+    with pytest.raises(ValidationError):
+        AgentMessage.from_json(json.dumps({**_BASE, field: bad}))
+
+
+@pytest.mark.parametrize("bad", [
+    "", " ", "a b", "a\nb", "a\tb", "a‮b", "a​b", "a b", "a b",
+])
+def test_id_must_be_printable_and_non_empty(bad):
+    with pytest.raises(ValidationError):
+        AgentMessage.from_json(json.dumps({**_BASE, "id": bad}))
+
+
+@pytest.mark.parametrize("bad", [5, None, ["b"]])
+def test_non_string_body_is_an_invalid_envelope(bad):
+    with pytest.raises(ValidationError):
+        AgentMessage.from_json(json.dumps({**_BASE, "body": bad}))
+
+
+def test_sanitize_field_and_frame_body_neutralise_format_characters():
+    from swarmbus.message import frame_body, sanitize_field
+
+    assert sanitize_field("a‮b​c﻿d⁦e") == "a b c d e"
+    assert frame_body("a‮b​c﻿d").split("\n")[1] == "| a\\u202eb\\u200bc\\ufeffd"
