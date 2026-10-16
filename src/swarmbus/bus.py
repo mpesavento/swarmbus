@@ -143,7 +143,7 @@ class AgentBus:
         / ``client_key`` is set; otherwise the broker connection is
         plaintext.
 
-        hold_store: when set, ``listen()`` and ``watch_inbox()`` refuse
+        hold_store: when set, ``listen()``, ``read_inbox()`` and ``watch_inbox()`` refuse
         messages the store holds (past its hop limit, or from a tripped
         sender). When None they behave exactly as before.
 
@@ -560,7 +560,16 @@ class AgentBus:
         envelopes are skipped. Raises ``aiomqtt.MqttError`` if the broker is
         unreachable — callers that want graceful empty-on-error behaviour
         (e.g. the MCP tool surface) must catch it themselves.
+
+        With a ``hold_store``, messages the store holds (past its hop
+        limit, or from a tripped sender) are left out and do not count
+        toward ``max_messages``; every message returned is recorded in the
+        store. If the store cannot be read for a message, that message is
+        left out and an ERROR is logged.
         """
+        if self.hold_store is not None:
+            # A failure propagates, before any connection is made.
+            await self.hold_store.open()
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
@@ -575,12 +584,26 @@ class AgentBus:
                     async for mqtt_msg in client.messages:
                         try:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
-                            messages.append(json.loads(msg.to_json()))
                         except Exception as exc:
                             logger.warning(
                                 "read_inbox: skipping bad envelope: %s",
                                 sanitize_field(exc),
                             )
+                        else:
+                            admitted = True
+                            if self.hold_store is not None:
+                                try:
+                                    admitted = await self.hold_store.admit(
+                                        msg, source_topic=str(mqtt_msg.topic)
+                                    )
+                                except Exception as exc:
+                                    logger.error(
+                                        "hold check failed for message %s: %s",
+                                        sanitize_field(msg.id), exc,
+                                    )
+                                    admitted = False
+                            if admitted:
+                                messages.append(json.loads(msg.to_json()))
                         if len(messages) >= max_messages:
                             break
             except asyncio.TimeoutError:

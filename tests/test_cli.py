@@ -1043,6 +1043,38 @@ def test_held_reports_counts(tmp_path):
     assert "admitted (last 30 days): 1, id conflicts: 0" in text.output
 
 
+def test_read_passes_hold_store_and_prints_id_and_hops(tmp_path):
+    msg = {
+        "id": "msg-9", "from": "wren", "to": "sparrow",
+        "ts": "2026-10-16T05:00:00Z", "subject": "hi", "body": "hello",
+        "content_type": "text/plain", "priority": "normal", "reply_to": None,
+        "in_reply_to": None, "hops": 2, "origin": "wren", "envelope_version": 2,
+    }
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore") as MockStore:
+        MockBus.return_value.read_inbox = AsyncMock(return_value=[msg])
+        result = runner.invoke(main, [
+            "read", "--agent-id", "sparrow",
+            "--state-dir", str(tmp_path), "--hop-limit", "2",
+        ])
+    assert result.exit_code == 0, result.output
+    assert MockStore.call_args.args[0] == tmp_path / "sparrow.sqlite3"
+    assert MockStore.call_args.kwargs["hop_limit"] == 2
+    assert MockBus.call_args.kwargs["hold_store"] is MockStore.return_value
+    lines = result.output.splitlines()
+    assert "id: msg-9" in lines
+    assert "hops: 2" in lines
+
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        MockBus.return_value.read_inbox = AsyncMock(
+            side_effect=RuntimeError("holds schema 2 is newer than supported version 1")
+        )
+        failed = runner.invoke(main, ["read", "--agent-id", "sparrow", "--state-dir", str(tmp_path)])
+    assert failed.exit_code == 2
+    assert "cannot open state db" in failed.output
+
+
 def test_send_refuses_past_its_hop_limit_unless_forced(monkeypatch):
     for key in ("SWARMBUS_ID", "SWARMBUS_HOPS", "SWARMBUS_ORIGIN", "SWARMBUS_HOP_LIMIT"):
         monkeypatch.delenv(key, raising=False)
