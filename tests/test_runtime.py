@@ -781,3 +781,11 @@ async def test_identical_redelivery_is_acked_without_conflict_record():
     assert events == ["seen", "ack"]
     assert store.conflicts == []
     assert runtime.state is RuntimeState.CONNECTED
+
+
+def test_runtime_caps_the_incoming_queue(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    assert runtime._client_kwargs()["max_queued_incoming_messages"] == 1000

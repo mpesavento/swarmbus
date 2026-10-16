@@ -1,5 +1,8 @@
 import asyncio
+import json
+import os
 import stat
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -184,7 +187,7 @@ async def test_record_conflict_keeps_original_and_lists_rejected(db_path, msg):
         assert [
             (c["id"], c["from"], c["source_topic"], c["subject"])
             for c in conflicts
-        ] == [(msg.id, "wren", topic, "reused id")] * 2
+        ] == [(msg.id, "wren", topic, "reused id")]
         assert all(c["recorded_at"] for c in conflicts)
         assert await store.list_conflicts(limit=1) == conflicts[:1]
 
@@ -523,3 +526,214 @@ async def test_admit_holds_hops_beyond_sqlite_integer_range(db_path):
     holds = await store.list_holds()
     assert [t["sender"] for t in holds["tripped"]] == ["wren"]
     assert holds["held_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_admit_treats_reused_id_with_a_different_envelope_as_conflict(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    first = AgentMessage.create(from_="wren", to="sparrow", subject="first", body="b")
+    changed = first.model_copy(update={"subject": "changed"})
+    other_sender = first.model_copy(update={"from_agent": "robin"})
+
+    assert await store.admit(first, source_topic=topic) is True
+    assert await store.admit(first, source_topic=topic) is True
+    assert await store.admit(changed, source_topic=topic) is False
+    assert await store.admit(changed, source_topic=topic) is False
+    assert await store.admit(other_sender, source_topic=topic) is False
+
+    conflicts = await store.list_conflicts(limit=100)
+    assert sorted((c["from"], c["subject"]) for c in conflicts) == [
+        ("robin", "first"), ("wren", "changed"),
+    ]
+    assert await store.lookup(first.id) == {"from": "wren", "hops": 0, "origin": "wren"}
+    assert (await store.list_holds())["held_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tripped_sender_cannot_reuse_an_admitted_id(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    old = _chain_msg("wren", 0, "old")
+    assert await store.admit(old, source_topic=topic) is True
+    assert await store.admit(_chain_msg("wren", 5, "past"), source_topic=topic) is False
+
+    assert await store.admit(old.model_copy(update={"hops": 50}), source_topic=topic) is False
+    assert await store.admit(old, source_topic=topic) is False
+
+    holds = await store.list_holds()
+    assert holds["held_count"] == 2
+    assert {h["reason"] for h in holds["held"]} == {"hop-limit", "sender-tripped"}
+
+
+@pytest.mark.asyncio
+async def test_admit_reads_a_holds_v1_database_and_migrates_it(db_path):
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "CREATE TABLE swarmbus_schema (component TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+        )
+        await db.execute("INSERT INTO swarmbus_schema VALUES ('holds', 1)")
+        await db.execute(
+            """CREATE TABLE admitted_messages (id TEXT PRIMARY KEY, from_agent TEXT NOT NULL,
+               hops INTEGER NOT NULL, origin TEXT, seen_at TEXT NOT NULL)"""
+        )
+        await db.execute(
+            """CREATE TABLE held_messages (id TEXT PRIMARY KEY, from_agent TEXT NOT NULL,
+               hops INTEGER NOT NULL, reason TEXT NOT NULL, source_topic TEXT NOT NULL,
+               held_at TEXT NOT NULL, envelope TEXT NOT NULL)"""
+        )
+        await db.execute(
+            "INSERT INTO admitted_messages VALUES ('legacy-1', 'wren', 2, 'planner', ?)", (now,)
+        )
+        await db.commit()
+
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    base = AgentMessage.create(from_="wren", to="sparrow", subject="s", body="b", hops=2)
+    same = base.model_copy(update={"id": "legacy-1"})
+    other = base.model_copy(update={"id": "legacy-1", "from_agent": "robin"})
+    topic = "agents/sparrow/inbox"
+
+    assert await store.admit(same, source_topic=topic) is True
+    assert await store.admit(other, source_topic=topic) is False
+    assert await store.admit(_chain_msg("kestrel", 0), source_topic=topic) is True
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT version FROM swarmbus_schema WHERE component = 'holds'"
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_conflicts_are_recorded_once_per_envelope_and_capped(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False)
+    store.CONFLICTS_MAX_ROWS = 3
+    original = AgentMessage.create(from_="wren", to="sparrow", subject="original", body="b")
+    assert await store.store(original, source_topic=topic) is True
+    reused = original.model_copy(update={"subject": "reused"})
+
+    for _ in range(5):
+        await store.record_conflict(reused, source_topic=topic)
+    assert len(await store.list_conflicts(limit=100)) == 1
+
+    for i in range(5):
+        await store.record_conflict(
+            original.model_copy(update={"subject": f"v{i}"}), source_topic=topic,
+        )
+    assert [c["subject"] for c in await store.list_conflicts(limit=100)] == ["v4", "v3", "v2"]
+    assert (await store.list_holds())["conflict_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_open_dedupes_conflict_rows_written_before_the_key(db_path):
+    store = SQLiteMessageStore(db_path, managed=False)
+    await store.open()
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("DROP INDEX inbox_message_conflicts_once")
+        for _ in range(3):
+            await db.execute(
+                "INSERT INTO inbox_message_conflicts VALUES (?, ?, ?, ?, ?)",
+                ("dup", "wren", "agents/sparrow/inbox",
+                 "2026-10-16T00:00:00+00:00", json.dumps({"subject": "x"})),
+            )
+        await db.commit()
+
+    again = SQLiteMessageStore(db_path, managed=False)
+    assert len(await again.list_conflicts(limit=100)) == 1
+
+
+@pytest.mark.asyncio
+async def test_admitted_messages_age_out_after_retention(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False)
+    old = _chain_msg("wren", 0, "old")
+    recent = _chain_msg("wren", 0, "recent")
+    assert await store.admit(old, source_topic=topic) is True
+    assert await store.admit(recent, source_topic=topic) is True
+    stale = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+
+    async def make_stale(message_id):
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "UPDATE admitted_messages SET seen_at = ? WHERE id = ?", (stale, message_id),
+            )
+            await db.commit()
+
+    await make_stale(old.id)
+    reopened = SQLiteMessageStore(db_path, managed=False)
+    assert await reopened.lookup(recent.id) is not None
+    assert await reopened.lookup(old.id) is None
+    assert (await reopened.list_holds())["admitted_count"] == 1
+
+    reopened.PRUNE_EVERY_ADMISSIONS = 2
+    await make_stale(recent.id)
+    assert await reopened.admit(_chain_msg("robin", 0, "a"), source_topic=topic) is True
+    assert await reopened.lookup(recent.id) is not None
+    assert await reopened.admit(_chain_msg("robin", 0, "b"), source_topic=topic) is True
+    assert await reopened.lookup(recent.id) is None
+
+
+@pytest.mark.asyncio
+async def test_held_envelopes_are_capped_per_tripped_sender_and_in_total(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=0)
+    store.HELD_FULL_ENVELOPES_PER_SENDER = 2
+    store.HELD_MAX_ROWS = 3  # unprotected rows; the trip row is protected and not counted
+    trip = _chain_msg("wren", 1, "trip")
+    after = [_chain_msg("wren", 0, f"after-{i}") for i in range(4)]
+
+    assert await store.admit(trip, source_topic=topic) is False
+    for m in after:
+        assert await store.admit(m, source_topic=topic) is False
+
+    holds = await store.list_holds()
+    assert holds["held_count"] == 4
+    assert holds["held_by_sender"] == [{"sender": "wren", "count": 4}]
+    assert {h["id"] for h in holds["held"]} == {trip.id, after[1].id, after[2].id, after[3].id}
+
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT id, stub, envelope FROM held_messages"
+        ) as cursor:
+            rows = {r[0]: (r[1], json.loads(r[2])) for r in await cursor.fetchall()}
+    assert rows[trip.id][0] == 0 and rows[trip.id][1]["body"] == "b"
+    assert rows[after[1].id][0] == 0 and rows[after[1].id][1]["body"] == "b"
+    assert rows[after[3].id][0] == 1
+    assert "body" not in rows[after[3].id][1]
+    assert rows[after[3].id][1]["subject"] == "after-3"
+    assert (await store.lookup(after[3].id))["hops"] == 0
+    assert await store.admit(after[0], source_topic=topic) is False
+
+
+@pytest.mark.asyncio
+async def test_state_db_uses_wal_a_30s_busy_timeout_and_private_sidecar_files(tmp_path):
+    from unittest.mock import patch
+
+    real_connect = aiosqlite.connect
+    timeouts = []
+
+    def spy(*args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        return real_connect(*args, **kwargs)
+
+    store = SQLiteMessageStore(tmp_path / "state" / "sparrow.sqlite3")
+    topic = "agents/sparrow/inbox"
+    old_umask = os.umask(0o022)
+    try:
+        with patch("swarmbus.archive.aiosqlite.connect", side_effect=spy):
+            assert await store.admit(_chain_msg("wren", 0, "one"), source_topic=topic) is True
+        assert timeouts and all(t == 30.0 for t in timeouts)
+
+        async with real_connect(store.db_path) as reader:
+            async with reader.execute("PRAGMA journal_mode") as cursor:
+                assert (await cursor.fetchone())[0] == "wal"
+            async with reader.execute("SELECT COUNT(*) FROM admitted_messages") as cursor:
+                assert (await cursor.fetchone())[0] == 1
+            assert await store.admit(_chain_msg("wren", 0, "two"), source_topic=topic) is True
+            for suffix in ("-wal", "-shm"):
+                side = Path(f"{store.db_path}{suffix}")
+                assert side.exists(), suffix
+                assert stat.S_IMODE(side.stat().st_mode) == 0o600, suffix
+    finally:
+        os.umask(old_umask)

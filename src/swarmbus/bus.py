@@ -11,6 +11,7 @@ import aiomqtt
 
 from .message import AgentMessage, _validate_registered_agent_id, sanitize_field
 from .handlers.base import BaseHandler
+from .handlers.file_bridge import FileBridgeHandler
 from .topics import DEFAULT_TOPICS, TopicMap
 from ._compat import asyncio_timeout
 
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
     from .archive import SQLiteMessageStore
 
 logger = logging.getLogger(__name__)
+
+# aiomqtt discards (with a WARNING) once its incoming queue is this full.
+MAX_QUEUED_INCOMING_MESSAGES = 1000
 
 
 def _build_tls_context(
@@ -366,19 +370,55 @@ class AgentBus:
         # Persistent session: stable client identifier + clean_session=False
         # so the broker queues QoS1 messages for this agent when the listener
         # is offline, and redelivers them on reconnect.
-        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs(), "will": will}
+        client_kwargs: dict[str, Any] = {
+            **self._aiomqtt_kwargs(),
+            "will": will,
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
         if self.hold_store is not None:
             # A failure propagates: better to exit than run unprotected.
             await self.hold_store.open()
+        # Persistent with a hold store: acknowledge by hand, after the hold
+        # check and the handlers, so a delivery whose check failed is
+        # redelivered.
+        manual_ack = self.persistent and self.hold_store is not None
+        if manual_ack:
+            # Function-local: runtime.py imports from this module at top level.
+            from .runtime import AcknowledgementError, _ManualAckAdapter
         backoff = reconnect_initial
+        hold_backoff = reconnect_initial
         while True:
+            client_cm = aiomqtt.Client(
+                self.broker, port=self.port, **client_kwargs
+            )
+            ack_adapter = None
+            if manual_ack:
+                # Built outside the try so an unusable Paho handle exits the
+                # daemon rather than running unprotected. Must precede
+                # connect: the broker replays queued messages right after
+                # CONNACK, before our SUBSCRIBE.
+                ack_adapter = _ManualAckAdapter(client_cm)
+                ack_adapter.enable()
+
+            def ack(mqtt_msg: Any) -> bool:
+                """Acknowledge by hand; False means leave the connection."""
+                if ack_adapter is None:
+                    return True
+                try:
+                    ack_adapter.ack(mqtt_msg)
+                except AcknowledgementError as exc:
+                    logger.warning(
+                        "MQTT acknowledgement failed; reconnecting: %s", exc
+                    )
+                    return False
+                return True
+
+            leave: str | None = None  # "hold" or "ack" when we break out
             try:
-                async with aiomqtt.Client(
-                    self.broker, port=self.port, **client_kwargs
-                ) as client:
+                async with client_cm as client:
                     await client.publish(
                         self.topics.presence(self.agent_id),
                         json.dumps({"agent": self.agent_id, "status": "online"}),
@@ -398,6 +438,9 @@ class AgentBus:
                             logger.warning(
                                 "Discarding invalid message envelope: %s", exc
                             )
+                            if not ack(mqtt_msg):
+                                leave = "ack"
+                                break
                             continue
 
                         if self.hold_store is not None:
@@ -412,8 +455,19 @@ class AgentBus:
                                     "hold check failed for message %s: %s",
                                     sanitize_field(msg.id), exc,
                                 )
+                                if manual_ack:
+                                    # Left unacknowledged: the broker resends
+                                    # it, and everything queued behind it,
+                                    # when the session resumes.
+                                    leave = "hold"
+                                    break
+                                await self._archive_unchecked(msg)
                                 continue
+                            hold_backoff = reconnect_initial
                             if not admitted:
+                                if not ack(mqtt_msg):
+                                    leave = "ack"
+                                    break
                                 continue
 
                         for handler in self._handlers:
@@ -424,7 +478,13 @@ class AgentBus:
                                     "Handler %s raised: %s",
                                     handler.__class__.__name__, exc,
                                 )
-                return  # iterator exhausted / clean shutdown
+                        # Even when a handler raised: a message that always
+                        # breaks a handler must not be redelivered forever.
+                        if not ack(mqtt_msg):
+                            leave = "ack"
+                            break
+                if leave is None:
+                    return  # iterator exhausted / clean shutdown
             except aiomqtt.MqttError as exc:
                 logger.warning(
                     "MQTT broker disconnected (%s); reconnecting in %.1fs",
@@ -432,6 +492,33 @@ class AgentBus:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, reconnect_max)
+                continue
+            if leave == "hold":
+                await asyncio.sleep(hold_backoff)
+                hold_backoff = min(hold_backoff * 2, reconnect_max)
+            else:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, reconnect_max)
+
+    async def _archive_unchecked(self, msg: AgentMessage) -> None:
+        """Write a message whose hold check failed to the file bridge only.
+
+        For connections that acknowledge on arrival, where dropping the
+        message would lose it. The subject is marked and no other handler
+        runs: no wake, no persistent-listener count.
+        """
+        marked = msg.model_copy(
+            update={"subject": f"[HOLD CHECK FAILED] {msg.subject}"}
+        )
+        for handler in self._handlers:
+            if not isinstance(handler, FileBridgeHandler):
+                continue
+            try:
+                await handler.handle(marked)
+            except Exception as exc:
+                logger.error(
+                    "Handler %s raised: %s", handler.__class__.__name__, exc,
+                )
 
     async def read_inbox(self, max_messages: int = 10, drain_timeout: float = 1.0) -> list[dict]:
         """Non-blocking drain of queued messages for this agent.
@@ -503,7 +590,10 @@ class AgentBus:
         if self.hold_store is not None:
             # A failure propagates, before any connection is made.
             await self.hold_store.open()
-        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
+        client_kwargs: dict[str, Any] = {
+            **self._aiomqtt_kwargs(),
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False

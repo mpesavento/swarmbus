@@ -1175,7 +1175,19 @@ def held(
             click.echo("[swarmbus] reset 0 trip(s)")
             return
         if as_json:
-            click.echo(json.dumps({"tripped": [], "held_count": 0, "held": []}, indent=2))
+            click.echo(
+                json.dumps(
+                    {
+                        "tripped": [],
+                        "held_count": 0,
+                        "held": [],
+                        "held_by_sender": [],
+                        "admitted_count": 0,
+                        "conflict_count": 0,
+                    },
+                    indent=2,
+                )
+            )
         else:
             click.echo(f"[swarmbus] {agent_id}: no holds")
         return
@@ -1207,23 +1219,29 @@ def held(
         return
     if not holds["tripped"] and not holds["held_count"]:
         click.echo(f"[swarmbus] {agent_id}: no holds")
-        return
-    for t in holds["tripped"]:
-        click.echo(
-            f"tripped: {sanitize_field(t['sender'])} at {sanitize_field(t['tripped_at'])} "
-            f"by message {sanitize_field(t['message_id'])}"
-        )
-    for h in holds["held"]:
-        click.echo(
-            f"held: {sanitize_field(h['id'])} from {sanitize_field(h['from'])} "
-            f"hops={sanitize_field(h['hops'])} reason={sanitize_field(h['reason'])} "
-            f"at {sanitize_field(h['held_at'])} subject: {sanitize_field(h['subject'])}"
-        )
-    if holds["held_count"] > len(holds["held"]):
-        click.echo(
-            f"[swarmbus] showing newest {len(holds['held'])} of "
-            f"{holds['held_count']} held message(s)"
-        )
+    else:
+        for t in holds["tripped"]:
+            click.echo(
+                f"tripped: {sanitize_field(t['sender'])} at {sanitize_field(t['tripped_at'])} "
+                f"by message {sanitize_field(t['message_id'])}"
+            )
+        for h in holds["held"]:
+            click.echo(
+                f"held: {sanitize_field(h['id'])} from {sanitize_field(h['from'])} "
+                f"hops={sanitize_field(h['hops'])} reason={sanitize_field(h['reason'])} "
+                f"at {sanitize_field(h['held_at'])} subject: {sanitize_field(h['subject'])}"
+            )
+        if holds["held_count"] > len(holds["held"]):
+            click.echo(
+                f"[swarmbus] showing newest {len(holds['held'])} of "
+                f"{holds['held_count']} held message(s)"
+            )
+        for entry in holds["held_by_sender"]:
+            click.echo(f"held from {sanitize_field(entry['sender'])}: {entry['count']}")
+    click.echo(
+        f"[swarmbus] admitted (last 30 days): {holds['admitted_count']}, "
+        f"id conflicts: {holds['conflict_count']}"
+    )
 
 
 # ---------------------------------------------------------------------------

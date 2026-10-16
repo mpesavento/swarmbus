@@ -12,7 +12,7 @@ from typing import Any
 import aiomqtt
 
 from .archive import MessageConflictError, SQLiteMessageStore
-from .bus import _build_tls_context
+from .bus import MAX_QUEUED_INCOMING_MESSAGES, _build_tls_context
 from .message import (
     DEFAULT_HOP_LIMIT,
     AgentMessage,
@@ -140,7 +140,9 @@ class ManagedMCPRuntime:
         self._replay_settled = True
 
     def _client_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.presence:
             kwargs["will"] = aiomqtt.Will(
                 topic=self.topics.presence(self.agent_id),
