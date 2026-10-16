@@ -164,7 +164,7 @@ async def test_listen_retains_online_presence():
                     yield
             return _gen()
 
-    def _capture_client(broker, port, will=None):
+    def _capture_client(broker, port, will=None, **_kwargs):
         will_args["payload"] = will.payload if will else None
         will_args["retain"] = will.retain if will else None
         return FakeClient()
