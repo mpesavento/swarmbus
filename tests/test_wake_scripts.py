@@ -2,6 +2,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -500,3 +501,86 @@ def test_claude_wake_preamble_names_the_notify_tool_only_when_set(tmp_path):
                       extra_env={"SWARMBUS_WAKE_NOTIFY_TOOL": "mcp__plugin_telegram_telegram__reply"})
     prompt = (bin_dir / "claude.stdin").read_text(encoding="utf-8")
     assert "mcp__plugin_telegram_telegram__reply" in prompt[:prompt.index("[UNTRUSTED PEER METADATA")]
+
+
+TOKEN = "123456:SECRET-tok_en"
+
+
+def _real_telegram_secrets(home, token=TOKEN):
+    secrets = home / ".secrets"
+    secrets.mkdir(parents=True, exist_ok=True)
+    (secrets / "TELEGRAM_BOT_TOKEN").write_text(token + "\n")
+    (secrets / "TELEGRAM_CHAT_ID").write_text("42\n")
+
+
+def test_claude_wake_pushes_telegram_only_on_priority_high(tmp_path):
+    home = tmp_path / "all"
+    _real_telegram_secrets(home)
+    result, bin_dir = _run(home, CLAUDE_WAKE, "bob", to="bob", priority="normal",
+                           extra_env={"SWARMBUS_WAKE_POLICY": "all"})
+    assert result.returncode == 0, result.stderr
+    assert (bin_dir / "claude.stdin").exists()       # policy=all still wakes
+    assert not (bin_dir / "curl.args").exists()      # but only priority=high pushes
+
+
+@BOTH
+def test_wake_telegram_token_goes_on_stdin_and_subject_is_sanitized(tmp_path, script, agent_id, stub):
+    home = tmp_path / "h"
+    _real_telegram_secrets(home)
+    subject = "urgent‮ \x85x"
+    result, bin_dir = _run(home, script, agent_id, to="bob", priority="high",
+                           extra_env={"SWARMBUS_SUBJECT": subject})
+    assert result.returncode == 0, result.stderr
+    args = _args(bin_dir, "curl")
+    assert "SECRET" not in "\n".join(args)
+    assert args[args.index("--config") + 1] == "-"
+    assert 'url = "https://api.telegram.org/bot123456:SECRET-tok_en/sendMessage"' in (
+        bin_dir / "curl.stdin").read_text()
+    assert "chat_id=42" in args
+    assert "text=⚡ priority:high from alice: " + sanitize_field(subject) in args
+
+
+@BOTH
+def test_wake_telegram_push_skipped_on_a_malformed_token(tmp_path, script, agent_id, stub):
+    home = tmp_path / "h"
+    _real_telegram_secrets(home, token='12:ab"\nurl = "http://evil')
+    result, bin_dir = _run(home, script, agent_id, to="bob", priority="high")
+    assert result.returncode == 0, result.stderr
+    assert not (bin_dir / "curl.args").exists()
+    assert (bin_dir / f"{stub}.stdin").exists()       # the wake itself still runs
+    assert "token file malformed" in _log_path(home, script, agent_id).read_text()
+
+
+@BOTH
+def test_wake_telegram_push_is_throttled_per_agent(tmp_path, script, agent_id, stub):
+    home = tmp_path / "h"
+    _real_telegram_secrets(home)
+    state = home / ".local/state/swarmbus-wake"
+    last = state / (f"{agent_id}.tg-last" if script == CLAUDE_WAKE else f"{agent_id}-wake.tg-last")
+
+    _, bin_dir = _run(home, script, agent_id, to="bob", priority="high")
+    assert (bin_dir / "curl.args").exists()
+    stamp, held = last.read_text().split()
+    assert held == "0" and abs(int(stamp) - time.time()) < 30
+
+    for expected_held in ("1", "2"):
+        (bin_dir / "curl.args").unlink(missing_ok=True)
+        _, bin_dir = _run(home, script, agent_id, to="bob", priority="high")
+        assert not (bin_dir / "curl.args").exists()
+        assert last.read_text().split() == [stamp, expected_held]
+        assert (bin_dir / f"{stub}.stdin").exists()   # throttling never stops the wake
+    assert "tier3 TG push throttled" in _log_path(home, script, agent_id).read_text()
+
+    last.write_text(f"{int(time.time()) - 61} 2\n")
+    _, bin_dir = _run(home, script, agent_id, to="bob", priority="high")
+    assert any(a.startswith("text=") and a.endswith(" (+2 more)") for a in _args(bin_dir, "curl"))
+    assert last.read_text().split()[1] == "0"
+
+    for corrupt in ("garbage\n", "", "12 x\n"):
+        last.write_text(corrupt)
+        (bin_dir / "curl.args").unlink(missing_ok=True)
+        _, bin_dir = _run(home, script, agent_id, to="bob", priority="high")
+        assert (bin_dir / "curl.args").exists(), corrupt
+        assert not any(a.endswith("more)") for a in _args(bin_dir, "curl"))
+        assert last.read_text().split()[1] == "0"
+    assert stat.S_IMODE(last.stat().st_mode) == 0o600
