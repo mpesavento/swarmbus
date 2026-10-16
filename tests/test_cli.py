@@ -1,5 +1,6 @@
 import json
-from unittest.mock import patch, AsyncMock
+import os
+from unittest.mock import patch, AsyncMock, MagicMock
 from click.testing import CliRunner
 import aiomqtt
 from swarmbus.cli import main
@@ -1237,3 +1238,72 @@ def test_doctor_reports_tripped_senders_and_held_count(tmp_path):
     result = run_doctor()
     assert "1 tripped: robin (rate-limit until " in result.output
     assert "[⚠] 8. tripped senders" in result.output
+
+
+def _doctor():
+    envs = []
+
+    def fake_run(cmd, **kwargs):
+        envs.append(kwargs.get("env"))
+        return MagicMock(returncode=1, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.aiomqtt"):
+        MockBus.probe.return_value._aiomqtt_kwargs = lambda: {}
+        MockBus.probe.return_value.list_agents = AsyncMock(return_value=[])
+        result = CliRunner().invoke(main, ["doctor", "--agent-id", "doc-agent"])
+    return result, envs
+
+
+def test_doctor_does_not_create_the_outbox(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWARMBUS_OUTBOX", raising=False)
+    outbox = tmp_path / "missing" / "deeper" / "doc-agent-outbox.md"
+    monkeypatch.setenv("SWARMBUS_OUTBOX_DOC_AGENT", str(outbox))
+    result, _ = _doctor()
+    assert f"outbox env resolvable... {outbox}" in result.output, result.output
+    assert "NOT WRITABLE" not in result.output
+    assert not (tmp_path / "missing").exists()
+
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("SWARMBUS_OUTBOX_DOC_AGENT", str(blocker / "out.md"))
+    result, _ = _doctor()
+    assert "NOT WRITABLE" in result.output, result.output
+
+
+def test_doctor_keeps_callers_systemd_user_env(monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/custom/run")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/bus")
+    result, envs = _doctor()
+    assert envs, result.output
+    assert {(e["XDG_RUNTIME_DIR"], e["DBUS_SESSION_BUS_ADDRESS"]) for e in envs} == {
+        ("/custom/run", "unix:path=/custom/bus"),
+    }
+
+
+def test_detect_agent_id_keeps_callers_env_and_defaults_when_unset(monkeypatch):
+    from swarmbus.cli import _detect_agent_id
+
+    envs = []
+
+    def fake_run(cmd, **kwargs):
+        envs.append(kwargs["env"])
+        return MagicMock(returncode=0, stdout="swarmbus-planner.service loaded active running x\n")
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/custom/run")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/bus")
+    with patch("subprocess.run", side_effect=fake_run):
+        assert _detect_agent_id() == "planner"
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "")
+    with patch("subprocess.run", side_effect=fake_run):
+        assert _detect_agent_id() == "planner"
+
+    assert (envs[0]["XDG_RUNTIME_DIR"], envs[0]["DBUS_SESSION_BUS_ADDRESS"]) == (
+        "/custom/run", "unix:path=/custom/bus",
+    )
+    uid = os.getuid()
+    assert (envs[1]["XDG_RUNTIME_DIR"], envs[1]["DBUS_SESSION_BUS_ADDRESS"]) == (
+        f"/run/user/{uid}", f"unix:path=/run/user/{uid}/bus",
+    )
