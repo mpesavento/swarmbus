@@ -592,3 +592,10 @@ def test_openclaw_bridge_sanitizes_the_run_label():
     assert "params.label = `swarmbus: ${subject}`.slice(0, 128);" not in text
     assert ".replace(/[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]/gu, \" \")" in text
     assert "Array.from(`swarmbus: ${subject}`).slice(0, 128)" in text
+
+
+def test_openclaw_bridge_scopes_idempotency_key_to_the_agent():
+    """Source pin: node is not in the harness image, so the bridge cannot run here."""
+    text = (EXAMPLES / "openclaw-bridge.mjs").read_text()
+    assert "const idempotencyKey = process.env.SWARMBUS_ID || randomUUID();" not in text
+    assert "`swarmbus:${process.env.SWARMBUS_TO" in text
