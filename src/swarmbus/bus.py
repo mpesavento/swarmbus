@@ -278,8 +278,14 @@ class AgentBus:
         priority: str = "normal",
         reply_to: str | None = None,
         outbox_path: str | None = None,
+        in_reply_to: str | None = None,
+        hops: int = 0,
+        origin: str | None = None,
     ) -> None:
         """Publish a message.
+
+        `in_reply_to`, `hops` and `origin` stamp the reply chain on the
+        envelope; `origin=None` means this agent starts the chain.
 
         If a persistent client is open (via connect() or `async with`), it is
         reused — no per-call connection churn. Otherwise a one-shot client is
@@ -302,6 +308,9 @@ class AgentBus:
             content_type=content_type,
             priority=priority,  # type: ignore[arg-type]
             reply_to=reply_to,
+            in_reply_to=in_reply_to,
+            hops=hops,
+            origin=origin,
         )
         # Broadcast uses agents/broadcast; directed messages use agents/{to}/inbox
         topic = self.topics.route(to)

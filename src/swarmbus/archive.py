@@ -276,7 +276,11 @@ class SQLiteMessageStore:
                 "reply_to": row["reply_to"],
             },
         )
-        row = message.model_dump(by_alias=True, mode="json")
+        row = message.model_dump(
+            by_alias=True,
+            mode="json",
+            exclude={"in_reply_to", "hops", "origin", "envelope_version"},
+        )
         row["untrusted"] = True
         return row
 

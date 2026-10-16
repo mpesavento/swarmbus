@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 _AGENT_ID_RE = re.compile(r'^[a-z0-9_-]{1,64}$')
 _MAX_BODY_BYTES = 64 * 1024  # 64KB
+ENVELOPE_VERSION = 2      # what this code stamps on a new message
+DEFAULT_HOP_LIMIT = 4     # Mike, 2026-10-15
 
 # Reserved — these collide with topic semantics and cannot be used as an
 # agent's own registered ID. They are still valid as a `to` field on a
@@ -110,6 +112,13 @@ class AgentMessage(BaseModel):
     # from a newer peer was silently discarded by older daemons.
     priority: str = "normal"
     reply_to: Optional[str] = None
+    # Reply-chain fields. `in_reply_to` is a message id, unlike `reply_to`,
+    # which is an agent address. `origin` is a free string with no validator,
+    # so a future peer's value never makes this receiver drop the envelope.
+    in_reply_to: Optional[str] = None   # id of the message this one answers
+    hops: int = Field(default=0, ge=0)  # replies since the first message of the chain
+    origin: Optional[str] = None        # agent id that sent the first message of the chain
+    envelope_version: int = 1           # absent on the wire = a pre-0.3.0 sender
 
     @field_validator("from_agent", mode="before")
     @classmethod
@@ -138,6 +147,9 @@ class AgentMessage(BaseModel):
         content_type: str = "text/plain",
         priority: str = "normal",
         reply_to: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        hops: int = 0,
+        origin: Optional[str] = None,
     ) -> "AgentMessage":
         return cls.model_validate({
             "from": from_,
@@ -147,6 +159,10 @@ class AgentMessage(BaseModel):
             "content_type": content_type,
             "priority": priority,
             "reply_to": reply_to,
+            "in_reply_to": in_reply_to,
+            "hops": hops,
+            "origin": from_ if origin is None else origin,
+            "envelope_version": ENVELOPE_VERSION,
         })
 
     def to_json(self) -> str:
