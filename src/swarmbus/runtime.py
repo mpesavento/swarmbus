@@ -523,15 +523,28 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
+        hops = 0
+        origin = None
+        if in_reply_to:
+            parent = await self.store.lookup(in_reply_to)
+            if parent is None:
+                hops = 1
+            else:
+                hops = parent["hops"] + 1
+                origin = parent["origin"] or parent["from"]
         message = AgentMessage.create(
             from_=self.agent_id,
             to=to,
             subject=subject,
             body=body,
             content_type=content_type,
+            in_reply_to=in_reply_to or None,
+            hops=hops,
+            origin=origin,
         )
         await self._client.publish(
             self.topics.route(to),
