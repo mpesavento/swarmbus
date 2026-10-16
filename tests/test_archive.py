@@ -410,3 +410,77 @@ async def test_message_store_rows_are_marked_untrusted(db_path, msg):
         assert rows[0]["subject"] == msg.subject
     finally:
         await store.close()
+
+
+def _chain_msg(sender, hops, subject="chain"):
+    return AgentMessage.create(
+        from_=sender, to="sparrow", subject=subject, body="b", hops=hops,
+    )
+
+
+@pytest.mark.asyncio
+async def test_store_holds_past_hop_limit_and_trips_sender(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    at_limit = _chain_msg("wren", 4, "at-limit")
+    past = _chain_msg("wren", 5, "past")
+    fresh_wren = _chain_msg("wren", 0, "fresh-wren")
+    fresh_robin = _chain_msg("robin", 0, "fresh-robin")
+
+    assert await store.store(at_limit, source_topic=topic) is True
+    assert await store.store(past, source_topic=topic) is False
+    assert await store.store(past, source_topic=topic) is False
+    assert await store.store(fresh_wren, source_topic=topic) is False
+    assert await store.store(fresh_robin, source_topic=topic) is True
+
+    rows = await store.read()
+    assert [r["subject"] for r in rows] == ["at-limit", "fresh-robin"]
+    assert set(rows[0]) == {
+        "id", "from", "to", "ts", "subject", "body",
+        "content_type", "priority", "reply_to", "untrusted",
+    }
+
+    holds = await store.list_holds()
+    assert [(t["sender"], t["message_id"]) for t in holds["tripped"]] == [("wren", past.id)]
+    assert holds["held_count"] == 2
+    assert {(h["id"], h["reason"]) for h in holds["held"]} == {
+        (past.id, "hop-limit"), (fresh_wren.id, "sender-tripped"),
+    }
+
+    reopened = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    assert await reopened.admit(_chain_msg("wren", 0), source_topic=topic) is False
+    assert await reopened.reset_trips("wren") == 1
+    assert await reopened.reset_trips("wren") == 0
+    after = _chain_msg("wren", 0, "after-reset")
+    assert await reopened.store(after, source_topic=topic) is True
+    assert [r["subject"] for r in await reopened.read()] == [
+        "at-limit", "fresh-robin", "after-reset",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_admit_records_messages_for_lookup(db_path):
+    topic = "agents/sparrow/inbox"
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    parent = AgentMessage.create(from_="wren", to="sparrow", subject="p", body="b", hops=3, origin="planner")
+    held = AgentMessage.create(from_="robin", to="sparrow", subject="h", body="b", hops=5)
+
+    assert await store.admit(parent, source_topic=topic) is True
+    assert await store.admit(parent, source_topic=topic) is True
+    assert await store.admit(held, source_topic=topic) is False
+
+    assert await store.lookup(parent.id) == {"from": "wren", "hops": 3, "origin": "planner"}
+    assert (await store.lookup(held.id))["hops"] == 5
+    assert await store.lookup("unknown-id") is None
+
+
+@pytest.mark.asyncio
+async def test_admit_holds_hops_beyond_sqlite_integer_range(db_path):
+    store = SQLiteMessageStore(db_path, managed=False, hop_limit=4)
+    huge = AgentMessage.create(from_="wren", to="sparrow", subject="huge", body="b", hops=2**70)
+
+    assert await store.admit(huge, source_topic="agents/sparrow/inbox") is False
+
+    holds = await store.list_holds()
+    assert [t["sender"] for t in holds["tripped"]] == ["wren"]
+    assert holds["held_count"] == 1
