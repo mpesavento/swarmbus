@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import aiomqtt
 import pytest
 
+from swarmbus.archive import MessageConflictError
 from swarmbus.message import AgentMessage
 from swarmbus.runtime import (
     AcknowledgementError,
@@ -644,3 +645,139 @@ async def test_runtime_holds_message_past_hop_limit_and_acks_it(tmp_path):
     assert await runtime.store.read() == []
     default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
     assert default.store.hop_limit == 4
+
+
+def _conflicting_pair():
+    original = _message()
+    reused = original.model_copy(update={"subject": "not the same envelope"})
+    return original, reused
+
+
+@pytest.mark.asyncio
+async def test_reused_message_id_is_recorded_acked_and_not_fatal(tmp_path, caplog):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    await runtime.store.open()
+    ack = _RecordingAck()
+    original, reused = _conflicting_pair()
+
+    await runtime._handle_message(_FakeMqttMessage(original), ack)
+    with caplog.at_level(logging.WARNING, logger="swarmbus.runtime"):
+        await runtime._handle_message(_FakeMqttMessage(reused), ack)
+
+    assert len(ack.messages) == 2
+    assert runtime.state is RuntimeState.CONNECTED
+    assert runtime.last_fatal_error is None
+    assert runtime.last_store_error is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert original.id in warnings[0].getMessage()
+    assert "different envelope" in warnings[0].getMessage()
+    assert [m["subject"] for m in await runtime.store.read()] == [original.subject]
+    conflicts = await runtime.store.list_conflicts()
+    assert [(c["id"], c["from"], c["subject"]) for c in conflicts] == [
+        (original.id, "wren", reused.subject),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reused_message_id_does_not_stop_persistent_receiver(tmp_path, monkeypatch):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", persistent=True,
+    )
+    await runtime.store.open()
+    original, reused = _conflicting_pair()
+    observed_states = []
+
+    class _Messages:
+        def __init__(self, messages):
+            self._messages = iter(messages)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._messages)
+            except StopIteration:
+                observed_states.append(runtime.state)
+                runtime._stopping.set()
+                raise StopAsyncIteration
+
+    class _LoopClient:
+        def __init__(self):
+            self._client = _FakePaho()
+            self.messages = _Messages(
+                [_FakeMqttMessage(original), _FakeMqttMessage(reused)]
+            )
+            self.subscribe = AsyncMock()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    client = _LoopClient()
+    monkeypatch.setattr(
+        "swarmbus.runtime.aiomqtt.Client",
+        lambda *args, **kwargs: client,
+    )
+    monkeypatch.setattr("swarmbus.runtime.asyncio.sleep", AsyncMock())
+
+    await runtime._connection_loop()
+
+    assert client._client.acks == [(42, 1), (42, 1)]
+    assert observed_states == [RuntimeState.CONNECTED]
+    assert runtime.last_fatal_error is None
+    assert runtime.state is not RuntimeState.FATAL
+    assert len(await runtime.store.list_conflicts()) == 1
+
+
+@pytest.mark.asyncio
+async def test_conflict_record_failure_leaves_message_unacked():
+    class _ConflictStore(_FakeStore):
+        async def store(self, msg, *, source_topic):
+            raise MessageConflictError("message ID reused")
+
+        async def record_conflict(self, msg, *, source_topic):
+            raise sqlite3.OperationalError("locked")
+
+    ack = _RecordingAck()
+    runtime = _runtime(_ConflictStore([]), persistent=True)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await runtime._handle_message(_FakeMqttMessage(_message()), ack)
+
+    assert ack.messages == []
+    assert runtime.state is RuntimeState.STORE_DEGRADED
+    assert runtime.last_fatal_error is None
+
+
+@pytest.mark.asyncio
+async def test_identical_redelivery_is_acked_without_conflict_record():
+    class _SeenStore(_FakeStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.conflicts = []
+
+        async def store(self, msg, *, source_topic):
+            self.events.append("seen")
+            return False
+
+        async def record_conflict(self, msg, *, source_topic):
+            self.conflicts.append(msg)
+
+    events = []
+    store = _SeenStore(events)
+    runtime = _runtime(store)
+    ack = _RecordingAck(events)
+
+    await runtime._handle_message(_FakeMqttMessage(_message()), ack)
+
+    assert events == ["seen", "ack"]
+    assert store.conflicts == []
+    assert runtime.state is RuntimeState.CONNECTED

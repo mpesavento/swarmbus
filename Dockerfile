@@ -17,5 +17,7 @@ RUN pip install --no-cache-dir -e ".[mcp,dev]"
 
 COPY tests/ tests/
 COPY scripts/ scripts/
+COPY docs/ docs/
+COPY examples/ examples/
 
 CMD ["pytest", "-v", "--tb=short"]
