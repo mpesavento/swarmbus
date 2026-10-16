@@ -16,6 +16,19 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [Unreleased]
+
+### Changed
+- Wake scripts: `examples/openclaw-wake.sh` now wakes only on `priority=high` by default, with the same `SWARMBUS_WAKE_POLICY` (`priority-high`/`all`/`none`) as `examples/claude-code-wake.sh`; a broadcast (`to: "broadcast"`) never wakes either script or pings Telegram, under any policy, and is still archived by the daemon; both scripts put the receiver's own `~/.swarmbus/receive-protocol-<id>.md` (or `$SWARMBUS_RECEIVE_PROTOCOL`) at the top of the wake prompt, labelled as trusted, ahead of the untrusted peer sections. (#4)
+
+### Wire-compat
+1. **Envelope shape — no change.**
+2. **Topic layout — no change.** Broadcast still reaches every agent across namespaces.
+3. **Retain/QoS defaults — no change.**
+4. **MCP tool contract — no change.** OpenClaw hosts that relied on every message waking the agent set `SWARMBUS_WAKE_POLICY=all` in the daemon's environment.
+
+---
+
 ## [0.2.0] — 2026-10-14
 
 ### Added
