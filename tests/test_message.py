@@ -171,3 +171,14 @@ def test_envelope_without_chain_fields_reads_as_old_peer():
 def test_negative_hops_is_an_invalid_envelope():
     with pytest.raises(ValueError):
         AgentMessage.create(from_="wren", to="sparrow", subject="s", body="b", hops=-1)
+
+
+@pytest.mark.parametrize("bad", ["3", 3.0, 2.5, True, None])
+def test_non_integer_hops_is_an_invalid_envelope(bad):
+    raw = json.dumps({
+        "id": "x-1", "from": "wren", "to": "sparrow",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+        "hops": bad,
+    })
+    with pytest.raises(ValueError):
+        AgentMessage.from_json(raw)
