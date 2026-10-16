@@ -67,6 +67,16 @@ CREATE TABLE IF NOT EXISTS inbox_message_quarantine (
 )
 """
 
+_CREATE_CONFLICTS_TABLE = """
+CREATE TABLE IF NOT EXISTS inbox_message_conflicts (
+    message_id   TEXT NOT NULL,       -- the id already bound to another envelope
+    from_agent   TEXT NOT NULL,
+    source_topic TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL,
+    envelope     TEXT NOT NULL        -- msg.to_json() of the rejected message
+)
+"""
+
 _CREATE_HELD_TABLE = """
 CREATE TABLE IF NOT EXISTS held_messages (
     id           TEXT PRIMARY KEY,
@@ -228,6 +238,7 @@ class SQLiteMessageStore:
 
                     await db.execute(_CREATE_INBOX_TABLE)
                     await db.execute(_CREATE_QUARANTINE_TABLE)
+                    await db.execute(_CREATE_CONFLICTS_TABLE)
 
                     async with db.execute(
                         """SELECT version FROM swarmbus_schema
@@ -438,6 +449,66 @@ class SQLiteMessageStore:
             finally:
                 if not committed:
                     await db.rollback()
+
+    async def record_conflict(
+        self,
+        msg: AgentMessage,
+        *,
+        source_topic: str,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        """Durably note a message whose id is already bound to another envelope.
+
+        The stored envelope is untouched; the rejected one is kept in
+        ``inbox_message_conflicts`` so a person can see who reused the id.
+        """
+        await self._ensure_open()
+        recorded = recorded_at or datetime.now(timezone.utc)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            committed = False
+            try:
+                await db.execute(
+                    """INSERT INTO inbox_message_conflicts
+                       (message_id, from_agent, source_topic, recorded_at,
+                        envelope)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        msg.id,
+                        msg.from_agent,
+                        source_topic,
+                        recorded.isoformat(),
+                        msg.to_json(),
+                    ),
+                )
+                await db.commit()
+                committed = True
+            finally:
+                if not committed:
+                    await db.rollback()
+
+    async def list_conflicts(self, limit: int = 20) -> list[dict]:
+        """Return the newest recorded id conflicts, newest first."""
+        await self._ensure_open()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                """SELECT message_id, from_agent, source_topic, recorded_at,
+                          envelope
+                   FROM inbox_message_conflicts
+                   ORDER BY recorded_at DESC, rowid DESC
+                   LIMIT ?""",
+                (limit,),
+            ) as cursor:
+                return [
+                    {
+                        "id": r[0],
+                        "from": r[1],
+                        "source_topic": r[2],
+                        "recorded_at": r[3],
+                        "subject": json.loads(r[4]).get("subject"),
+                    }
+                    for r in await cursor.fetchall()
+                ]
 
     async def list_holds(self, limit: int = 20) -> dict:
         """Report tripped senders and the newest held messages."""

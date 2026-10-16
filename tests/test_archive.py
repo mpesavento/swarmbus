@@ -167,6 +167,44 @@ async def test_conflicting_duplicate_message_id_is_rejected(db_path, msg):
 
 
 @pytest.mark.asyncio
+async def test_record_conflict_keeps_original_and_lists_rejected(db_path, msg):
+    store = SQLiteMessageStore(db_path)
+    await store.open()
+    try:
+        topic = "agents/sparrow/inbox"
+        await store.store(msg, source_topic=topic)
+        rejected = msg.model_copy(update={"subject": "reused id"})
+        with pytest.raises(MessageConflictError):
+            await store.store(rejected, source_topic=topic)
+
+        await store.record_conflict(rejected, source_topic=topic)
+        await store.record_conflict(rejected, source_topic=topic)
+
+        conflicts = await store.list_conflicts()
+        assert [
+            (c["id"], c["from"], c["source_topic"], c["subject"])
+            for c in conflicts
+        ] == [(msg.id, "wren", topic, "reused id")] * 2
+        assert all(c["recorded_at"] for c in conflicts)
+        assert await store.list_conflicts(limit=1) == conflicts[:1]
+
+        # The first envelope is untouched: still readable and acknowledgeable.
+        assert [item["subject"] for item in await store.read()] == [msg.subject]
+        assert await store.ack([msg.id]) == 1
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM inbox_message_quarantine"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 0
+            async with db.execute(
+                "SELECT version FROM swarmbus_schema WHERE component = 'inbox'"
+            ) as cursor:
+                assert (await cursor.fetchone())[0] == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_acknowledgements_are_idempotent(db_path, msg):
     store = SQLiteMessageStore(db_path)
     await store.open()
@@ -282,6 +320,7 @@ async def test_failed_inbox_migration_rolls_back(monkeypatch, db_path, msg):
                WHERE type = 'table'
                  AND name IN (
                      'inbox_messages',
+                     'inbox_message_conflicts',
                      'inbox_message_quarantine',
                      'swarmbus_schema'
                  )
