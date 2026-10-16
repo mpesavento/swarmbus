@@ -1169,3 +1169,71 @@ def test_held_lists_and_resets_a_rate_cooldown(tmp_path):
     assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 0
     assert json.loads(runner.invoke(main, [*base, "--json"]).stdout)["cooling"] == []
     assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 1
+
+
+def test_on_trip_builds_an_alerter_for_start_watch_and_mcp_server(tmp_path, monkeypatch):
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore"):
+        MockBus.return_value.run = lambda: None
+        result = runner.invoke(main, [
+            "start", "--agent-id", "sparrow", "--on-trip", "notify --label 'trip alert'",
+        ])
+        assert result.exit_code == 0, result.output
+        alerter = MockBus.call_args.kwargs["trip_alerter"]
+        assert alerter.command == ["notify", "--label", "trip alert"]
+        assert (alerter.agent_id, alerter.listener) == ("sparrow", "start")
+
+        result = runner.invoke(main, ["start", "--agent-id", "sparrow"])
+        assert result.exit_code == 0, result.output
+        assert MockBus.call_args.kwargs["trip_alerter"] is None
+
+        MockBus.return_value.watch_inbox = AsyncMock(return_value=None)
+        monkeypatch.setenv("SWARMBUS_ON_TRIP", "notify-watch")
+        result = runner.invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
+        assert result.exit_code == 1
+        alerter = MockBus.call_args.kwargs["trip_alerter"]
+        assert (alerter.command, alerter.listener) == (["notify-watch"], "watch")
+
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = runner.invoke(main, ["mcp-server", "--agent-id", "sparrow"])
+    assert result.exit_code == 0, result.output
+    assert run_server.call_args.kwargs["on_trip"] == ["notify-watch"]
+
+
+def test_doctor_reports_tripped_senders_and_held_count(tmp_path):
+    import asyncio as _asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state = tmp_path / "state"
+    runner = CliRunner()
+
+    def run_doctor():
+        with patch("swarmbus.cli.AgentBus") as MockBus, patch("swarmbus.cli.aiomqtt"):
+            MockBus.probe.return_value._aiomqtt_kwargs = lambda: {}
+            MockBus.probe.return_value.list_agents = AsyncMock(return_value=["sparrow"])
+            return runner.invoke(main, ["doctor", "--agent-id", "sparrow", "--state-dir", str(state)])
+
+    result = run_doctor()
+    assert "no state db at" in result.output
+    assert not (state / "sparrow.sqlite3").exists()
+
+    async def trip():
+        store = SQLiteMessageStore(state / "sparrow.sqlite3", hop_limit=1, rate_limit=1)
+        topic = "agents/sparrow/inbox"
+        for sender, hops in (("wren", 2), ("wren", 0), ("robin", 0), ("robin", 0)):
+            msg = AgentMessage.create(from_=sender, to="sparrow", subject="s", body="b", hops=hops)
+            await store.admit(msg, source_topic=topic)
+    _asyncio.run(trip())
+
+    result = run_doctor()
+    assert result.exit_code == 1, result.output
+    assert "2 tripped: wren (hop-limit), robin (rate-limit until " in result.output
+    assert "; 3 message(s) held" in result.output
+    assert "swarmbus held --agent-id sparrow" in result.output
+
+    _asyncio.run(SQLiteMessageStore(state / "sparrow.sqlite3").reset_trips("wren"))
+    result = run_doctor()
+    assert "1 tripped: robin (rate-limit until " in result.output
+    assert "[⚠] 8. tripped senders" in result.output
