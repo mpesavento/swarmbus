@@ -5,14 +5,17 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
 
 import aiomqtt
 
-from .message import AgentMessage, _validate_registered_agent_id
+from .message import AgentMessage, _validate_registered_agent_id, sanitize_field
 from .handlers.base import BaseHandler
 from .topics import DEFAULT_TOPICS, TopicMap
 from ._compat import asyncio_timeout
+
+if TYPE_CHECKING:
+    from .archive import SQLiteMessageStore
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,8 @@ class AgentBus:
     # topic. Root-less by default, which keeps the wire format unchanged;
     # a rooted deployment overrides this with TopicMap(root=...).
     topics: TopicMap = DEFAULT_TOPICS
+    # Same reasoning: a probe bus never runs __init__ and holds nothing.
+    hold_store: "SQLiteMessageStore | None" = None
 
     def __init__(
         self,
@@ -94,6 +99,7 @@ class AgentBus:
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        hold_store: "SQLiteMessageStore | None" = None,
     ) -> None:
         """Construct an AgentBus.
 
@@ -129,6 +135,10 @@ class AgentBus:
         TLS engages when ``tls=True`` or any of ``ca_cert`` / ``client_cert``
         / ``client_key`` is set; otherwise the broker connection is
         plaintext.
+
+        hold_store: when set, ``listen()`` and ``watch_inbox()`` refuse
+        messages the store holds (past its hop limit, or from a tripped
+        sender). When None they behave exactly as before.
         """
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -151,6 +161,7 @@ class AgentBus:
             client_cert=client_cert,
             client_key=client_key,
         )
+        self.hold_store = hold_store
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -217,6 +228,7 @@ class AgentBus:
             client_key=client_key,
         )
         self._handlers = []
+        self.hold_store = None
         self._client = None
         self._client_cm = None
         return self
@@ -358,6 +370,9 @@ class AgentBus:
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
+        if self.hold_store is not None:
+            # A failure propagates: better to exit than run unprotected.
+            await self.hold_store.open()
         backoff = reconnect_initial
         while True:
             try:
@@ -384,6 +399,22 @@ class AgentBus:
                                 "Discarding invalid message envelope: %s", exc
                             )
                             continue
+
+                        if self.hold_store is not None:
+                            try:
+                                admitted = await self.hold_store.admit(
+                                    msg, source_topic=str(mqtt_msg.topic)
+                                )
+                            except Exception as exc:
+                                # Fail closed: an unreadable hold store
+                                # must not let a message through.
+                                logger.error(
+                                    "hold check failed for message %s: %s",
+                                    sanitize_field(msg.id), exc,
+                                )
+                                continue
+                            if not admitted:
+                                continue
 
                         for handler in self._handlers:
                             try:
@@ -460,10 +491,18 @@ class AgentBus:
         agent-id can hold the session: do not run a daemon or persistent
         MCP server for the same agent-id.
 
+        With a ``hold_store``, messages the store holds are skipped (and
+        acknowledged in persistent mode) and never returned; they do not
+        extend the timeout. If the store cannot be read, the message is
+        neither returned nor acknowledged.
+
         Returns None on timeout. Raises ``aiomqtt.MqttError`` if the broker
         is unreachable; callers that want graceful None-on-error (e.g. the
         MCP tool surface) must catch it themselves.
         """
+        if self.hold_store is not None:
+            # A failure propagates, before any connection is made.
+            await self.hold_store.open()
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
@@ -491,6 +530,23 @@ class AgentBus:
                             if ack_adapter is not None:
                                 ack_adapter.ack(mqtt_msg)
                             continue
+                        if self.hold_store is not None:
+                            try:
+                                admitted = await self.hold_store.admit(
+                                    msg, source_topic=str(mqtt_msg.topic)
+                                )
+                            except Exception as exc:
+                                # Fail closed and leave it unacknowledged:
+                                # a persistent session redelivers it.
+                                logger.error(
+                                    "hold check failed for message %s: %s",
+                                    sanitize_field(msg.id), exc,
+                                )
+                                continue
+                            if not admitted:
+                                if ack_adapter is not None:
+                                    ack_adapter.ack(mqtt_msg)
+                                continue
                         if ack_adapter is not None:
                             ack_adapter.ack(mqtt_msg)
                         return result
