@@ -72,10 +72,10 @@ class RegistryGCReport(BaseModel):
     raced: int = 0
     malformed: int = 0
     deleted: int = 0
-    # Deleted identities whose durable MQTT session was destroyed.
+    # Deleted identities whose persistent MQTT session was destroyed.
     sessions_destroyed: int = 0
-    # Durable identities whose records were cleared but whose session was
-    # kept because presence was never positively observed offline.
+    # Records whose persistent session was kept because presence was never
+    # positively observed offline.
     sessions_preserved: int = 0
     would_delete: int = 0
     disappeared: int = 0
@@ -608,7 +608,7 @@ class RegistryMaintenance:
                     presence_deleted = False
                     try:
                         if destroy_session:
-                            # Retiring a durable identity also destroys its session.
+                            # A stable session is destroyed only with positive offline evidence.
                             async with self._new_client(
                                 identifier=f"swarmbus-{original.agent_id}",
                                 clean_session=True,
@@ -839,7 +839,7 @@ class RegistryMaintenance:
             )
             try:
                 # Stay on the anonymous client: connecting under the agent's
-                # own client id would destroy any durable session it holds,
+                # own client id would destroy any persistent session it holds,
                 # and an orphan carries no record saying whether it has one.
                 await client.publish(
                     self.topics.presence(agent_id),

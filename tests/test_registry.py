@@ -201,13 +201,13 @@ def test_capabilities_are_normalized_but_remain_open_vocabulary():
         )
 
 
-def test_lifecycle_defaults_persistent_for_schema_v1_compatibility():
+def test_lifecycle_defaults_named_for_schema_v1_compatibility():
     payload = _record("foo").model_dump()
     payload.pop("lifecycle")
 
     record = RegistryRecord.model_validate(payload)
 
-    assert record.lifecycle == "persistent"
+    assert record.lifecycle == "named"
 
 
 def test_lifecycle_filter_partitions_the_directory():
@@ -231,7 +231,7 @@ def test_lifecycle_filter_partitions_the_directory():
     ]
     assert [
         state["agent_id"]
-        for state in cache.list_states(lifecycle="persistent")
+        for state in cache.list_states(lifecycle="named")
     ] == ["healthcheck"]
     assert [
         state["agent_id"]
@@ -239,7 +239,7 @@ def test_lifecycle_filter_partitions_the_directory():
     ] == ["transient-session"]
 
 
-def test_lifecycle_filter_still_lists_offline_persistent_agents():
+def test_lifecycle_filter_still_lists_offline_named_agents():
     cache = RegistryCache(stale_after_seconds=180)
     record = _record("healthcheck", age_seconds=181)
     cache.update_registry(
@@ -249,11 +249,11 @@ def test_lifecycle_filter_still_lists_offline_persistent_agents():
         DEFAULT_TOPICS.presence("healthcheck"), _presence_payload("healthcheck")
     )
 
-    assert cache.list_states(lifecycle="persistent") == []
+    assert cache.list_states(lifecycle="named") == []
     assert [
         state["agent_id"]
         for state in cache.list_states(
-            lifecycle="persistent", include_offline=True
+            lifecycle="named", include_offline=True
         )
     ] == ["healthcheck"]
 
@@ -300,13 +300,13 @@ def test_registry_reads_do_not_refresh_last_seen():
     assert second["last_seen"] == record.last_seen.isoformat()
 
 
-def test_transient_gc_never_selects_persistent_records():
+def test_transient_gc_never_selects_named_records():
     now = datetime(2026, 10, 2, tzinfo=timezone.utc)
     record = RegistryRecord.model_validate(
         {
             **_record("relay", age_seconds=0).model_dump(),
             "last_seen": now - timedelta(days=30),
-            "lifecycle": "persistent",
+            "lifecycle": "named",
         }
     )
 
@@ -323,7 +323,7 @@ def test_transient_gc_never_selects_persistent_records():
     )
 
     assert decision.eligible is False
-    assert decision.reason is GCDecisionReason.PERSISTENT
+    assert decision.reason is GCDecisionReason.NAMED
 
 
 @pytest.mark.parametrize(

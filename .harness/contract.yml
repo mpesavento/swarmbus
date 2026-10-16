@@ -1,0 +1,47 @@
+# swarmbus's Verification Contract for drydock (https://github.com/mpesavento/drydock, spec §1).
+# It declares how a drydock run builds, installs and tests this repo. Runs branch from `dev` and
+# open their PRs against `dev`; `main` is the production release branch.
+version: 2
+
+runtime:
+  image: "swarmbus-harness:local"
+  build: "docker build -f Dockerfile.harness -t {image} ."
+  workdir: /repo
+  # The suite starts its own mosquitto broker on localhost and calls no outside service.
+  secrets_required: none
+
+commands:
+  # Both extras, as CI installs them (`pip install -e ".[mcp,dev]"`), from the committed lockfile.
+  install: "uv sync --frozen --all-extras"
+  # No `lint` or `typecheck`: the repo declares no linter or type checker.
+
+suites:
+  # The whole pytest suite, as CI runs it on Python 3.12 (CI also runs 3.10, 3.11 and 3.13).
+  # --frozen: a test run never rewrites uv.lock in the worktree.
+  - { name: unit, layer: core, cmd: "uv run --frozen pytest -q", load_bearing: true }
+
+test_one: "uv run --frozen pytest -q {file}"
+test_layout:
+  frameworks: { core: pytest }
+  globs: { core: "tests/**/test_*.py" }
+
+layers:
+  - { name: core, paths: ["src/**", "tests/**", "scripts/**", "examples/**"] }
+
+# A planned change under any of these gets a person on the merge; an unplanned one blocks.
+sensitive_paths:
+  - ".harness/**"
+  - "Dockerfile.harness"
+  - "pyproject.toml"
+  - "uv.lock"
+  - "Dockerfile"
+  - "compose.yaml"
+  - ".github/workflows/**"
+  - "systemd/**"
+  - "scripts/install-systemd.sh"
+  - "scripts/setup-*.sh"
+
+actions:
+  adapters: ["cli"]
+
+review: { strategy: cost }

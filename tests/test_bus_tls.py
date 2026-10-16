@@ -172,7 +172,7 @@ async def test_listen_passes_auth_alongside_will_and_durable():
     bus = AgentBus(
         agent_id="listener", broker="b", port=8883,
         username="alice", password="secret", tls=True,
-        durable=True,
+        persistent=True,
     )
     with patch("swarmbus.bus.aiomqtt.Client", side_effect=_FakeClient):
         await bus.listen()
@@ -180,7 +180,7 @@ async def test_listen_passes_auth_alongside_will_and_durable():
     assert kw["username"] == "alice"
     assert kw["password"] == "secret"
     assert isinstance(kw["tls_context"], ssl.SSLContext)
-    # Auth kwargs must coexist with the will + durable-session kwargs;
+    # Auth kwargs must coexist with the will + persistent-session kwargs;
     # regression here would mean one merge clobbered the other.
     assert "will" in kw
     assert kw["identifier"] == "swarmbus-listener"

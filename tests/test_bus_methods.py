@@ -6,6 +6,8 @@ timeout and malformed-envelope branches directly.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -23,11 +25,35 @@ _INBOX_TOPIC = DEFAULT_TOPICS.inbox("me")
 
 
 class _FakeMsg:
-    """aiomqtt.Message stand-in. Carries the topic: presence ownership is
-    defined by it, not by the payload."""
-    def __init__(self, payload: bytes, topic: str):
+    """Minimal aiomqtt message carrying transport and topic metadata."""
+    def __init__(
+        self,
+        payload: bytes,
+        topic: str = _INBOX_TOPIC,
+        mid: int = 0,
+        qos: int = 1,
+    ):
         self.payload = payload
         self.topic = topic
+        self.mid = mid
+        self.qos = qos
+
+
+class _FakePaho:
+    """Stands in for the paho client aiomqtt wraps; records manual-ack use."""
+    def __init__(self, events: list):
+        self._events = events
+        self.manual_ack = None
+        self.acks: list[tuple[int, int]] = []
+
+    def manual_ack_set(self, on: bool):
+        self.manual_ack = on
+        self._events.append(("manual_ack_set", on))
+
+    def ack(self, mid: int, qos: int):
+        self.acks.append((mid, qos))
+        self._events.append(("ack", mid))
+        return 0
 
 
 def _legacy_presence(agent_id: str, status: str) -> _FakeMsg:
@@ -64,11 +90,14 @@ class _FakeClient:
         topic: str = _INBOX_TOPIC,
     ):
         self._payloads = [
-            p if isinstance(p, _FakeMsg) else _FakeMsg(p, topic)
-            for p in payloads
+            p if isinstance(p, _FakeMsg) else _FakeMsg(p, topic, mid=i)
+            for i, p in enumerate(payloads, start=1)
         ]
+        self.events: list = []
+        self._client = _FakePaho(self.events)
 
     async def __aenter__(self):
+        self.events.append(("enter",))
         return self
 
     async def __aexit__(self, *_):
@@ -76,6 +105,9 @@ class _FakeClient:
 
     async def subscribe(self, *_args, **_kwargs):
         pass
+
+    async def publish(self, topic, payload, **kwargs):
+        self.events.append(("publish", str(topic), payload, kwargs))
 
     @property
     def messages(self):
@@ -350,7 +382,7 @@ async def test_send_outbox_disabled_when_unset(tmp_path):
 
 @pytest.mark.asyncio
 async def test_listen_durable_passes_stable_identifier_and_clean_session():
-    """durable=True → stable client-id + clean_session=False on the MQTT client."""
+    """persistent=True → stable client-id + clean_session=False on the MQTT client."""
     captured_kwargs = {}
 
     class _ClientStub:
@@ -372,7 +404,7 @@ async def test_listen_durable_passes_stable_identifier_and_clean_session():
             return _empty()
 
     with patch("swarmbus.bus.aiomqtt.Client", _ClientStub):
-        bus = AgentBus(agent_id="sparrow", durable=True)
+        bus = AgentBus(agent_id="sparrow", persistent=True)
         await bus.listen()
     assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
     assert captured_kwargs.get("clean_session") is False
@@ -401,7 +433,7 @@ async def test_listen_non_durable_omits_identifier():
             return _empty()
 
     with patch("swarmbus.bus.aiomqtt.Client", _ClientStub):
-        bus = AgentBus(agent_id="sparrow", durable=False)
+        bus = AgentBus(agent_id="sparrow", persistent=False)
         await bus.listen()
     assert "identifier" not in captured_kwargs
     assert "clean_session" not in captured_kwargs
@@ -424,13 +456,13 @@ async def test_send_outbox_agent_id_template_substitutes(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# read_inbox / watch_inbox durable session kwargs
+# read_inbox / watch_inbox persistent session kwargs
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_read_inbox_durable_passes_identifier_and_clean_session():
-    """durable=True → stable client-id + clean_session=False on read_inbox."""
+    """persistent=True → stable client-id + clean_session=False on read_inbox."""
     captured_kwargs = {}
     payloads = [_envelope(subject="queued")]
 
@@ -440,7 +472,7 @@ async def test_read_inbox_durable_passes_identifier_and_clean_session():
             super().__init__(payloads)
 
     with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
-        bus = AgentBus(agent_id="sparrow", durable=True)
+        bus = AgentBus(agent_id="sparrow", persistent=True)
         result = await bus.read_inbox(drain_timeout=0.1)
     assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
     assert captured_kwargs.get("clean_session") is False
@@ -449,7 +481,7 @@ async def test_read_inbox_durable_passes_identifier_and_clean_session():
 
 @pytest.mark.asyncio
 async def test_read_inbox_non_durable_omits_identifier():
-    """durable=False (default) → no identifier or clean_session set."""
+    """persistent=False (default) → no identifier or clean_session set."""
     captured_kwargs = {}
 
     class _CapturingClient(_FakeClient):
@@ -458,7 +490,7 @@ async def test_read_inbox_non_durable_omits_identifier():
             super().__init__([])
 
     with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
-        bus = AgentBus(agent_id="sparrow", durable=False)
+        bus = AgentBus(agent_id="sparrow", persistent=False)
         await bus.read_inbox(drain_timeout=0.1)
     assert "identifier" not in captured_kwargs
     assert "clean_session" not in captured_kwargs
@@ -466,7 +498,7 @@ async def test_read_inbox_non_durable_omits_identifier():
 
 @pytest.mark.asyncio
 async def test_watch_inbox_durable_passes_identifier_and_clean_session():
-    """durable=True → stable client-id + clean_session=False on watch_inbox."""
+    """persistent=True → stable client-id + clean_session=False on watch_inbox."""
     captured_kwargs = {}
     payloads = [_envelope(subject="live")]
 
@@ -476,7 +508,7 @@ async def test_watch_inbox_durable_passes_identifier_and_clean_session():
             super().__init__(payloads)
 
     with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
-        bus = AgentBus(agent_id="sparrow", durable=True)
+        bus = AgentBus(agent_id="sparrow", persistent=True)
         result = await bus.watch_inbox(timeout=0.1)
     assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
     assert captured_kwargs.get("clean_session") is False
@@ -485,7 +517,7 @@ async def test_watch_inbox_durable_passes_identifier_and_clean_session():
 
 @pytest.mark.asyncio
 async def test_watch_inbox_non_durable_omits_identifier():
-    """durable=False (default) → no identifier or clean_session set."""
+    """persistent=False (default) → no identifier or clean_session set."""
     captured_kwargs = {}
 
     class _CapturingClient(_FakeClient):
@@ -494,7 +526,133 @@ async def test_watch_inbox_non_durable_omits_identifier():
             super().__init__([])
 
     with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
-        bus = AgentBus(agent_id="sparrow", durable=False)
+        bus = AgentBus(agent_id="sparrow", persistent=False)
         await bus.watch_inbox(timeout=0.1)
     assert "identifier" not in captured_kwargs
     assert "clean_session" not in captured_kwargs
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_persistent_acks_only_the_returned_message():
+    """persistent=True → manual ack on before connect; only the returned mid is acked."""
+    fake = _FakeClient([_envelope(subject="first"), _envelope(subject="second")])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        result = await bus.watch_inbox(timeout=0.2)
+    assert result is not None
+    assert result["subject"] == "first"
+    assert fake._client.acks == [(1, 1)]
+    assert fake._client.manual_ack is True
+    assert fake.events.index(("manual_ack_set", True)) < fake.events.index(("enter",))
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_persistent_acks_skipped_bad_envelope():
+    """A skipped malformed payload is acked too, in order, before the returned one."""
+    fake = _FakeClient([b"garbage", _envelope(subject="good")])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        bus = AgentBus(agent_id="sparrow", persistent=True)
+        result = await bus.watch_inbox(timeout=0.2)
+    assert result is not None
+    assert result["subject"] == "good"
+    assert fake._client.acks == [(1, 1), (2, 1)]
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_non_persistent_never_touches_manual_ack():
+    """persistent=False → manual ack stays untouched and nothing is acked."""
+    fake = _FakeClient([b"garbage", _envelope(subject="good")])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        bus = AgentBus(agent_id="sparrow", persistent=False)
+        result = await bus.watch_inbox(timeout=0.2)
+    assert result is not None
+    assert result["subject"] == "good"
+    assert fake._client.manual_ack is None
+    assert fake._client.acks == []
+
+@pytest.mark.asyncio
+async def test_persistent_watch_publishes_named_registry_and_presence():
+    captured_kwargs = {}
+    fake = _FakeClient([_envelope(subject="live")])
+
+    def client(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return fake
+
+    with patch("swarmbus.bus.aiomqtt.Client", client):
+        result = await AgentBus(
+            agent_id="sparrow",
+            persistent=True,
+        ).watch_inbox(timeout=0.1)
+
+    assert result is not None
+    will = captured_kwargs["will"]
+    assert str(will.topic) == DEFAULT_TOPICS.presence("sparrow")
+    assert json.loads(will.payload)["state"] == "offline"
+
+    publishes = [event for event in fake.events if event[0] == "publish"]
+    assert [event[1] for event in publishes] == [
+        DEFAULT_TOPICS.registry("sparrow"),
+        DEFAULT_TOPICS.presence("sparrow"),
+        DEFAULT_TOPICS.presence("sparrow"),
+    ]
+    registry = json.loads(publishes[0][2])
+    assert registry["lifecycle"] == "named"
+    assert registry["durability"] == "durable"
+    assert json.loads(publishes[1][2])["state"] == "online"
+    assert json.loads(publishes[2][2])["state"] == "offline"
+
+
+def _topic_client(payloads):
+    class _Msg:
+        def __init__(self, payload):
+            self.topic = "agents/me/inbox"
+            self.payload = payload
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def subscribe(self, *_args, **_kwargs):
+            pass
+
+        @property
+        def messages(self):
+            async def _gen():
+                for p in payloads:
+                    yield _Msg(p)
+                await asyncio.sleep(30)
+            return _gen()
+
+    return _Client()
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_skips_held_messages_and_records_admitted_ones(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "me.sqlite3", managed=False, hop_limit=4)
+    bus = AgentBus(agent_id="me", broker="localhost", hold_store=store)
+    past = AgentMessage.create(from_="wren", to="me", subject="past", body="b", hops=5)
+    tripped = AgentMessage.create(from_="wren", to="me", subject="tripped", body="b")
+    ok = AgentMessage.create(from_="robin", to="me", subject="ok", body="b", hops=2, origin="planner")
+    payloads = [m.to_json().encode() for m in (past, tripped, ok)]
+
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_topic_client(payloads)):
+        result = await bus.read_inbox(max_messages=1, drain_timeout=0.2)
+
+    assert [m["subject"] for m in result] == ["ok"]
+    holds = await store.list_holds()
+    assert [t["sender"] for t in holds["tripped"]] == ["wren"]
+    assert holds["held_count"] == 2
+    assert await store.lookup(ok.id) == {"from": "robin", "hops": 2, "origin": "planner"}
+
+    empty = SQLiteMessageStore(tmp_path / "empty" / "me.sqlite3", managed=False)
+    bus = AgentBus(agent_id="me", broker="localhost", hold_store=empty)
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_topic_client([])):
+        assert await bus.read_inbox(drain_timeout=0.1) == []
+    assert (tmp_path / "empty" / "me.sqlite3").exists()
+

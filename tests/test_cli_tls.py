@@ -199,10 +199,10 @@ def test_mcp_server_durable_flag_threads_through():
     with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
         result = runner.invoke(
             main,
-            ["mcp-server", "--agent-id", "sb", "--durable", "--presence"],
+            ["mcp-server", "--agent-id", "sb", "--persistent", "--presence"],
         )
     assert result.exit_code == 0, result.output
-    assert mock_run.call_args.kwargs["durable"] is True
+    assert mock_run.call_args.kwargs["persistent"] is True
 
 
 def test_mcp_server_no_durable_is_default():
@@ -213,7 +213,7 @@ def test_mcp_server_no_durable_is_default():
             ["mcp-server", "--agent-id", "sb"],
         )
     assert result.exit_code == 0, result.output
-    assert mock_run.call_args.kwargs["durable"] is False
+    assert mock_run.call_args.kwargs["persistent"] is False
 
 
 def test_mcp_server_registry_timing_env_vars():
@@ -302,26 +302,26 @@ def test_mcp_server_rejects_transient_without_presence():
 _ACCEPTED_DURABLE_PRESENCE_FLAGS = [
     ([], False, False),
     (["--presence"], False, True),
-    (["--durable", "--presence"], True, True),
+    (["--persistent", "--presence"], True, True),
 ]
 _REJECTED_DURABLE_PRESENCE_FLAGS = [
-    (["--durable"], True, False),
+    (["--persistent"], True, False),
 ]
 
 
 def test_mcp_server_durable_presence_flag_matrix_is_exhaustive():
     """Cover the lifecycle/presence flag cross product."""
     covered = {
-        (durable, presence)
-        for _, durable, presence in (
+        (persistent, presence)
+        for _, persistent, presence in (
             _ACCEPTED_DURABLE_PRESENCE_FLAGS
             + _REJECTED_DURABLE_PRESENCE_FLAGS
         )
     }
 
     assert covered == {
-        (durable, presence)
-        for durable in (False, True)
+        (persistent, presence)
+        for persistent in (False, True)
         for presence in (False, True)
     }
 
@@ -335,7 +335,7 @@ def test_mcp_server_accepts_valid_durable_presence_combinations(
     expected_durable,
     expected_presence,
 ):
-    """Only durable sidecars without presence are rejected."""
+    """Only persistent sidecars without presence are rejected."""
     runner = CliRunner()
     with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
         result = runner.invoke(
@@ -344,7 +344,7 @@ def test_mcp_server_accepts_valid_durable_presence_combinations(
         )
 
     assert result.exit_code == 0, result.output
-    assert mock_run.call_args.kwargs["durable"] is expected_durable
+    assert mock_run.call_args.kwargs["persistent"] is expected_durable
     assert mock_run.call_args.kwargs["presence"] is expected_presence
 
 
@@ -357,7 +357,7 @@ def test_mcp_server_rejects_durable_without_presence(
     expected_durable,
     expected_presence,
 ):
-    """Reject durable sidecars absent from the directory."""
+    """Reject persistent sidecars absent from the directory."""
     runner = CliRunner()
     with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
         result = runner.invoke(
@@ -366,30 +366,30 @@ def test_mcp_server_rejects_durable_without_presence(
         )
 
     assert result.exit_code == 2, result.output
-    assert "--durable" in result.output
+    assert "--persistent" in result.output
     assert "--presence" in result.output
     assert mock_run.call_count == 0
 
 
-def test_mcp_server_rejects_the_retired_persistent_flag():
-    """Reject the removed --persistent option."""
+def test_mcp_server_rejects_the_retired_durable_flag():
+    """Reject the removed --durable option."""
     runner = CliRunner()
     with patch("swarmbus.mcp_server.run_mcp_server") as mock_run:
         result = runner.invoke(
             main,
-            ["mcp-server", "--agent-id", "sb", "--persistent", "--presence"],
+            ["mcp-server", "--agent-id", "sb", "--durable", "--presence"],
         )
 
     assert result.exit_code == 2, result.output
-    assert "--persistent" in result.output
+    assert "--durable" in result.output
     assert mock_run.call_count == 0
 
 
 def _durable_default(command_name):
-    """Read the --durable default off the command that declares it."""
+    """Read the --persistent default off the command that declares it."""
     command = main.commands[command_name]
     option = next(
-        param for param in command.params if param.name == "durable"
+        param for param in command.params if param.name == "persistent"
     )
     return option.default
 
@@ -404,8 +404,8 @@ def test_durable_defaults_differ_between_start_and_mcp_server():
     ("lifecycle", "presence_flags", "expected_presence"),
     [
         ("transient", ["--presence"], True),
-        ("persistent", [], False),
-        ("persistent", ["--presence"], True),
+        ("named", [], False),
+        ("named", ["--presence"], True),
     ],
 )
 def test_mcp_server_accepts_valid_lifecycle_presence_combinations(
@@ -440,7 +440,7 @@ def test_mcp_server_default_lifecycle_presence_pair_is_accepted():
         result = runner.invoke(main, ["mcp-server", "--agent-id", "sb"])
 
     assert result.exit_code == 0, result.output
-    assert mock_run.call_args.kwargs["lifecycle"] == "persistent"
+    assert mock_run.call_args.kwargs["lifecycle"] == "named"
     assert mock_run.call_args.kwargs["presence"] is False
 
 

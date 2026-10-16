@@ -12,9 +12,16 @@ from typing import Any, Literal
 
 import aiomqtt
 
-from .archive import SQLiteMessageStore
-from .bus import _build_tls_context
-from .message import AgentMessage, _validate_registered_agent_id
+from .archive import MessageConflictError, SQLiteMessageStore
+from .bus import MAX_QUEUED_INCOMING_MESSAGES, _build_tls_context
+from .message import (
+    DEFAULT_HOP_LIMIT,
+    DEFAULT_RATE_COOLDOWN,
+    DEFAULT_RATE_LIMIT,
+    AgentMessage,
+    _validate_registered_agent_id,
+    sanitize_field,
+)
 from .registry import (
     AgentLifecycle,
     RegistryCache,
@@ -95,7 +102,7 @@ class _ManualAckAdapter:
 
 
 class ManagedMCPRuntime:
-    """One MQTT connection and durable SQLite inbox for an MCP server."""
+    """One MQTT connection and persistent SQLite inbox for an MCP server."""
 
     def __init__(
         self,
@@ -103,9 +110,9 @@ class ManagedMCPRuntime:
         agent_id: str,
         broker: str = "localhost",
         port: int = 1883,
-        durable: bool = False,
+        persistent: bool = False,
         presence: bool = False,
-        lifecycle: AgentLifecycle = "persistent",
+        lifecycle: AgentLifecycle = "named",
         client_id: str | None = None,
         heartbeat_seconds: float = 60,
         stale_after_seconds: float = 180,
@@ -118,10 +125,13 @@ class ManagedMCPRuntime:
         client_cert: str | None = None,
         client_key: str | None = None,
         store: SQLiteMessageStore | Any | None = None,
+        hop_limit: int = DEFAULT_HOP_LIMIT,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     ) -> None:
         _validate_registered_agent_id(agent_id)
-        if lifecycle not in {"persistent", "transient"}:
-            raise ValueError("lifecycle must be persistent or transient")
+        if lifecycle not in {"named", "transient"}:
+            raise ValueError("lifecycle must be named or transient")
         if lifecycle == "transient" and not presence:
             raise ValueError(
                 "lifecycle='transient' requires presence=True "
@@ -129,20 +139,20 @@ class ManagedMCPRuntime:
                 "describes how this identity's directory record is "
                 "retired, and a presence-free runtime has no directory "
                 "record, so the declaration applies to nothing. Enable "
-                "presence, or use lifecycle='persistent' "
-                "(--lifecycle persistent)."
+                "presence, or use lifecycle='named' "
+                "(--lifecycle named)."
             )
-        if durable and not presence:
+        if persistent and not presence:
             raise ValueError(
-                "durable=True requires presence=True (--durable "
-                "requires --presence): a durable MQTT session makes the "
+                "persistent=True requires presence=True (--persistent "
+                "requires --presence): a persistent MQTT session makes the "
                 "broker queue messages for this identity while it is "
                 "away, but a presence-free identity never appears in the "
                 "directory, so no operator can discover it with "
                 "`swarmbus list` or retire it with `swarmbus "
                 "registry-forget` and its queued backlog grows forever. "
-                "Enable presence, or use durable=False "
-                "(--no-durable) for a live-session runtime."
+                "Enable presence, or use persistent=False "
+                "(--no-persistent) for a live-session runtime."
             )
         if client_id is not None:
             _validate_registered_agent_id(client_id)
@@ -155,7 +165,7 @@ class ManagedMCPRuntime:
         self.agent_id = agent_id
         self.broker = broker
         self.port = port
-        self.durable = durable
+        self.persistent = persistent
         self.presence = presence
         self.lifecycle = lifecycle
         self.client_id = client_id
@@ -168,7 +178,12 @@ class ManagedMCPRuntime:
             client_cert=client_cert,
             client_key=client_key,
         )
-        self.store = store or SQLiteMessageStore(state_path)
+        self.store = store or SQLiteMessageStore(
+            state_path,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+        )
         self.topics = DEFAULT_TOPICS
         self.registry = RegistryCache(
             stale_after_seconds=stale_after_seconds,
@@ -210,7 +225,9 @@ class ManagedMCPRuntime:
         self._replay_settled = True
 
     def _client_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.presence:
             kwargs["will"] = aiomqtt.Will(
                 topic=self.topics.presence(self.agent_id),
@@ -229,7 +246,7 @@ class ManagedMCPRuntime:
         if self._tls_context is not None:
             kwargs["tls_context"] = self._tls_context
         identifier = self.client_id
-        if self.durable:
+        if self.persistent:
             identifier = identifier or f"swarmbus-{self.agent_id}"
             kwargs["clean_session"] = False
         if identifier is not None:
@@ -400,7 +417,7 @@ class ManagedMCPRuntime:
                 # Only now is the willed connection gone, so reclaiming the
                 # client id cannot make the broker publish its will.
                 if destroy_session:
-                    await self._destroy_durable_session()
+                    await self._destroy_persistent_session()
                 await self.store.close()
                 if self._state is not RuntimeState.FATAL:
                     self._state = RuntimeState.STOPPED
@@ -437,7 +454,7 @@ class ManagedMCPRuntime:
                             self.topics.any_registry_filter(), qos=1
                         )
                     self._client = client
-                    if self.durable:
+                    if self.persistent:
                         self._replay_activity_at = (
                             asyncio.get_running_loop().time()
                         )
@@ -457,7 +474,7 @@ class ManagedMCPRuntime:
                     await self._notify_inbox_waiters()
                     self._ready.set()
                     async for message in client.messages:
-                        if self.durable and not self._replay_settled:
+                        if self.persistent and not self._replay_settled:
                             self._replay_activity_at = (
                                 asyncio.get_running_loop().time()
                             )
@@ -534,7 +551,7 @@ class ManagedMCPRuntime:
                 "capabilities": [],
             }
         lifecycle = state["lifecycle"]
-        if lifecycle not in {"persistent", "transient"}:
+        if lifecycle not in {"named", "transient"}:
             lifecycle = "unknown"
         return {
             "lifecycle": lifecycle,
@@ -550,12 +567,12 @@ class ManagedMCPRuntime:
         *,
         source_topic: str,
     ) -> bool:
-        """Store once in durable mode; hold and retry in live-session mode."""
+        """Store once in persistent mode; hold and retry in live-session mode."""
         sender_provenance = self._observe_sender_state(message.from_agent)
         backoff = 1.0
         while not self._stopping.is_set():
             try:
-                inserted = await self.store.store(
+                inserted = await self._commit_inbox_message(
                     message,
                     source_topic=source_topic,
                     sender_provenance=sender_provenance,
@@ -564,7 +581,7 @@ class ManagedMCPRuntime:
                 self._last_store_error = exc
                 self._state = RuntimeState.STORE_DEGRADED
                 await self._notify_inbox_waiters()
-                if self.durable:
+                if self.persistent:
                     raise
                 logger.error(
                     "inbox commit failed; retaining delivery and retrying "
@@ -580,6 +597,38 @@ class ManagedMCPRuntime:
                 return inserted
         raise asyncio.CancelledError
 
+    async def _commit_inbox_message(
+        self,
+        message: AgentMessage,
+        *,
+        source_topic: str,
+        sender_provenance: dict,
+    ) -> bool:
+        """Commit one envelope; a reused id is recorded and dropped, not fatal.
+
+        A peer can send two different envelopes under one ``id``. The first
+        one is already in the inbox and stays there; the second is written to
+        ``inbox_message_conflicts`` and reported as not inserted, so the caller
+        acknowledges it and the broker does not redeliver it. A byte-identical
+        redelivery still returns False from ``store`` without raising.
+        """
+        try:
+            return await self.store.store(
+                message,
+                source_topic=source_topic,
+                sender_provenance=sender_provenance,
+            )
+        except MessageConflictError:
+            await self.store.record_conflict(message, source_topic=source_topic)
+            logger.warning(
+                "discarding message %s from %s: its id is already bound to a "
+                "different envelope; the rejected envelope is recorded in "
+                "inbox_message_conflicts",
+                sanitize_field(message.id),
+                sanitize_field(message.from_agent),
+            )
+            return False
+
     async def _handle_message(
         self,
         mqtt_message: Any,
@@ -590,7 +639,9 @@ class ManagedMCPRuntime:
             try:
                 message = AgentMessage.from_json(mqtt_message.payload)
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
-                logger.warning("discarding invalid message envelope: %s", exc)
+                logger.warning(
+                    "discarding invalid message envelope: %s", sanitize_field(exc)
+                )
                 ack_adapter.ack(mqtt_message)
                 return
             inserted = await self._store_inbox_message(
@@ -633,7 +684,9 @@ class ManagedMCPRuntime:
                 ValueError,
                 UnicodeDecodeError,
             ) as exc:
-                logger.warning("discarding invalid presence record: %s", exc)
+                logger.warning(
+                    "discarding invalid presence record: %s", sanitize_field(exc)
+                )
             ack_adapter.ack(mqtt_message)
             return
 
@@ -646,15 +699,28 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
+        hops = 0
+        origin = None
+        if in_reply_to:
+            parent = await self.store.lookup(in_reply_to)
+            if parent is None:
+                hops = 1
+            else:
+                hops = parent["hops"] + 1
+                origin = parent["origin"] or parent["from"]
         message = AgentMessage.create(
             from_=self.agent_id,
             to=to,
             subject=subject,
             body=body,
             content_type=content_type,
+            in_reply_to=in_reply_to or None,
+            hops=hops,
+            origin=origin,
         )
         await self._client.publish(
             self.topics.route(to),
@@ -693,7 +759,7 @@ class ManagedMCPRuntime:
         )
 
     async def _await_startup_replay(self) -> None:
-        """Wait for a quiet window while a durable session replays."""
+        """Wait for a quiet window while a persistent session replays."""
         while self.connected and not self._replay_settled:
             assert self._replay_activity_at is not None
             remaining = (
@@ -856,7 +922,7 @@ class ManagedMCPRuntime:
             working_set=self.working_set if working_set is None else working_set,
             capabilities=[*self.runtime_capabilities, *declared],
             lifecycle=self.lifecycle,
-            durability="durable" if self.durable else "ephemeral",
+            durability="durable" if self.persistent else "ephemeral",
             started_at=self.started_at,
             last_seen=datetime.now(timezone.utc),
         )
@@ -901,7 +967,7 @@ class ManagedMCPRuntime:
                 *self.declared_capabilities,
             ],
             lifecycle=self.lifecycle,
-            durability="durable" if self.durable else "ephemeral",
+            durability="durable" if self.persistent else "ephemeral",
             started_at=self.started_at,
             last_seen=datetime.now(timezone.utc),
         )
@@ -938,11 +1004,10 @@ class ManagedMCPRuntime:
         self.registry.remove_presence(presence_topic)
         self.registry.remove_registry(registry_topic)
         # Reclaiming the client id kicks the live connection, and the broker
-        # publishes the kicked session's will -- recreating the presence
-        # tombstone just removed. Defer the destroy until after a clean close.
-        return self.durable
+        # publishes that connection's will. Defer until after a clean close.
+        return self.persistent
 
-    async def _destroy_durable_session(self) -> None:
+    async def _destroy_persistent_session(self) -> None:
         """Destroy the broker session for a retired transient identity."""
         # A will could recreate the presence orphan just removed.
         kwargs = {
@@ -954,8 +1019,7 @@ class ManagedMCPRuntime:
         try:
             async with aiomqtt.Client(self.broker, port=self.port, **kwargs):
                 pass
-        # A failed destroy must not abort the rest of shutdown, so catch the
-        # transport failures a connect can raise. CancelledError is a
-        # BaseException and still propagates.
+        # Session cleanup is best-effort during shutdown; cancellation still
+        # propagates because CancelledError is a BaseException.
         except (aiomqtt.MqttError, OSError, asyncio.TimeoutError) as exc:
-            logger.warning("failed to destroy durable session: %s", exc)
+            logger.warning("failed to destroy persistent session: %s", exc)

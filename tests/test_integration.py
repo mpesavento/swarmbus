@@ -329,7 +329,7 @@ async def test_durable_runtime_replays_offline_delivery_across_restarts(
     mosquitto_broker,
     tmp_path,
 ):
-    """A durable consumer must durably receive an offline delivery."""
+    """A persistent consumer must durably receive an offline delivery."""
     host, port = mosquitto_broker
     state_path = tmp_path / "consumer.sqlite3"
     runtimes: list[ManagedMCPRuntime] = []
@@ -339,7 +339,7 @@ async def test_durable_runtime_replays_offline_delivery_across_restarts(
             agent_id="consumer",
             broker=host,
             port=port,
-            durable=True,
+            persistent=True,
             presence=True,
             state_path=state_path,
         )
@@ -419,7 +419,7 @@ async def test_durable_runtime_redelivers_after_first_store_failure(
     mosquitto_broker,
     tmp_path,
 ):
-    """A failed durable write must remain unacked and redeliver exactly once."""
+    """A failed persistent write must remain unacked and redeliver exactly once."""
     host, port = mosquitto_broker
     state_path = tmp_path / "receiver.sqlite3"
 
@@ -451,7 +451,7 @@ async def test_durable_runtime_redelivers_after_first_store_failure(
         agent_id="receiver",
         broker=host,
         port=port,
-        durable=True,
+        persistent=True,
         presence=True,
         state_path=state_path,
         store=store,
@@ -1075,7 +1075,7 @@ async def test_registry_list_reports_orphan_wait_after_a_real_gc_stamp(
 async def test_durable_session_queues_message_until_reconnect(
     mosquitto_broker,
 ):
-    """Confirm durable persistent identities receive queued mail."""
+    """Confirm persistent persistent identities receive queued mail."""
     host, port = mosquitto_broker
     agent_id = "queued-session-control"
     client_id = f"swarmbus-{agent_id}"
@@ -1141,16 +1141,16 @@ async def test_transient_durable_shutdown_destroys_queued_session(
     mosquitto_broker,
     tmp_path,
 ):
-    """Clean transient shutdown destroys queued durable-session mail."""
+    """Clean transient shutdown destroys queued persistent-session mail."""
     host, port = mosquitto_broker
-    agent_id = "transient-durable-exit"
+    agent_id = "transient-persistent-exit"
     client_id = f"swarmbus-{agent_id}"
     inbox_topic = DEFAULT_TOPICS.inbox(agent_id)
     runtime = ManagedMCPRuntime(
         agent_id=agent_id,
         broker=host,
         port=port,
-        durable=True,
+        persistent=True,
         presence=True,
         lifecycle="transient",
         state_path=tmp_path / "transient.sqlite3",
@@ -1225,7 +1225,7 @@ async def test_transient_nondurable_clean_stop_tombstones_presence(
         agent_id=agent_id,
         broker=host,
         port=port,
-        durable=False,
+        persistent=False,
         presence=True,
         lifecycle="transient",
         client_id=agent_id,
@@ -1301,7 +1301,7 @@ async def test_transient_durable_clean_stop_tombstones_presence(
         agent_id=agent_id,
         broker=host,
         port=port,
-        durable=True,
+        persistent=True,
         presence=True,
         lifecycle="transient",
         state_path=tmp_path / "transient-durable.sqlite3",
@@ -1505,6 +1505,225 @@ async def test_mcp_tools_expose_expected_signatures(tmp_path):
     ]
 
 
+def _watch_persistent(host, port, agent_id, *extra):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    return CliRunner().invoke(main, [
+        "watch", "--agent-id", agent_id, "--broker", host, "--port", str(port),
+        "--persistent", *extra,
+    ])
+
+
+def _cli_send(host, port, to, subject, body):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    result = CliRunner().invoke(main, [
+        "send", "--agent-id", "pw-sender", "--to", to,
+        "--broker", host, "--port", str(port),
+        "--subject", subject, "--body", body,
+    ])
+    assert result.exit_code == 0, result.output
+
+
+def _drop_session(host, port, agent_id):
+    async def _go():
+        async with aiomqtt.Client(
+            host, port=port,
+            identifier=f"swarmbus-{agent_id}",
+            clean_session=True,
+        ):
+            pass
+
+    asyncio.run(_go())
+
+
+def test_watch_persistent_delivers_message_sent_while_no_watch_running(mosquitto_broker):
+    host, port = mosquitto_broker
+    agent = "pw-single"
+    try:
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        _cli_send(host, port, agent, "while-away", "hello later")
+        result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        msg = json.loads(result.stdout)
+        assert msg["subject"] == "while-away"
+        assert msg["body"] == "hello later"
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_three_offline_messages_arrive_one_per_watch_in_order(
+    mosquitto_broker,
+):
+    host, port = mosquitto_broker
+    agent = "pw-three"
+    subjects = ["queued-one", "queued-two", "queued-three"]
+    try:
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        for subject in subjects:
+            _cli_send(host, port, agent, subject, "body of " + subject)
+        received = []
+        for _ in subjects:
+            result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+            assert result.exit_code == 0, result.output
+            received.append(json.loads(result.stdout))
+        assert [m["subject"] for m in received] == subjects
+        assert len({m["id"] for m in received}) == 3
+        assert _watch_persistent(host, port, agent, "--timeout", "1").exit_code == 1
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_first_ever_run_does_not_see_earlier_message(mosquitto_broker):
+    host, port = mosquitto_broker
+    agent = "pw-first"
+    try:
+        _cli_send(host, port, agent, "before", "sent before any session")
+        assert _watch_persistent(host, port, agent, "--timeout", "1").exit_code == 1
+        _cli_send(host, port, agent, "after", "sent after registration")
+        result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["subject"] == "after"
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_multiline_body_survives_queue(mosquitto_broker):
+    host, port = mosquitto_broker
+    agent = "pw-lines"
+    body = "line one\nline two\n\nline four"
+    try:
+        assert _watch_persistent(host, port, agent, "--timeout", "0.5").exit_code == 1
+        _cli_send(host, port, agent, "multi", body)
+        result = _watch_persistent(host, port, agent, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["body"] == body
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_persistent_holds_past_hop_limit_and_does_not_redeliver(
+    mosquitto_broker, tmp_path,
+):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    host, port = mosquitto_broker
+    agent = "pw-hops"
+    state = ["--state-dir", str(tmp_path / "state")]
+    try:
+        assert _watch_persistent(host, port, agent, *state, "--timeout", "0.5").exit_code == 1
+        storm = CliRunner().invoke(main, [
+            "send", "--agent-id", "pw-storm", "--to", agent,
+            "--broker", host, "--port", str(port),
+            "--subject", "storm", "--body", "again", "--force",
+        ], env={"SWARMBUS_ID": "parent-1", "SWARMBUS_HOPS": "8", "SWARMBUS_ORIGIN": "pw-storm"})
+        assert storm.exit_code == 0, storm.output
+        _cli_send(host, port, agent, "calm", "fresh chain")
+
+        result = _watch_persistent(host, port, agent, *state, "--json", "--timeout", "5")
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.stdout)["subject"] == "calm"
+        assert _watch_persistent(host, port, agent, *state, "--timeout", "1").exit_code == 1
+
+        held = CliRunner().invoke(main, ["held", "--agent-id", agent, *state, "--json"])
+        assert held.exit_code == 0, held.output
+        assert [t["sender"] for t in json.loads(held.stdout)["tripped"]] == ["pw-storm"]
+    finally:
+        _drop_session(host, port, agent)
+
+
+def test_watch_to_watch_replies_accumulate_hops_and_trip_the_limit(
+    mosquitto_broker, tmp_path, monkeypatch,
+):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    for key in ("SWARMBUS_ID", "SWARMBUS_HOPS", "SWARMBUS_ORIGIN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SWARMBUS_HOP_LIMIT", "4")
+    host, port = mosquitto_broker
+    a, b = "pw-chain-a", "pw-chain-b"
+    state = ["--state-dir", str(tmp_path / "state")]
+    broker = ["--broker", host, "--port", str(port)]
+
+    def send(sender, to, subject, extra=(), env=None):
+        result = CliRunner().invoke(main, [
+            "send", "--agent-id", sender, "--to", to, *broker, *state,
+            "--subject", subject, "--body", subject, *extra,
+        ], env=env or {})
+        assert result.exit_code == 0, result.output
+
+    def watch(agent, timeout="5"):
+        return _watch_persistent(host, port, agent, *state, "--json", "--timeout", timeout)
+
+    try:
+        assert watch(a, "0.5").exit_code == 1
+        assert watch(b, "0.5").exit_code == 1
+
+        send(b, a, "three", env={"SWARMBUS_ID": "root", "SWARMBUS_HOPS": "2"})
+        got_a = watch(a)
+        assert got_a.exit_code == 0, got_a.output
+        three = json.loads(got_a.stdout)
+        assert three["hops"] == 3
+
+        send(a, b, "four", ["--in-reply-to", three["id"]])
+        got_b = watch(b)
+        assert got_b.exit_code == 0, got_b.output
+        four = json.loads(got_b.stdout)
+        assert (four["hops"], four["in_reply_to"]) == (4, three["id"])
+
+        send(b, a, "five", ["--in-reply-to", four["id"], "--force"])
+        assert watch(a, "1").exit_code == 1
+
+        held = CliRunner().invoke(main, ["held", "--agent-id", a, *state, "--json"])
+        assert held.exit_code == 0, held.output
+        data = json.loads(held.stdout)
+        assert [t["sender"] for t in data["tripped"]] == [b]
+        assert [h["hops"] for h in data["held"]] == [5]
+    finally:
+        _drop_session(host, port, a)
+        _drop_session(host, port, b)
+
+
+@pytest.mark.asyncio
+async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_broker, tmp_path):
+    host, port = mosquitto_broker
+    store = SQLiteMessageStore(tmp_path / "state" / "pd-hold.sqlite3", hop_limit=4)
+    real_admit = store.admit
+    failures = []
+
+    async def fail_once(msg, *, source_topic):
+        if not failures:
+            failures.append(msg.id)
+            raise OSError("disk I/O error")
+        return await real_admit(msg, source_topic=source_topic)
+
+    store.admit = fail_once
+    handler = CollectingHandler()
+    receiver = AgentBus(
+        agent_id="pd-hold", broker=host, port=port, persistent=True, hold_store=store,
+    )
+    receiver.register_handler(handler)
+    task = asyncio.create_task(receiver.listen(reconnect_initial=0.05))
+    try:
+        await asyncio.sleep(0.3)
+        sender = AgentBus(agent_id="pd-sender", broker=host, port=port)
+        await sender.send(to="pd-hold", subject="survives", body="b")
+        await handler.wait_for_message(timeout=5.0)
+        assert [m.subject for m in handler.received] == ["survives"]
+        assert failures == [handler.received[0].id]
+    finally:
+        await _stop(task)
+        async with aiomqtt.Client(
+            host, port=port, identifier="swarmbus-pd-hold", clean_session=True,
+        ):
+            pass
+        await _clear_retained(host, port, ["agents/pd-hold/presence"])
+
 def test_list_agents_tool_is_gone(tmp_path):
     """The MCP surface exposes agent_state instead of list_agents."""
     runtime = ManagedMCPRuntime(
@@ -1515,3 +1734,80 @@ def test_list_agents_tool_is_gone(tmp_path):
     assert "list_agents" not in create_mcp_app(runtime)._tool_fns
     assert inspect.iscoroutinefunction(runtime.list_agents)
     assert inspect.iscoroutinefunction(AgentBus.probe().list_agents)
+
+def test_read_holds_retained_message_past_hop_limit_and_records_admitted_one(
+    mosquitto_broker, tmp_path,
+):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    host, port = mosquitto_broker
+    agent = "pr-read-hops"
+    state_dir = tmp_path / "state"
+    state = ["--state-dir", str(state_dir)]
+    read = ["read", "--agent-id", agent, "--broker", host, "--port", str(port), *state,
+            "--hop-limit", "4", "--json"]
+
+    async def retain(sender, subject, hops):
+        bus = AgentBus(agent_id=sender, broker=host, port=port, retain=True)
+        await bus.send(to=agent, subject=subject, body=subject, hops=hops, origin="planner")
+
+    async def clear():
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(AgentBus.topics.inbox(agent), payload=b"", qos=1, retain=True)
+
+    try:
+        asyncio.run(retain("pr-storm", "storm", 5))
+        first = CliRunner().invoke(main, read)
+        assert first.exit_code == 0, first.output
+        assert json.loads(first.stdout) == []
+
+        asyncio.run(retain("pr-calm", "calm", 2))
+        second = CliRunner().invoke(main, read)
+        assert second.exit_code == 0, second.output
+        [calm] = json.loads(second.stdout)
+        assert (calm["subject"], calm["hops"]) == ("calm", 2)
+
+        held = CliRunner().invoke(main, ["held", "--agent-id", agent, *state, "--json"])
+        assert held.exit_code == 0, held.output
+        assert [t["sender"] for t in json.loads(held.stdout)["tripped"]] == ["pr-storm"]
+        store = SQLiteMessageStore(state_dir / f"{agent}.sqlite3")
+        assert asyncio.run(store.lookup(calm["id"])) == {
+            "from": "pr-calm", "hops": 2, "origin": "planner",
+        }
+    finally:
+        asyncio.run(clear())
+
+
+def test_watch_persistent_rate_limits_a_flooding_sender(mosquitto_broker, tmp_path):
+    from click.testing import CliRunner
+    from swarmbus.cli import main
+
+    host, port = mosquitto_broker
+    agent = "pw-rate"
+    state = ["--state-dir", str(tmp_path / "state")]
+    opts = [*state, "--rate-limit", "2", "--json"]
+    try:
+        assert _watch_persistent(host, port, agent, *opts, "--timeout", "0.5").exit_code == 1
+        for subject in ("one", "two", "three"):
+            _cli_send(host, port, agent, subject, "flood")
+        calm = CliRunner().invoke(main, [
+            "send", "--agent-id", "pw-calm", "--to", agent,
+            "--broker", host, "--port", str(port), "--subject", "calm", "--body", "b",
+        ])
+        assert calm.exit_code == 0, calm.output
+
+        got = []
+        for _ in range(3):
+            result = _watch_persistent(host, port, agent, *opts, "--timeout", "5")
+            assert result.exit_code == 0, result.output
+            got.append(json.loads(result.stdout)["subject"])
+        assert got == ["one", "two", "calm"]
+        assert _watch_persistent(host, port, agent, *opts, "--timeout", "1").exit_code == 1
+
+        held = CliRunner().invoke(main, ["held", "--agent-id", agent, *state, "--json"])
+        data = json.loads(held.stdout)
+        assert data["tripped"] == []
+        assert [c["sender"] for c in data["cooling"]] == ["pw-sender"]
+    finally:
+        _drop_session(host, port, agent)

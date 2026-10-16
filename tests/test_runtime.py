@@ -5,11 +5,12 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import get_args
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiomqtt
 import pytest
 
+from swarmbus.archive import MessageConflictError
 from swarmbus.bus import _legacy_presence_payload
 from swarmbus.message import AgentMessage
 from swarmbus.registry import AgentLifecycle, RegistryRecord, presence_payload
@@ -126,6 +127,43 @@ def _message():
     )
 
 
+
+def _shutdown_runtime(events, **kwargs):
+    """A connected runtime whose shutdown publishes are recorded in order."""
+    runtime = _runtime(_FakeStore([]), presence=True, **kwargs)
+    client = _FakeClient()
+
+    async def record(topic, payload, **publish_kwargs):
+        events.append((str(topic), payload))
+
+    client.publish = AsyncMock(side_effect=record)
+    runtime._client = client
+    runtime._connection_task = asyncio.create_task(asyncio.sleep(60))
+    return runtime
+
+
+def _capture_session_destroy(monkeypatch, events, *, error=None):
+    """Record the connect kwargs of every client shutdown opens."""
+    connects = []
+
+    class _Session:
+        async def __aenter__(self):
+            events.append(("destroy-session", None))
+            if error is not None:
+                raise error
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    def connect(*args, **kwargs):
+        connects.append(kwargs)
+        return _Session()
+
+    monkeypatch.setattr("swarmbus.runtime.aiomqtt.Client", connect)
+    return connects
+
+
 def test_runtime_normalizes_declared_capabilities_at_construction():
     runtime = _runtime(
         _FakeStore([]),
@@ -212,7 +250,7 @@ async def test_store_failure_leaves_message_unacked(error):
             raise error
 
     ack = _RecordingAck()
-    runtime = _runtime(_BrokenStore([]), durable=True, presence=True)
+    runtime = _runtime(_BrokenStore([]), persistent=True, presence=True)
 
     with pytest.raises(type(error), match=str(error)):
         await runtime._handle_message(_FakeMqttMessage(_message()), ack)
@@ -322,7 +360,7 @@ async def test_read_inbox_long_poll_wakes_after_committed_message():
 @pytest.mark.asyncio
 async def test_read_inbox_waits_for_startup_replay_commit():
     store = _FakeStore([])
-    runtime = _runtime(store, durable=True, presence=True)
+    runtime = _runtime(store, persistent=True, presence=True)
     runtime._client = _FakeClient()
     runtime._replay_activity_at = asyncio.get_running_loop().time()
     runtime._replay_settled = False
@@ -655,7 +693,7 @@ async def test_store_failure_marks_runtime_degraded_before_reconnect(monkeypatch
         async def __aexit__(self, exc_type, exc, traceback):
             return False
 
-    runtime = _runtime(_BrokenStore([]), durable=True, presence=True)
+    runtime = _runtime(_BrokenStore([]), persistent=True, presence=True)
     observed_states = []
 
     async def idle_heartbeat():
@@ -731,7 +769,7 @@ async def test_send_message_uses_held_connection():
 
 
 def test_durable_runtime_uses_stable_session():
-    runtime = _runtime(_FakeStore([]), durable=True, presence=True)
+    runtime = _runtime(_FakeStore([]), persistent=True, presence=True)
 
     kwargs = runtime._client_kwargs()
 
@@ -749,8 +787,201 @@ def test_presence_controls_last_will():
     payload = json.loads(will.payload)
     assert payload["state"] == "offline"
     assert payload["reason"] == "connection-lost"
-    assert "connected_at" not in payload
 
+
+@pytest.mark.asyncio
+async def test_runtime_holds_message_past_hop_limit_and_acks_it(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", hop_limit=2,
+    )
+    assert runtime.store.hop_limit == 2
+    await runtime.store.open()
+    ack = _RecordingAck()
+    over = AgentMessage.create(from_="wren", to="foo", subject="over", body="b", hops=3)
+
+    await runtime._handle_message(_FakeMqttMessage(over), ack)
+
+    assert len(ack.messages) == 1
+    assert await runtime.store.read() == []
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert default.store.hop_limit == 8
+
+
+def _conflicting_pair():
+    original = _message()
+    reused = original.model_copy(update={"subject": "not the same envelope"})
+    return original, reused
+
+
+@pytest.mark.asyncio
+async def test_reused_message_id_is_recorded_acked_and_not_fatal(tmp_path, caplog):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    await runtime.store.open()
+    ack = _RecordingAck()
+    original, reused = _conflicting_pair()
+
+    await runtime._handle_message(_FakeMqttMessage(original), ack)
+    with caplog.at_level(logging.WARNING, logger="swarmbus.runtime"):
+        await runtime._handle_message(_FakeMqttMessage(reused), ack)
+
+    assert len(ack.messages) == 2
+    assert runtime.state is RuntimeState.CONNECTED
+    assert runtime.last_fatal_error is None
+    assert runtime.last_store_error is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert original.id in warnings[0].getMessage()
+    assert "different envelope" in warnings[0].getMessage()
+    assert [m["subject"] for m in await runtime.store.read()] == [original.subject]
+    conflicts = await runtime.store.list_conflicts()
+    assert [(c["id"], c["from"], c["subject"]) for c in conflicts] == [
+        (original.id, "wren", reused.subject),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reused_message_id_does_not_stop_persistent_receiver(tmp_path, monkeypatch):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+        persistent=True,
+        presence=True,
+    )
+    await runtime.store.open()
+    original, reused = _conflicting_pair()
+    observed_states = []
+
+    class _Messages:
+        def __init__(self, messages):
+            self._messages = iter(messages)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._messages)
+            except StopIteration:
+                observed_states.append(runtime.state)
+                runtime._stopping.set()
+                raise StopAsyncIteration
+
+    class _LoopClient:
+        def __init__(self):
+            self._client = _FakePaho()
+            self.messages = _Messages(
+                [_FakeMqttMessage(original), _FakeMqttMessage(reused)]
+            )
+            self.subscribe = AsyncMock()
+            self.publish = AsyncMock()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    client = _LoopClient()
+    monkeypatch.setattr(
+        "swarmbus.runtime.aiomqtt.Client",
+        lambda *args, **kwargs: client,
+    )
+
+    await runtime._connection_loop()
+
+    assert client._client.acks == [(42, 1), (42, 1)]
+    assert observed_states == [RuntimeState.CONNECTED]
+    assert runtime.last_fatal_error is None
+    assert runtime.state is not RuntimeState.FATAL
+    assert len(await runtime.store.list_conflicts()) == 1
+
+
+@pytest.mark.asyncio
+async def test_conflict_record_failure_leaves_message_unacked():
+    class _ConflictStore(_FakeStore):
+        async def store(
+            self, msg, *, source_topic, sender_provenance=None
+        ):
+            raise MessageConflictError("message ID reused")
+
+        async def record_conflict(self, msg, *, source_topic):
+            raise sqlite3.OperationalError("locked")
+
+    ack = _RecordingAck()
+    runtime = _runtime(_ConflictStore([]), persistent=True, presence=True)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await runtime._handle_message(_FakeMqttMessage(_message()), ack)
+
+    assert ack.messages == []
+    assert runtime.state is RuntimeState.STORE_DEGRADED
+    assert runtime.last_fatal_error is None
+
+
+@pytest.mark.asyncio
+async def test_identical_redelivery_is_acked_without_conflict_record():
+    class _SeenStore(_FakeStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.conflicts = []
+
+        async def store(
+            self, msg, *, source_topic, sender_provenance=None
+        ):
+            self.events.append("seen")
+            return False
+
+        async def record_conflict(self, msg, *, source_topic):
+            self.conflicts.append(msg)
+
+    events = []
+    store = _SeenStore(events)
+    runtime = _runtime(store)
+    ack = _RecordingAck(events)
+
+    await runtime._handle_message(_FakeMqttMessage(_message()), ack)
+
+    assert events == ["seen", "ack"]
+    assert store.conflicts == []
+    assert runtime.state is RuntimeState.CONNECTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    {"body": 5},
+    {"subject": "x\u202e" * 600},
+    {"id": "m\x00-1"},
+])
+async def test_invalid_field_is_acked_not_stored_with_one_line_warning(override, caplog):
+    store = _FakeStore([])
+    runtime = _runtime(store)
+    ack = _RecordingAck()
+    message = _FakeMqttMessage(_message())
+    message.payload = json.dumps({
+        "id": "m-1", "from": "wren", "to": "foo", "subject": "s", "body": "b",
+        **override,
+    }).encode()
+
+    with caplog.at_level(logging.WARNING, logger="swarmbus.runtime"):
+        await runtime._handle_message(message, ack)
+
+    assert store.messages == []
+    assert ack.messages == [message]
+    warnings = [r.getMessage() for r in caplog.records if r.name == "swarmbus.runtime"]
+    assert len(warnings) == 1
+    assert "\n" not in warnings[0] and "\u202e" not in warnings[0]
+
+
+def test_runtime_caps_the_incoming_queue(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    assert runtime._client_kwargs()["max_queued_incoming_messages"] == 1000
 
 @pytest.mark.asyncio
 async def test_published_presence_timestamps_only_the_online_record():
@@ -768,7 +999,6 @@ async def test_published_presence_timestamps_only_the_online_record():
     assert online["connected_at"] is not None
     assert "connected_at" not in offline
     assert offline["reason"] == "clean-shutdown"
-
 
 @pytest.mark.asyncio
 async def test_runtime_registry_reads_and_updates_use_held_connection():
@@ -795,7 +1025,6 @@ async def test_runtime_registry_reads_and_updates_use_held_connection():
     assert listed == [fetched]
     assert fetched["online"] is True
 
-
 @pytest.mark.asyncio
 async def test_runtime_merges_retained_registry_and_presence_messages():
     runtime = _runtime(_FakeStore([]), presence=True)
@@ -820,7 +1049,6 @@ async def test_runtime_merges_retained_registry_and_presence_messages():
 
     assert await runtime.list_agents() == ["wren"]
     assert (await runtime.get_state("wren"))["lifecycle"] == "transient"
-
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_survives_registry_publish_failure():
@@ -851,13 +1079,12 @@ async def test_heartbeat_loop_survives_registry_publish_failure():
 
 _ACCEPTED_LIFECYCLE_PRESENCE = [
     ("transient", True),
-    ("persistent", False),
-    ("persistent", True),
+    ("named", False),
+    ("named", True),
 ]
 _REJECTED_LIFECYCLE_PRESENCE = [
     ("transient", False),
 ]
-
 
 def test_lifecycle_presence_matrix_is_exhaustive():
     """Cover every lifecycle/presence constructor combination."""
@@ -870,7 +1097,6 @@ def test_lifecycle_presence_matrix_is_exhaustive():
         for lifecycle in get_args(AgentLifecycle)
         for presence in (False, True)
     }
-
 
 @pytest.mark.parametrize(
     ("lifecycle", "presence"),
@@ -888,7 +1114,6 @@ def test_accepted_lifecycle_presence_combinations_construct(
 
     assert runtime.lifecycle == lifecycle
     assert runtime.presence is presence
-
 
 @pytest.mark.parametrize(
     ("lifecycle", "presence"),
@@ -910,9 +1135,8 @@ def test_transient_lifecycle_without_presence_is_rejected(
     assert "transient" in message
     assert "presence" in message
 
-
 def test_default_lifecycle_and_presence_stay_accepted():
-    """The default persistent lifecycle remains valid without presence."""
+    """The default named lifecycle remains valid without presence."""
     parameters = inspect.signature(ManagedMCPRuntime.__init__).parameters
     defaults = (
         parameters["lifecycle"].default,
@@ -935,7 +1159,6 @@ _REJECTED_DURABLE_PRESENCE = [
     (True, False),
 ]
 
-
 def test_durable_presence_matrix_is_exhaustive():
     """Guard the combination tests below against an untested pair."""
     covered = set(_ACCEPTED_DURABLE_PRESENCE) | set(
@@ -943,65 +1166,61 @@ def test_durable_presence_matrix_is_exhaustive():
     )
 
     assert covered == {
-        (durable, presence)
-        for durable in (False, True)
+        (persistent, presence)
+        for persistent in (False, True)
         for presence in (False, True)
     }
 
-
 @pytest.mark.parametrize(
-    ("durable", "presence"),
+    ("persistent", "presence"),
     _ACCEPTED_DURABLE_PRESENCE,
 )
 def test_accepted_durable_presence_combinations_construct(
-    durable,
+    persistent,
     presence,
 ):
     runtime = _runtime(
         _FakeStore([]),
-        durable=durable,
+        persistent=persistent,
         presence=presence,
     )
 
-    assert runtime.durable is durable
+    assert runtime.persistent is persistent
     assert runtime.presence is presence
 
-
 @pytest.mark.parametrize(
-    ("durable", "presence"),
+    ("persistent", "presence"),
     _REJECTED_DURABLE_PRESENCE,
 )
-def test_durable_session_without_presence_is_rejected(durable, presence):
+def test_durable_session_without_presence_is_rejected(persistent, presence):
     """Durable sessions require presence."""
     with pytest.raises(ValueError) as excinfo:
         _runtime(
             _FakeStore([]),
-            durable=durable,
+            persistent=persistent,
             presence=presence,
         )
 
     message = str(excinfo.value)
-    assert "durable" in message
+    assert "persistent" in message
     assert "presence" in message
-
 
 def test_durable_is_independent_of_lifecycle():
     """Durability and lifecycle remain independent fields."""
     runtime = _runtime(
         _FakeStore([]),
-        durable=True,
+        persistent=True,
         presence=True,
         lifecycle="transient",
     )
 
-    assert (runtime.durable, runtime.lifecycle) == (True, "transient")
-
+    assert (runtime.persistent, runtime.lifecycle) == (True, "transient")
 
 def test_default_durable_and_presence_stay_accepted():
     """The default messaging-only runtime remains valid."""
     parameters = inspect.signature(ManagedMCPRuntime.__init__).parameters
     defaults = (
-        parameters["durable"].default,
+        parameters["persistent"].default,
         parameters["presence"].default,
     )
 
@@ -1009,7 +1228,7 @@ def test_default_durable_and_presence_stay_accepted():
 
     runtime = _runtime(_FakeStore([]))
 
-    assert (runtime.durable, runtime.presence) == defaults
+    assert (runtime.persistent, runtime.presence) == defaults
 
 
 _DIRECTORY_OPERATIONS = (
@@ -1026,7 +1245,6 @@ _MESSAGING_OPERATIONS = frozenset(
 )
 _LIFECYCLE_OPERATIONS = frozenset({"start", "wait_until_ready", "stop"})
 
-
 def test_directory_operation_matrix_covers_the_mcp_runtime_contract():
     """Cover every public directory method with presence-refusal tests."""
     declared = {
@@ -1041,7 +1259,6 @@ def test_directory_operation_matrix_covers_the_mcp_runtime_contract():
     assert {name for name, _ in _DIRECTORY_OPERATIONS} == (
         declared - _MESSAGING_OPERATIONS - _LIFECYCLE_OPERATIONS
     )
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -1062,7 +1279,6 @@ async def test_directory_operations_refuse_without_presence(name, call):
     assert runtime.agent_id in message
     assert "presence" in message
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("name", "call"),
@@ -1080,7 +1296,6 @@ async def test_directory_operations_refuse_presence_before_transport(
 
     with pytest.raises(PresenceRequiredError):
         await call(runtime)
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("presence", [False, True])
@@ -1141,7 +1356,6 @@ async def test_directory_subscriptions_follow_presence(presence, monkeypatch):
         assert directory_filters.isdisjoint(subscribed)
         assert runtime.registry.list_states(include_offline=True) == []
 
-
 @pytest.mark.asyncio
 async def test_messaging_survives_the_directory_refusal():
     """Presence-free runtimes still send and receive messages."""
@@ -1162,7 +1376,6 @@ async def test_messaging_survives_the_directory_refusal():
     assert store.sender_provenance[0]["lifecycle"] == "unknown"
     assert store.sender_provenance[0]["online"] is None
 
-
 def test_transient_runtime_uses_explicit_mqtt_client_id():
     runtime = _runtime(
         _FakeStore([]),
@@ -1175,7 +1388,6 @@ def test_transient_runtime_uses_explicit_mqtt_client_id():
 
     assert kwargs["identifier"] == "session-deadbeef"
     assert "clean_session" not in kwargs
-
 
 @pytest.mark.asyncio
 async def test_connect_publishes_registry_before_presence(monkeypatch):
@@ -1234,7 +1446,6 @@ async def test_connect_publishes_registry_before_presence(monkeypatch):
         "agents/foo/presence",
     ]
 
-
 @pytest.mark.asyncio
 async def test_transient_shutdown_stops_heartbeat_before_tombstoning():
     runtime = _runtime(
@@ -1263,7 +1474,6 @@ async def test_transient_shutdown_stops_heartbeat_before_tombstoning():
 
     assert events == ["heartbeat-stopped", "tombstoned"]
 
-
 @pytest.mark.asyncio
 async def test_clean_transient_shutdown_tombstones_presence_then_registry():
     """Shutdown tombstones presence before registry."""
@@ -1290,48 +1500,11 @@ async def test_clean_transient_shutdown_tombstones_presence_then_registry():
     ]
     assert runtime.registry.list_states(include_offline=True) == []
 
-
-def _shutdown_runtime(events, **kwargs):
-    """A connected runtime whose shutdown publishes are recorded in order."""
-    runtime = _runtime(_FakeStore([]), presence=True, **kwargs)
-    client = _FakeClient()
-
-    async def record(topic, payload, **publish_kwargs):
-        events.append((str(topic), payload))
-
-    client.publish = AsyncMock(side_effect=record)
-    runtime._client = client
-    runtime._connection_task = asyncio.create_task(asyncio.sleep(60))
-    return runtime
-
-
-def _capture_session_destroy(monkeypatch, events, *, error=None):
-    """Record the connect kwargs of every client shutdown opens."""
-    connects = []
-
-    class _Session:
-        async def __aenter__(self):
-            events.append(("destroy-session", None))
-            if error is not None:
-                raise error
-            return self
-
-        async def __aexit__(self, exc_type, exc, traceback):
-            return False
-
-    def connect(*args, **kwargs):
-        connects.append(kwargs)
-        return _Session()
-
-    monkeypatch.setattr("swarmbus.runtime.aiomqtt.Client", connect)
-    return connects
-
-
 @pytest.mark.asyncio
 async def test_transient_durable_shutdown_destroys_the_mqtt_session(monkeypatch):
-    """Transient durable shutdown destroys the session after tombstones."""
+    """Transient persistent shutdown destroys the session after tombstones."""
     events = []
-    runtime = _shutdown_runtime(events, durable=True, lifecycle="transient")
+    runtime = _shutdown_runtime(events, persistent=True, lifecycle="transient")
     connects = _capture_session_destroy(monkeypatch, events)
 
     await runtime.stop()
@@ -1344,7 +1517,6 @@ async def test_transient_durable_shutdown_destroys_the_mqtt_session(monkeypatch)
     assert len(connects) == 1
     assert connects[0]["identifier"] == "swarmbus-foo"
     assert connects[0]["clean_session"] is True
-
 
 @pytest.mark.asyncio
 async def test_transient_shutdown_without_durable_destroys_no_session(monkeypatch):
@@ -1362,12 +1534,11 @@ async def test_transient_shutdown_without_durable_destroys_no_session(monkeypatc
     ]
     assert connects == []
 
-
 @pytest.mark.asyncio
 async def test_persistent_durable_shutdown_keeps_the_mqtt_session(monkeypatch):
-    """Persistent durable shutdown keeps the broker session."""
+    """Named persistent shutdown keeps the broker session."""
     events = []
-    runtime = _shutdown_runtime(events, durable=True)
+    runtime = _shutdown_runtime(events, persistent=True)
     connects = _capture_session_destroy(monkeypatch, events)
 
     await runtime.stop()
@@ -1376,20 +1547,18 @@ async def test_persistent_durable_shutdown_keeps_the_mqtt_session(monkeypatch):
     assert json.loads(events[0][1])["state"] == "offline"
     assert connects == []
 
-
 @pytest.mark.asyncio
 async def test_session_destroy_carries_no_last_will(monkeypatch):
     """An unclean drop of the destroying connection would republish the
     presence record just tombstoned, as an orphan nothing collects."""
     events = []
-    runtime = _shutdown_runtime(events, durable=True, lifecycle="transient")
+    runtime = _shutdown_runtime(events, persistent=True, lifecycle="transient")
     connects = _capture_session_destroy(monkeypatch, events)
 
     await runtime.stop()
 
     assert "will" in runtime._client_kwargs()
     assert "will" not in connects[0]
-
 
 @pytest.mark.asyncio
 async def test_session_destroy_failure_does_not_crash_shutdown(
@@ -1399,7 +1568,7 @@ async def test_session_destroy_failure_does_not_crash_shutdown(
     """Teardown runs on the way out, so a dead broker must not take the
     process with it -- matching the shutdown publish failure path."""
     events = []
-    runtime = _shutdown_runtime(events, durable=True, lifecycle="transient")
+    runtime = _shutdown_runtime(events, persistent=True, lifecycle="transient")
     _capture_session_destroy(
         monkeypatch,
         events,
@@ -1409,17 +1578,16 @@ async def test_session_destroy_failure_does_not_crash_shutdown(
     with caplog.at_level(logging.WARNING):
         await runtime.stop()
 
-    assert "failed to destroy durable session: broker gone" in caplog.text
+    assert "failed to destroy persistent session: broker gone" in caplog.text
     assert runtime.state is RuntimeState.STOPPED
     assert runtime.store.closed is True
-
 
 @pytest.mark.asyncio
 async def test_disconnected_shutdown_destroys_no_session(monkeypatch):
     """With no connection there is nothing to publish on and nothing to
     reclaim the client id from; shutdown still has to finish."""
     events = []
-    runtime = _shutdown_runtime(events, durable=True, lifecycle="transient")
+    runtime = _shutdown_runtime(events, persistent=True, lifecycle="transient")
     runtime._client = None
     connects = _capture_session_destroy(monkeypatch, events)
 
@@ -1428,3 +1596,72 @@ async def test_disconnected_shutdown_destroys_no_session(monkeypatch):
     assert events == []
     assert connects == []
     assert runtime.state is RuntimeState.STOPPED
+
+def _inbox_delivery(msg, agent):
+    delivery = MagicMock()
+    delivery.topic = f"agents/{agent}/inbox"
+    delivery.payload = msg.to_json().encode()
+    return delivery
+
+
+@pytest.mark.asyncio
+async def test_mcp_send_in_reply_to_takes_the_parent_chain_from_the_state_db(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "foo" / "foo.sqlite3", hop_limit=4,
+    )
+    await runtime.store.open()
+    other = ManagedMCPRuntime(
+        agent_id="bar", broker="localhost",
+        state_path=tmp_path / "bar" / "bar.sqlite3",
+    )
+    await other.store.open()
+
+    parent = AgentMessage.create(
+        from_="wren", to="foo", subject="p", body="b", hops=2, origin="planner",
+    )
+    held = AgentMessage.create(from_="robin", to="foo", subject="h", body="b", hops=5)
+    old_peer = AgentMessage.from_json(json.dumps({
+        "id": "old-1", "from": "kite", "to": "foo",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+    }))
+    elsewhere = AgentMessage.create(from_="wren", to="bar", subject="x", body="b", hops=3)
+    for msg in (parent, held, old_peer):
+        await runtime._handle_message(_inbox_delivery(msg, "foo"), _RecordingAck())
+    await other._handle_message(_inbox_delivery(elsewhere, "bar"), _RecordingAck())
+    assert [r["id"] for r in await runtime.store.read()] == [parent.id, "old-1"]
+
+    runtime._client = AsyncMock()
+
+    async def chain(**kwargs):
+        await runtime.send_message(to="wren", subject="re", body="ok", **kwargs)
+        sent = AgentMessage.from_json(runtime._client.publish.await_args.args[1])
+        return (sent.in_reply_to, sent.hops, sent.origin)
+
+    assert await chain() == (None, 0, "foo")
+    assert await chain(in_reply_to=parent.id) == (parent.id, 3, "planner")
+    assert await chain(in_reply_to=held.id) == (held.id, 6, "robin")
+    assert await chain(in_reply_to="old-1") == ("old-1", 1, "kite")
+    assert await chain(in_reply_to="unknown-id") == ("unknown-id", 1, "foo")
+    assert await chain(in_reply_to=elsewhere.id) == (elsewhere.id, 1, "foo")
+
+
+@pytest.mark.asyncio
+async def test_runtime_rate_limits_a_sender_and_acks_the_held_message(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+        rate_limit=1, rate_cooldown=30,
+    )
+    assert (runtime.store.rate_limit, runtime.store.rate_cooldown) == (1, 30)
+    await runtime.store.open()
+    ack = _RecordingAck()
+    for subject in ("first", "second"):
+        msg = AgentMessage.create(from_="wren", to="foo", subject=subject, body="b")
+        await runtime._handle_message(_FakeMqttMessage(msg), ack)
+
+    assert len(ack.messages) == 2
+    assert [r["subject"] for r in await runtime.store.read()] == ["first"]
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert (default.store.hop_limit, default.store.rate_limit, default.store.rate_cooldown) == (8, 20, 600)
+

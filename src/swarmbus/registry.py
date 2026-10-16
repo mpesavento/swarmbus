@@ -12,7 +12,7 @@ from .topics import DEFAULT_TOPICS, TopicMap
 
 MAX_STATUS_LENGTH = 280
 MAX_CAPABILITY_LENGTH = 128
-AgentLifecycle = Literal["persistent", "transient"]
+AgentLifecycle = Literal["named", "transient"]
 #: Payload key holding the first-sighting stamp maintenance writes onto a
 #: presence record that has no registry record to age against.
 PRESENCE_FIRST_SEEN_OFFLINE_KEY = "first_seen_offline"
@@ -51,7 +51,7 @@ class RegistryRecord(BaseModel):
     status: str = ""
     working_set: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
-    lifecycle: AgentLifecycle = "persistent"
+    lifecycle: AgentLifecycle = "named"
     durability: str = "unknown"
     started_at: datetime
     last_seen: datetime
@@ -271,7 +271,7 @@ class GCDecisionReason(str, Enum):
     """Why a registry record was preserved or selected for transient GC."""
 
     ELIGIBLE = "eligible"
-    PERSISTENT = "persistent"
+    NAMED = "named"
     ONLINE = "online"
     WITHIN_RETENTION = "within-retention"
     CLOCK_SKEW = "clock-skew"
@@ -316,11 +316,11 @@ def transient_gc_decision(
         "age_seconds": age_seconds,
     }
 
-    if record.lifecycle == "persistent":
+    if record.lifecycle == "named":
         return TransientGCDecision(
             **decision,
             eligible=False,
-            reason=GCDecisionReason.PERSISTENT,
+            reason=GCDecisionReason.NAMED,
         )
     if age_seconds < 0:
         return TransientGCDecision(

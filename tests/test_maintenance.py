@@ -177,7 +177,7 @@ async def test_registry_list_joins_registry_and_presence_without_writes():
         "online",
         now=now,
         age_seconds=30,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     offline = _registry("offline", now=now, age_seconds=300)
     unknown = _registry("unknown", now=now, age_seconds=300)
@@ -214,7 +214,7 @@ async def test_registry_list_joins_registry_and_presence_without_writes():
         True,
         None,
     ]
-    assert report.identities[1].lifecycle == "persistent"
+    assert report.identities[1].lifecycle == "named"
     _assert_nothing_published(factory)
 
 
@@ -274,7 +274,7 @@ async def test_gc_deletes_oldest_eligible_transient_in_bounded_batch():
         "keeper",
         now=now,
         age_seconds=5000,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     fresh = _registry("fresh", now=now, age_seconds=30)
     factory = _ClientFactory(
@@ -312,7 +312,7 @@ async def test_gc_deletes_oldest_eligible_transient_in_bounded_batch():
     assert audit_events[0]["presence_state"] == "offline"
     assert audit_events[0]["online"] is False
     assert report.preserved_by_reason == {
-        "persistent": 1,
+        "named": 1,
         "within-retention": 1,
     }
     client = factory.clients[1]
@@ -868,7 +868,7 @@ async def test_gc_counter_identities_hold_across_a_mixed_batch():
         "keeper",
         now=now,
         age_seconds=5000,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     fresh = _registry("fresh", now=now, age_seconds=30)
     oldest = _registry("oldest", now=now, age_seconds=1200)
@@ -1050,7 +1050,7 @@ async def test_snapshot_counts_topic_in_neither_tree_as_invalid():
         "keeper",
         now=now,
         age_seconds=5000,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     factory = _ClientFactory(
         [
@@ -1105,7 +1105,7 @@ async def test_forget_tombstones_state_and_destroys_durable_session():
         "abandoned-session",
         now=now,
         age_seconds=900,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     offline = _presence(record.agent_id, "offline")
     factory = _ClientFactory(
@@ -1136,7 +1136,7 @@ async def test_forget_tombstones_state_and_destroys_durable_session():
     assert result.refused_reason is None
     assert result.already_absent is False
     assert audit_events[0]["operation"] == "explicit-forget"
-    assert audit_events[0]["lifecycle"] == "persistent"
+    assert audit_events[0]["lifecycle"] == "named"
     assert audit_events[0]["online"] is False
     # The anonymous re-read precedes the destructive clean-session client.
     assert len(factory.calls) == 3
@@ -1158,7 +1158,7 @@ async def test_forget_refuses_online_identity_without_override():
         "active-worker",
         now=now,
         age_seconds=5,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     factory = _ClientFactory(
         [[_message(record), _message(_presence(record.agent_id, "online"))]]
@@ -1189,7 +1189,7 @@ async def test_forget_refuses_when_presence_was_never_observed():
         "live-worker",
         now=now,
         age_seconds=5,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     factory = _ClientFactory([[_message(record)]])
     audit_events = []
@@ -1259,7 +1259,7 @@ async def test_forget_refuses_state_that_appears_after_empty_snapshot(
         "starting-session",
         now=now,
         age_seconds=age_seconds,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     presence = _presence(record.agent_id, presence_state)
     factory = _ClientFactory([[], [_message(record), _message(presence)]])
@@ -1312,7 +1312,7 @@ async def test_forget_proceeds_on_unknown_presence_with_force_online():
         "stuck-session",
         now=now,
         age_seconds=5,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     factory = _ClientFactory([[_message(record)], [_message(record)], []])
     audit_events = []
@@ -1351,7 +1351,7 @@ async def test_forget_evicts_observed_online_identity_with_force_online():
         "runaway-worker",
         now=now,
         age_seconds=5,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     online = _presence(record.agent_id, "online")
     factory = _ClientFactory(
@@ -1423,7 +1423,7 @@ async def test_forget_audit_failure_preserves_retained_state():
         "worker",
         now=now,
         age_seconds=900,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     offline = _presence("worker", "offline")
     factory = _ClientFactory(
@@ -1466,7 +1466,7 @@ async def test_forget_partial_failure_reports_presence_already_gone():
         "worker",
         now=now,
         age_seconds=900,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     offline = _presence("worker", "offline")
     failure = aiomqtt.MqttError("registry tombstone failed")
@@ -1507,7 +1507,7 @@ async def test_forget_presence_failure_reports_no_partial_delete():
         "worker",
         now=now,
         age_seconds=900,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     offline = _presence("worker", "offline")
     failure = aiomqtt.MqttError("presence tombstone failed")
@@ -1547,7 +1547,7 @@ async def test_forget_aborts_when_reread_shows_agent_back_online():
         "resumed-worker",
         now=now,
         age_seconds=5,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     factory = _ClientFactory(
         [
@@ -1589,7 +1589,7 @@ async def test_forget_aborts_when_reread_loses_presence_evidence():
         "flaky-worker",
         now=now,
         age_seconds=900,
-        lifecycle="persistent",
+        lifecycle="named",
     )
     factory = _ClientFactory(
         [
@@ -1704,7 +1704,7 @@ async def test_gc_rejects_bad_bounds_before_connecting(override, match):
 
 @pytest.mark.asyncio
 async def test_gc_durable_transient_tombstones_on_its_own_client_id():
-    """GC retires durable identities using their stable client ID."""
+    """GC retires persistent identities using their stable client ID."""
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     rec = _registry("ghost", now=now, age_seconds=1200)
     rec.durability = "durable"
@@ -1913,7 +1913,7 @@ def test_maintenance_rejects_non_positive_snapshot_window():
 
 def test_registry_list_cli_prints_full_directory():
     report = RegistryListReport(scanned=1)
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.list_registry = AsyncMock(return_value=report)
         result = CliRunner().invoke(
             main,
@@ -1957,7 +1957,7 @@ def test_registry_list_cli_renders_orphan_stamps():
         ],
         orphan_presence_agent_ids=["stamped", "unstamped"],
     )
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.list_registry = AsyncMock(return_value=report)
         result = CliRunner().invoke(main, ["registry-list"])
 
@@ -1987,7 +1987,7 @@ def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
         would_delete=1,
         would_delete_agent_ids=["worker"],
     )
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.gc_transient = AsyncMock(return_value=report)
         result = runner.invoke(
             main,
@@ -2037,7 +2037,7 @@ def test_registry_gc_cli_reads_password_file(tmp_path):
         selected=0,
     )
 
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.gc_transient = AsyncMock(return_value=report)
         result = CliRunner().invoke(
             main,
@@ -2077,7 +2077,7 @@ def test_registry_gc_cli_requires_explicit_delete_switch_to_mutate():
         deleted=1,
         deleted_agent_ids=["worker"],
     )
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.gc_transient = AsyncMock(return_value=report)
         result = runner.invoke(main, ["registry-gc", "--delete"])
 
@@ -2090,7 +2090,7 @@ def test_registry_gc_cli_requires_explicit_delete_switch_to_mutate():
 
 def test_registry_forget_prompts_before_connecting():
     runner = CliRunner()
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         result = runner.invoke(
             main,
             ["registry-forget", "--agent-id", "old-session"],
@@ -2109,7 +2109,7 @@ def test_registry_forget_confirmation_allows_mutation():
         deleted=True,
         session_destroyed=True,
     )
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.forget = AsyncMock(return_value=report)
         result = CliRunner().invoke(
             main,
@@ -2123,7 +2123,7 @@ def test_registry_forget_confirmation_allows_mutation():
 
 def test_registry_forget_tombstones_exact_agent_with_yes():
     runner = CliRunner()
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.forget = AsyncMock(
             return_value=RegistryForgetReport(
                 agent_id="old-session",
@@ -2187,7 +2187,7 @@ def test_registry_forget_threads_snapshot_seconds_to_maintenance():
         online=False,
         rechecked=True,
     )
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.forget = AsyncMock(return_value=report)
         explicit = runner.invoke(
             main,
@@ -2225,7 +2225,7 @@ def test_registry_forget_refusal_exits_non_zero(refused_reason):
         refused_reason=refused_reason,
         online=True if refused_reason == "online" else None,
     )
-    with patch("swarmbus.maintenance.RegistryMaintenance") as maintenance:
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
         maintenance.return_value.forget = AsyncMock(return_value=report)
         result = runner.invoke(
             main,

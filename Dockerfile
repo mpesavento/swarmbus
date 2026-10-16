@@ -6,16 +6,19 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
          mosquitto \
          openssl \
+         procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Deps first for layer caching
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md CHANGELOG.md ./
 COPY src/ src/
 RUN pip install --no-cache-dir -e ".[mcp,dev]"
 
 COPY tests/ tests/
 COPY scripts/ scripts/
+COPY docs/ docs/
+COPY examples/ examples/
 
 CMD ["pytest", "-v", "--tb=short"]
