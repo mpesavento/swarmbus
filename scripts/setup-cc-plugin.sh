@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # scripts/setup-cc-plugin.sh
-# Register swarmbus MCP sidecar in Claude Code settings.json and install the
-# behavioral skill that teaches Claude when/how to use the MCP tools.
+# Register the swarmbus MCP sidecar with Claude Code (`claude mcp add --scope user`, stored in ~/.claude.json) and install the behavioral skill that teaches Claude when/how to use the MCP tools.
 set -euo pipefail
 
 AGENT_ID="${1:-}"
@@ -13,41 +12,25 @@ if [ -z "$AGENT_ID" ]; then
   exit 1
 fi
 
-SETTINGS_FILE="${HOME}/.claude/settings.json"
+if ! command -v claude >/dev/null 2>&1; then
+  echo "ERROR: 'claude' not on PATH. Register by hand: claude mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id $AGENT_ID --broker $BROKER" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SKILL_SRC="$REPO_ROOT/src/swarmbus/skills/using-swarmbus"
 SKILL_DST="$HOME/.claude/skills/using-swarmbus"
 
-if [ ! -f "$SETTINGS_FILE" ]; then
-  mkdir -p "$(dirname "$SETTINGS_FILE")"
-  echo '{}' > "$SETTINGS_FILE"
-fi
-
-python3 - "$SETTINGS_FILE" "$AGENT_ID" "$BROKER" <<'EOF'
-import json, sys
-
-settings_path, agent_id, broker = sys.argv[1], sys.argv[2], sys.argv[3]
-
-with open(settings_path) as f:
-    settings = json.load(f)
-
-settings.setdefault("mcpServers", {})
-settings["mcpServers"]["swarmbus"] = {
-    "command": "swarmbus",
-    "args": ["mcp-server", "--agent-id", agent_id, "--broker", broker]
-}
-
-with open(settings_path, "w") as f:
-    json.dump(settings, f, indent=2)
-
-print(f"[swarmbus] Registered MCP sidecar in {settings_path}")
-print(f"[swarmbus] agent-id: {agent_id}, broker: {broker}")
-EOF
+# `claude mcp add` fails when the name already exists at this scope; a first run has nothing to remove.
+claude mcp remove --scope user swarmbus >/dev/null 2>&1 || true
+claude mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id "$AGENT_ID" --broker "$BROKER"
+echo "[swarmbus] Registered MCP sidecar for agent-id $AGENT_ID (broker $BROKER) at user scope (~/.claude.json)"
 
 # Install the behavioral skill so Claude Code knows when/how to use the tools.
 if [ -d "$SKILL_SRC" ]; then
   mkdir -p "$(dirname "$SKILL_DST")"
+  rm -rf "$SKILL_DST"
   cp -r "$SKILL_SRC" "$SKILL_DST"
   echo "[swarmbus] Installed skill at $SKILL_DST"
 else
