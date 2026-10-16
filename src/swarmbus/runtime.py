@@ -16,6 +16,8 @@ from .archive import MessageConflictError, SQLiteMessageStore
 from .bus import MAX_QUEUED_INCOMING_MESSAGES, _build_tls_context
 from .message import (
     DEFAULT_HOP_LIMIT,
+    DEFAULT_RATE_COOLDOWN,
+    DEFAULT_RATE_LIMIT,
     AgentMessage,
     _validate_registered_agent_id,
     sanitize_field,
@@ -124,6 +126,8 @@ class ManagedMCPRuntime:
         client_key: str | None = None,
         store: SQLiteMessageStore | Any | None = None,
         hop_limit: int = DEFAULT_HOP_LIMIT,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         if lifecycle not in {"named", "transient"}:
@@ -174,7 +178,12 @@ class ManagedMCPRuntime:
             client_cert=client_cert,
             client_key=client_key,
         )
-        self.store = store or SQLiteMessageStore(state_path, hop_limit=hop_limit)
+        self.store = store or SQLiteMessageStore(
+            state_path,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+        )
         self.topics = DEFAULT_TOPICS
         self.registry = RegistryCache(
             stale_after_seconds=stale_after_seconds,
@@ -690,15 +699,28 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
+        hops = 0
+        origin = None
+        if in_reply_to:
+            parent = await self.store.lookup(in_reply_to)
+            if parent is None:
+                hops = 1
+            else:
+                hops = parent["hops"] + 1
+                origin = parent["origin"] or parent["from"]
         message = AgentMessage.create(
             from_=self.agent_id,
             to=to,
             subject=subject,
             body=body,
             content_type=content_type,
+            in_reply_to=in_reply_to or None,
+            hops=hops,
+            origin=origin,
         )
         await self._client.publish(
             self.topics.route(to),

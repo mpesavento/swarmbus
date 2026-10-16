@@ -867,3 +867,133 @@ async def test_read_quarantines_invalid_sender_provenance(
         assert any(fragment in row[0] for fragment in error_fragments)
     finally:
         await store.close()
+
+INBOX = "agents/sparrow/inbox"
+BROADCAST = "agents/broadcast"
+
+
+def _rate_store(db_path, now, **kw):
+    kw.setdefault("rate_limit", 2)
+    kw.setdefault("rate_cooldown", 600)
+    return SQLiteMessageStore(db_path, managed=False, clock=lambda: now[0], **kw)
+
+
+def _from(sender, subject="m", hops=0):
+    return AgentMessage.create(from_=sender, to="sparrow", subject=subject, body="b", hops=hops)
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_holds_sender_for_cooldown_then_admits_again(db_path):
+    now = [1000.0]
+    store = _rate_store(db_path, now)
+    over = _from("wren", "3")
+
+    assert await store.store(_from("wren", "1"), source_topic=INBOX) is True
+    assert await store.store(_from("wren", "2"), source_topic=INBOX) is True
+    assert await store.store(over, source_topic=INBOX) is False
+    assert await store.store(_from("robin", "r"), source_topic=INBOX) is True
+
+    holds = await store.list_holds()
+    assert holds["tripped"] == []
+    assert [(c["sender"], c["message_id"], c["until"]) for c in holds["cooling"]] == [
+        ("wren", over.id, _iso(1600.0)),
+    ]
+    assert [(h["id"], h["reason"]) for h in holds["held"]] == [(over.id, "rate-limit")]
+
+    now[0] = 1599.0
+    assert await store.admit(_from("wren", "still"), source_topic=INBOX) is False
+    now[0] = 1600.0
+    assert await store.store(_from("wren", "after"), source_topic=INBOX) is True
+    assert await store.store(over, source_topic=INBOX) is False
+    assert (await store.list_holds())["cooling"] == []
+    assert [r["subject"] for r in await store.read()] == ["1", "2", "r", "after"]
+
+
+@pytest.mark.asyncio
+async def test_rate_bucket_refills_caps_its_burst_and_survives_clock_jumps(db_path):
+    now = [0.0]
+    store = _rate_store(db_path, now, rate_cooldown=0)
+
+    async def burst(n):
+        return [await store.admit(_from("wren"), source_topic=INBOX) for _ in range(n)]
+
+    assert await burst(3) == [True, True, False]
+    assert (await store.list_holds())["cooling"] == []
+    now[0] = 20.0      # 2 per 60 s: one token every 30 s
+    assert await burst(1) == [False]
+    now[0] = 45.0
+    assert await burst(1) == [True]
+    now[0] = 10_000.0  # a long silence refills to the burst size and no more
+    assert await burst(3) == [True, True, False]
+    now[0] = 5_000.0   # the clock jumps back: no refill, nothing negative
+    assert await burst(1) == [False]
+    now[0] = 5_031.0
+    assert await burst(1) == [True]
+
+
+@pytest.mark.asyncio
+async def test_cooldown_never_outlasts_one_cooldown_after_the_clock_jumps_back(db_path):
+    now = [10_000.0]
+    store = _rate_store(db_path, now)
+
+    async def burst(n):
+        return [await store.admit(_from("wren"), source_topic=INBOX) for _ in range(n)]
+
+    assert await burst(3) == [True, True, False]
+    now[0] = 0.0
+    assert await burst(1) == [False]
+    assert [c["until"] for c in (await store.list_holds())["cooling"]] == [_iso(600.0)]
+    now[0] = 600.0
+    assert await burst(3) == [True, True, False]
+    assert [c["until"] for c in (await store.list_holds())["cooling"]] == [_iso(1200.0)]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_is_held_but_never_trips_its_sender(db_path):
+    now = [0.0]
+    store = _rate_store(db_path, now, hop_limit=4)
+    deep = _from("wren", "deep", hops=9)
+    flood = _from("wren", "b3")
+
+    assert await store.admit(deep, source_topic=BROADCAST) is False
+    assert await store.admit(_from("wren", "b1"), source_topic=BROADCAST) is True
+    assert await store.admit(_from("wren", "b2"), source_topic=BROADCAST) is True
+    assert await store.admit(flood, source_topic=BROADCAST) is False
+    assert await store.admit(_from("wren", "d1"), source_topic=INBOX) is True
+    holds = await store.list_holds()
+    assert holds["tripped"] == [] and holds["cooling"] == []
+    assert {(h["id"], h["reason"]) for h in holds["held"]} == {
+        (deep.id, "hop-limit"), (flood.id, "rate-limit"),
+    }
+
+    assert await store.admit(_from("robin", hops=9), source_topic=INBOX) is False
+    assert await store.admit(_from("robin"), source_topic=BROADCAST) is False
+    assert await store.admit(_from("wren", "d2"), source_topic=INBOX) is True
+    assert await store.admit(_from("wren", "d3"), source_topic=INBOX) is False
+    now[0] = 60.0      # the broadcast bucket is full again, but wren is cooling
+    assert await store.admit(_from("wren", "b4"), source_topic=BROADCAST) is False
+    holds = await store.list_holds()
+    assert [t["sender"] for t in holds["tripped"]] == ["robin"]
+    assert [c["sender"] for c in holds["cooling"]] == ["wren"]
+
+
+@pytest.mark.asyncio
+async def test_two_listeners_on_one_state_db_share_one_bucket(db_path):
+    now = [0.0]
+    daemon, watch = _rate_store(db_path, now), _rate_store(db_path, now)
+    one = _from("wren", "1")
+
+    assert await daemon.admit(one, source_topic=INBOX) is True
+    assert await watch.admit(one, source_topic=INBOX) is True   # counted once
+    assert await watch.admit(_from("wren", "2"), source_topic=INBOX) is True
+    assert await daemon.admit(_from("wren", "3"), source_topic=INBOX) is False
+    assert [c["sender"] for c in (await watch.list_holds())["cooling"]] == ["wren"]
+
+    assert await watch.reset_trips("wren") == 1
+    assert (await daemon.list_holds())["cooling"] == []
+    assert await daemon.admit(_from("wren", "4"), source_topic=INBOX) is True
+

@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import get_args
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiomqtt
 import pytest
@@ -805,7 +805,7 @@ async def test_runtime_holds_message_past_hop_limit_and_acks_it(tmp_path):
     assert len(ack.messages) == 1
     assert await runtime.store.read() == []
     default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
-    assert default.store.hop_limit == 4
+    assert default.store.hop_limit == 8
 
 
 def _conflicting_pair():
@@ -1596,3 +1596,72 @@ async def test_disconnected_shutdown_destroys_no_session(monkeypatch):
     assert events == []
     assert connects == []
     assert runtime.state is RuntimeState.STOPPED
+
+def _inbox_delivery(msg, agent):
+    delivery = MagicMock()
+    delivery.topic = f"agents/{agent}/inbox"
+    delivery.payload = msg.to_json().encode()
+    return delivery
+
+
+@pytest.mark.asyncio
+async def test_mcp_send_in_reply_to_takes_the_parent_chain_from_the_state_db(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "foo" / "foo.sqlite3", hop_limit=4,
+    )
+    await runtime.store.open()
+    other = ManagedMCPRuntime(
+        agent_id="bar", broker="localhost",
+        state_path=tmp_path / "bar" / "bar.sqlite3",
+    )
+    await other.store.open()
+
+    parent = AgentMessage.create(
+        from_="wren", to="foo", subject="p", body="b", hops=2, origin="planner",
+    )
+    held = AgentMessage.create(from_="robin", to="foo", subject="h", body="b", hops=5)
+    old_peer = AgentMessage.from_json(json.dumps({
+        "id": "old-1", "from": "kite", "to": "foo",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+    }))
+    elsewhere = AgentMessage.create(from_="wren", to="bar", subject="x", body="b", hops=3)
+    for msg in (parent, held, old_peer):
+        await runtime._handle_message(_inbox_delivery(msg, "foo"), _RecordingAck())
+    await other._handle_message(_inbox_delivery(elsewhere, "bar"), _RecordingAck())
+    assert [r["id"] for r in await runtime.store.read()] == [parent.id, "old-1"]
+
+    runtime._client = AsyncMock()
+
+    async def chain(**kwargs):
+        await runtime.send_message(to="wren", subject="re", body="ok", **kwargs)
+        sent = AgentMessage.from_json(runtime._client.publish.await_args.args[1])
+        return (sent.in_reply_to, sent.hops, sent.origin)
+
+    assert await chain() == (None, 0, "foo")
+    assert await chain(in_reply_to=parent.id) == (parent.id, 3, "planner")
+    assert await chain(in_reply_to=held.id) == (held.id, 6, "robin")
+    assert await chain(in_reply_to="old-1") == ("old-1", 1, "kite")
+    assert await chain(in_reply_to="unknown-id") == ("unknown-id", 1, "foo")
+    assert await chain(in_reply_to=elsewhere.id) == (elsewhere.id, 1, "foo")
+
+
+@pytest.mark.asyncio
+async def test_runtime_rate_limits_a_sender_and_acks_the_held_message(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+        rate_limit=1, rate_cooldown=30,
+    )
+    assert (runtime.store.rate_limit, runtime.store.rate_cooldown) == (1, 30)
+    await runtime.store.open()
+    ack = _RecordingAck()
+    for subject in ("first", "second"):
+        msg = AgentMessage.create(from_="wren", to="foo", subject=subject, body="b")
+        await runtime._handle_message(_FakeMqttMessage(msg), ack)
+
+    assert len(ack.messages) == 2
+    assert [r["subject"] for r in await runtime.store.read()] == ["first"]
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert (default.store.hop_limit, default.store.rate_limit, default.store.rate_cooldown) == (8, 20, 600)
+
