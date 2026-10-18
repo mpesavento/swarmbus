@@ -1695,10 +1695,12 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
     store = SQLiteMessageStore(tmp_path / "state" / "pd-hold.sqlite3", hop_limit=4)
     real_admit = store.admit
     failures = []
+    failure_seen = asyncio.Event()
 
     async def fail_once(msg, *, source_topic):
         if not failures:
             failures.append(msg.id)
+            failure_seen.set()
             raise OSError("disk I/O error")
         return await real_admit(msg, source_topic=source_topic)
 
@@ -1708,11 +1710,20 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
         agent_id="pd-hold", broker=host, port=port, persistent=True, hold_store=store,
     )
     receiver.register_handler(handler)
+
+    async with aiomqtt.Client(
+        host,
+        port=port,
+        identifier="swarmbus-pd-hold",
+        clean_session=False,
+    ) as client:
+        await client.subscribe(receiver.topics.inbox(receiver.agent_id), qos=1)
+
+    sender = AgentBus(agent_id="pd-sender", broker=host, port=port)
+    await sender.send(to="pd-hold", subject="survives", body="b")
     task = asyncio.create_task(receiver.listen(reconnect_initial=0.05))
     try:
-        await asyncio.sleep(0.3)
-        sender = AgentBus(agent_id="pd-sender", broker=host, port=port)
-        await sender.send(to="pd-hold", subject="survives", body="b")
+        await asyncio.wait_for(failure_seen.wait(), timeout=5.0)
         await handler.wait_for_message(timeout=5.0)
         assert [m.subject for m in handler.received] == ["survives"]
         assert failures == [handler.received[0].id]
