@@ -220,6 +220,8 @@ export SWARMBUS_OUTBOX_PLANNER="$HOME/sync/planner-outbox.md" # agent-scoped
 
 Resolution precedence: `--outbox` flag > `SWARMBUS_OUTBOX_<UPPER_ID>` > `SWARMBUS_OUTBOX`.
 
+The outbox rotates at 10 MiB and keeps 10 rotated files (`SWARMBUS_MAX_OUTBOX_BYTES`, `SWARMBUS_KEEP_OUTBOX_FILES`); rotated files sit next to it as `<name>.<UTC time>Z.md`.
+
 For the full archive + user-notification protocol (the 4-tier scheme: always archive, inline narrate when mid-chat, push on priority=high, silent otherwise), see [docs/notification-patterns.md](https://github.com/mpesavento/swarmbus/blob/main/docs/notification-patterns.md) in the swarmbus repo.
 
 **For reactive wake-up on hosts that have agent sessions outside the chat loop** (e.g. OpenClaw), pair the file bridge with a `--invoke` wrapper that triggers a fresh agent turn. See `examples/openclaw-wake.sh` for the reference pattern:

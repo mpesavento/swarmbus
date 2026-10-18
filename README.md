@@ -91,6 +91,8 @@ swarmbus send --agent-id planner --to coder --subject "hi" --body "got a minute?
 
 Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, none.
 
+Before an append would take the outbox past 10 MiB, `send` renames it to `<name>.<UTC time>Z.md` next to it (for example `planner-outbox.20261017T101500123456Z.md`) and starts a new one. It keeps the newest 10 rotated files and deletes older ones. Set `SWARMBUS_MAX_OUTBOX_BYTES` / `--outbox-max-bytes` (0 = never rotate) and `SWARMBUS_KEEP_OUTBOX_FILES` / `--outbox-keep` (0 = keep all). Readers that follow the file by offset and inode (`swarmbus tail --inbox <outbox>`, `scripts/inbox-watch.sh`) start again at the top of the new file. Whatever they had not read yet is at the end of the newest rotated file.
+
 Coder's inbox file grows immediately; her next session turn sees it. That's the receive path whenever the listener daemon is running for `coder`.
 
 ```bash
