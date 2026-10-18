@@ -105,6 +105,8 @@ $ swarmbus doctor --agent-id my-agent
   [✓] 5. --invoke wired.......... yes (/path/to/wake.sh my-agent)
   [✓] 6. outbox env resolvable... /home/you/sync/my-agent-outbox.md
   [✓] 7. peer discovery.......... I'm visible; N other peer(s): ...
+  [✓] 8. tripped senders......... none; 0 message(s) held
+  [✓] 9. channel traffic......... last 15 min: no messages admitted; deepest hops -; held: none
 
 [doctor] all green.
 ```

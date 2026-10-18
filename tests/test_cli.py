@@ -1271,6 +1271,57 @@ def test_doctor_reports_tripped_senders_and_held_count(tmp_path):
     assert "[⚠] 8. tripped senders" in result.output
 
 
+def test_doctor_reports_channel_traffic_from_the_state_db(tmp_path):
+    import asyncio as _asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state = tmp_path / "state"
+    runner = CliRunner()
+
+    def run_doctor(*extra):
+        with patch("swarmbus.cli.AgentBus") as MockBus, patch("swarmbus.cli.aiomqtt"):
+            MockBus.probe.return_value._aiomqtt_kwargs = lambda: {}
+            MockBus.probe.return_value.list_agents = AsyncMock(return_value=["sparrow"])
+            return runner.invoke(
+                main, ["doctor", "--agent-id", "sparrow", "--state-dir", str(state), *extra],
+            )
+
+    result = run_doctor()
+    assert "9. channel traffic......... (no state db at" in result.output
+    assert not (state / "sparrow.sqlite3").exists()
+
+    async def traffic():
+        store = SQLiteMessageStore(state / "sparrow.sqlite3", rate_limit=0)
+        for i in range(7):                  # peer<i> sends i + 1 messages at hops i
+            for _ in range(i + 1):
+                msg = AgentMessage.create(from_=f"peer{i}", to="sparrow", subject="s", body="b", hops=i)
+                assert await store.admit(msg, source_topic="agents/sparrow/inbox") is True
+    _asyncio.run(traffic())
+
+    result = run_doctor()
+    line = next(l for l in result.output.splitlines() if "9. channel traffic" in l)
+    assert "[✓]" in line
+    assert "last 15 min: 28 admitted from 7 sender(s): peer6 7 (0.47/min, max hops 6), peer5 6 (0.40/min, max hops 5)" in line
+    assert ", +2 more; deepest hops 6; held: none" in line
+
+    result = run_doctor("--window", "1")
+    assert "last 1 min: 28 admitted from 7 sender(s): peer6 7 (7.00/min, max hops 6)" in result.output
+
+    async def deep():
+        store = SQLiteMessageStore(state / "sparrow.sqlite3")
+        msg = AgentMessage.create(from_="kite", to="sparrow", subject="s", body="b", hops=12)
+        assert await store.admit(msg, source_topic="agents/sparrow/inbox") is False
+    _asyncio.run(deep())
+
+    result = run_doctor()
+    line = next(l for l in result.output.splitlines() if "9. channel traffic" in l)
+    assert "[⚠]" in line
+    assert "held: 1 hop-limit (deepest held hops 12)" in line
+    assert "[✗] 8. tripped senders" in result.output   # probe 8 unchanged: kite is hop-tripped
+    assert run_doctor("--window", "0").exit_code == 2
+
+
 def _doctor():
     envs = []
 

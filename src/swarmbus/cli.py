@@ -936,17 +936,62 @@ def _doctor_holds(db: Path, agent_id: str) -> tuple[str, str, str | None]:
     )
 
 
+def _doctor_channel(db: Path, agent_id: str, window_minutes: int) -> tuple[str, str, str | None]:
+    """The doctor's channel-traffic probe; never creates the state db."""
+    prefix = "channel traffic........."
+    if not db.exists():
+        return (f"{prefix} (no state db at {db})", "skip", None)
+    try:
+        m = asyncio.run(
+            SQLiteMessageStore(db).channel_metrics(window=window_minutes * 60, limit=5)
+        )
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        return (f"{prefix} cannot read {db}: {sanitize_field(exc)}", "warn", None)
+    text = f"{prefix} last {window_minutes} min: "
+    if m["admitted"] == 0:
+        text += "no messages admitted; deepest hops -"
+    else:
+        entries = ", ".join(
+            f"{sanitize_field(s['sender'])} {s['admitted']} "
+            f"({s['per_minute']:.2f}/min, max hops {s['max_hops']})"
+            for s in m["senders"]
+        )
+        if m["sender_count"] > 5:
+            entries += f", +{m['sender_count'] - 5} more"
+        text += (
+            f"{m['admitted']} admitted from {m['sender_count']} sender(s): "
+            f"{entries}; deepest hops {m['max_hops']}"
+        )
+    if m["held"]:
+        held = ", ".join(f"{n} {reason}" for reason, n in sorted(m["held"].items()))
+        held += f" (deepest held hops {m['held_max_hops']})"
+    else:
+        held = "none"
+    text += f"; held: {held}"
+    if m["future_rows"] > 0:
+        text += f"; {m['future_rows']} admitted row(s) dated after now (the clock moved back)"
+    warn = "hop-limit" in m["held"] or "rate-limit" in m["held"] or m["future_rows"] > 0
+    if warn:
+        return (text, "warn", f"swarmbus held --agent-id {agent_id}")
+    return (text, "ok", None)
+
+
 @main.command()
 @click.option("--agent-id", default=None, help="Agent id to audit. Defaults to auto-detect from systemd unit or env.")
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
 @_state_dir_option
+@click.option(
+    "--window", type=click.IntRange(min=1), default=15, show_default=True,
+    help="Minutes of traffic the channel-traffic probe reports.",
+)
 @_broker_auth_options
 def doctor(
     agent_id: str | None,
     broker: str,
     port: int,
     state_dir: str,
+    window: int,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -956,11 +1001,12 @@ def doctor(
 ) -> None:
     """Run a self-diagnosis of the local swarmbus install + daemon state.
 
-    Prints a checklist of 8 probes: CLI version, broker reachability, my
+    Prints a checklist of 9 probes: CLI version, broker reachability, my
     systemd unit state, daemon library freshness (catches stale in-memory
     Python — the root cause of the 2026-04-14 priority-field incident),
     --invoke wired, outbox env resolvable, peer discovery, tripped senders
-    and held messages from the state db. Each failure
+    and held messages from the state db, channel traffic (per-sender rate,
+    deepest hops, holds by reason over the last --window minutes). Each failure
     prints a one-line fix hint. Exits 0 if every check is green, 1 if
     any is red, 2 if the doctor itself couldn't run.
 
@@ -1210,6 +1256,19 @@ def doctor(
     else:
         results.append(_doctor_holds(
             _state_db_path(state_dir, agent_id_resolved), agent_id_resolved,
+        ))
+
+    # 9. Channel traffic
+    try:
+        _validate_agent_id(agent_id_resolved)
+    except ValueError:
+        results.append((
+            "channel traffic......... (agent id is not valid; no state db to read)",
+            "skip", None,
+        ))
+    else:
+        results.append(_doctor_channel(
+            _state_db_path(state_dir, agent_id_resolved), agent_id_resolved, window,
         ))
 
     # Render
