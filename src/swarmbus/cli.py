@@ -20,6 +20,8 @@ from .bus import DEFAULT_OUTBOX_KEEP, DEFAULT_OUTBOX_MAX_BYTES, AgentBus
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
+from .local_rpc import run_mcp_daemon, run_mcp_proxy
+from .maintenance import OnlineIdentityError, RegistryMaintenance
 from .message import (
     DEFAULT_HOP_LIMIT,
     DEFAULT_RATE_COOLDOWN,
@@ -29,6 +31,7 @@ from .message import (
     frame_body,
     sanitize_field,
 )
+from .topics import TopicMap
 from .trip_alert import TripAlerter
 
 
@@ -478,7 +481,7 @@ def start(
     click.echo(f"[swarmbus] {agent_id} ready")
     click.echo(f"  version:     {__version__}")
     click.echo(f"  broker:      {broker}:{port}")
-    click.echo(f"  persistent:  {'yes' if persistent else 'no'}")
+    click.echo(f"  persistent:     {'yes' if persistent else 'no'}")
     click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
     click.echo(f"  invoke:      {invoke_cmd or '(unset — no reactive wake)'}")
     if invoke_cmd:
@@ -528,7 +531,7 @@ def read(
     Non-blocking: returns immediately with whatever's waiting. Catches
     only messages sent with `retain=True` — non-retained directed sends
     (the default) that arrived while no subscriber was connected are
-    already gone. For durable delivery, keep a listener daemon up:
+    already gone. For persistent delivery, keep a listener daemon up:
     `swarmbus start --agent-id <me> --inbox <path>`.
 
     Messages past the hop limit are held and left out; every message read
@@ -1334,45 +1337,435 @@ def _detect_agent_id() -> str:
     raise RuntimeError("no swarmbus-*.service unit detected")
 
 
-@main.command("mcp-server")
-@click.option("--agent-id", required=True, help="This agent's ID")
+def _resolve_password(
+    password: str | None,
+    password_file: str | None,
+) -> str | None:
+    if password is not None and password_file is not None:
+        raise click.UsageError(
+            "--password and --password-file are mutually exclusive"
+        )
+    if password_file is None:
+        return password
+
+    try:
+        with open(password_file, encoding="utf-8") as handle:
+            resolved = handle.read().rstrip("\r\n")
+    except OSError as exc:
+        raise click.ClickException(
+            f"unable to read password file {password_file!r}: {exc}"
+        ) from exc
+    if not resolved:
+        raise click.UsageError("--password-file must not be empty")
+    return resolved
+
+
+@main.command("registry-list")
+@click.option(
+    "--topic-root",
+    default="",
+    help="Namespace for agent and registry topics.",
+)
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
 @click.option(
-    "--persistent/--no-persistent",
-    default=False,
+    "--stale-after-seconds",
+    type=float,
+    default=180,
     show_default=True,
-    help="Use an MQTT persistent session so queued QoS1 messages survive "
-         "between MCP server restarts. Enables durable delivery without a "
-         "listener daemon. Only one client per agent-id can hold the "
-         "persistent session -- do not combine with a running daemon.",
+    help="Heartbeat age after which online presence is considered stale.",
 )
 @click.option(
-    "--presence/--no-presence",
-    default=False,
+    "--snapshot-seconds",
+    type=float,
+    default=0.5,
     show_default=True,
-    help="Publish retained presence on startup (online) and shutdown "
-         "(offline). Makes this agent visible to `list_agents` without "
-         "a listener daemon.",
+    help="Bounded retained-topic collection window for the snapshot.",
 )
 @click.option(
-    "--state-dir",
-    default="~/.local/state/swarmbus",
-    envvar="SWARMBUS_STATE_DIR",
-    show_default=True,
-    help="Directory for the durable SQLite inbox. [env: SWARMBUS_STATE_DIR]",
+    "--password-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Read the broker password from this file.",
 )
-@_hop_limit_option
-@_rate_limit_options
-@_on_trip_option
 @_broker_auth_options
+def registry_list(
+    topic_root: str,
+    broker: str,
+    port: int,
+    stale_after_seconds: float,
+    snapshot_seconds: float,
+    password_file: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """List retained identities and their presence evidence."""
+
+    password = _resolve_password(password, password_file)
+    maintenance = RegistryMaintenance(
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        topics=TopicMap(root=topic_root),
+        snapshot_seconds=snapshot_seconds,
+    )
+    report = asyncio.run(
+        maintenance.list_registry(stale_after_seconds=stale_after_seconds)
+    )
+    click.echo(report.model_dump_json(indent=2))
+
+
+@main.command("registry-gc")
+@click.option(
+    "--topic-root",
+    default="",
+    help="Namespace for agent and registry topics.",
+)
+@click.option("--broker", default="localhost", show_default=True)
+@click.option("--port", default=1883, show_default=True)
+@click.option(
+    "--stale-after-seconds",
+    type=float,
+    default=180,
+    show_default=True,
+    help="Heartbeat age after which online presence is considered stale.",
+)
+@click.option(
+    "--retention-seconds",
+    type=float,
+    default=86400,
+    show_default=True,
+    help="Minimum age before a transient registry record can be deleted.",
+)
+@click.option(
+    "--batch-size",
+    type=click.IntRange(min=1),
+    default=100,
+    show_default=True,
+    help="Maximum records to recheck and delete in one run.",
+)
+@click.option(
+    "--snapshot-seconds",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Bounded retained-topic collection window for each snapshot.",
+)
+@click.option(
+    "--delete/--dry-run",
+    "delete",
+    default=False,
+    help="Delete eligible records; the default is a read-only dry run.",
+)
+@click.option(
+    "--password-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Read the broker password from this file.",
+)
+@_broker_auth_options
+def registry_gc(
+    topic_root: str,
+    broker: str,
+    port: int,
+    stale_after_seconds: float,
+    retention_seconds: float,
+    batch_size: int,
+    snapshot_seconds: float,
+    delete: bool,
+    password_file: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """Collect old transient retained registry entries."""
+
+    password = _resolve_password(password, password_file)
+    maintenance = RegistryMaintenance(
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        topics=TopicMap(root=topic_root),
+        snapshot_seconds=snapshot_seconds,
+    )
+    report = asyncio.run(
+        maintenance.gc_transient(
+            stale_after_seconds=stale_after_seconds,
+            retention_seconds=retention_seconds,
+            batch_size=batch_size,
+            dry_run=not delete,
+        )
+    )
+    click.echo(report.model_dump_json(indent=2))
+    if report.failed:
+        raise click.ClickException(
+            f"registry GC incomplete: {report.failed} record(s) failed"
+        )
+
+
+@main.command("registry-forget")
+@click.option("--agent-id", required=True, help="Exact agent ID to remove")
+@click.option(
+    "--topic-root",
+    default="",
+    help="Namespace for agent and registry topics.",
+)
+@click.option("--broker", default="localhost", show_default=True)
+@click.option("--port", default=1883, show_default=True)
+@click.option(
+    "--stale-after-seconds",
+    type=float,
+    default=180,
+    show_default=True,
+    help="Heartbeat age after which online presence is considered stale.",
+)
+@click.option(
+    "--snapshot-seconds",
+    type=float,
+    default=0.5,
+    show_default=True,
+    help="Bounded retained-topic collection window for each snapshot. "
+         "Widen this when a retirement is refused as unconfirmed-offline.",
+)
+@click.option(
+    "--force-online",
+    is_flag=True,
+    help="Emergency override: retire an identity still computed online.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Validate and print the operation without publishing tombstones.",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Confirm deletion without an interactive prompt.",
+)
+@click.option(
+    "--password-file",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Read the broker password from this file.",
+)
+@_broker_auth_options
+def registry_forget(
+    agent_id: str,
+    topic_root: str,
+    broker: str,
+    port: int,
+    stale_after_seconds: float,
+    snapshot_seconds: float,
+    force_online: bool,
+    dry_run: bool,
+    yes: bool,
+    password_file: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """Explicitly remove one agent's retained registry and presence."""
+
+    if not dry_run and not yes:
+        click.confirm(
+            f"Forget {agent_id!r} and destroy its persistent MQTT session?",
+            abort=True,
+        )
+
+    password = _resolve_password(password, password_file)
+    maintenance = RegistryMaintenance(
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        topics=TopicMap(root=topic_root),
+        snapshot_seconds=snapshot_seconds,
+    )
+    try:
+        result = asyncio.run(
+            maintenance.forget(
+                agent_id,
+                dry_run=dry_run,
+                force_online=force_online,
+                stale_after_seconds=stale_after_seconds,
+            )
+        )
+    except OnlineIdentityError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(result.model_dump_json(indent=2))
+    if result.refused:
+        # Refusals are reported without raising; preserve a non-zero status.
+        raise click.ClickException(
+            f"registry forget refused for {agent_id!r}: "
+            f"{result.refused_reason}"
+        )
+    if result.failed:
+        raise click.ClickException(
+            f"registry forget incomplete for {agent_id!r}"
+        )
+
+
+def _mcp_runtime_options(func):
+    func = _broker_auth_options(func)
+    func = _on_trip_option(func)
+    func = _rate_limit_options(func)
+    func = _hop_limit_option(func)
+    func = click.option(
+        "--password-file",
+        type=click.Path(exists=True, dir_okay=False, readable=True),
+        help="Read the broker password from this file.",
+    )(func)
+    func = click.option(
+        "--state-dir",
+        default="~/.local/state/swarmbus",
+        envvar="SWARMBUS_STATE_DIR",
+        show_default=True,
+        help="Directory for the persistent SQLite inbox. [env: SWARMBUS_STATE_DIR]",
+    )(func)
+    func = click.option(
+        "--topic-address",
+        default=None,
+        envvar="SWARMBUS_TOPIC_ADDRESS",
+        help="One- or two-level MQTT address bound to --agent-id. "
+             "[env: SWARMBUS_TOPIC_ADDRESS]",
+    )(func)
+    func = click.option(
+        "--topic-root",
+        default="",
+        envvar="SWARMBUS_TOPIC_ROOT",
+        help="Namespace prefix for agent and registry topics. [env: SWARMBUS_TOPIC_ROOT]",
+    )(func)
+    func = click.option(
+        "--registry-stale-after-seconds",
+        type=float,
+        default=180,
+        envvar="SWARMBUS_REGISTRY_STALE_AFTER_SECONDS",
+        show_default=True,
+        help="Seconds without a heartbeat before online state is stale. "
+             "[env: SWARMBUS_REGISTRY_STALE_AFTER_SECONDS]",
+    )(func)
+    func = click.option(
+        "--registry-heartbeat-seconds",
+        type=float,
+        default=60,
+        envvar="SWARMBUS_REGISTRY_HEARTBEAT_SECONDS",
+        show_default=True,
+        help="Seconds between registry heartbeats. "
+             "[env: SWARMBUS_REGISTRY_HEARTBEAT_SECONDS]",
+    )(func)
+    func = click.option(
+        "--capability",
+        "capabilities",
+        multiple=True,
+        help="Advisory capability to publish; repeat for more than one.",
+    )(func)
+    func = click.option(
+        "--client-id",
+        default=None,
+        help="Explicit MQTT client identifier (required for unique concurrent sessions).",
+    )(func)
+    func = click.option(
+        "--lifecycle",
+        type=click.Choice(["named", "transient"]),
+        default="named",
+        show_default=True,
+        help="Retained registry lifecycle for this agent identity. "
+             "'transient' publishes a retained registry record and "
+             "tombstones it on clean shutdown, and therefore requires "
+             "--presence. Independent of --persistent, which governs the MQTT "
+             "session rather than the directory record.",
+    )(func)
+    func = click.option(
+        "--presence/--no-presence",
+        default=False,
+        show_default=True,
+        help="Publish retained presence on startup (online) and shutdown "
+             "(offline). Makes this agent visible to `agent_state` and "
+             "`swarmbus list` without a listener daemon. Without it the "
+             "runtime is messaging-only: it subscribes to no directory "
+             "topics, and directory operations refuse instead of answering.",
+    )(func)
+    func = click.option(
+        "--persistent/--no-persistent",
+        default=False,
+        show_default=True,
+        help="Use an MQTT persistent session so queued QoS1 messages survive "
+             "between runtime restarts. Only one client per agent-id can hold "
+             "the session. Requires --presence, so the queued identity stays "
+             "discoverable and retirable. Independent of --lifecycle, which "
+             "governs the directory record rather than the MQTT session.",
+    )(func)
+    func = click.option("--port", default=1883, show_default=True)(func)
+    func = click.option("--broker", default="localhost", show_default=True)(func)
+    return click.option(
+        "--agent-id",
+        required=True,
+        help="This agent's ID",
+    )(func)
+
+
+def _validate_mcp_runtime_mode(
+    *,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+) -> None:
+    if lifecycle == "transient" and not presence:
+        raise click.UsageError(
+            "--lifecycle transient requires --presence: --lifecycle "
+            "describes how this identity's directory record is retired, "
+            "and without --presence the sidecar has no directory "
+            "record, so the choice applies to nothing. Add --presence, "
+            "or use --lifecycle named."
+        )
+    if persistent and not presence:
+        raise click.UsageError(
+            "--persistent requires --presence: a persistent session makes the "
+            "broker queue messages for this identity while it is away, "
+            "but without --presence the identity never appears in the "
+            "directory, so no operator can find or retire it. Add --presence, "
+            "or use --no-persistent."
+        )
+
+
+@main.command("mcp-server")
+@_mcp_runtime_options
 def mcp_server(
     agent_id: str,
     broker: str,
     port: int,
     persistent: bool,
     presence: bool,
+    lifecycle: str,
+    client_id: str | None,
+    capabilities: tuple[str, ...],
+    registry_heartbeat_seconds: float,
+    registry_stale_after_seconds: float,
     state_dir: str,
+    topic_root: str,
+    topic_address: str | None,
+    password_file: str | None,
     hop_limit: int,
     rate_limit: int,
     rate_cooldown: float,
@@ -1385,15 +1778,29 @@ def mcp_server(
     tls: bool,
 ) -> None:
     """Start the MCP sidecar for this agent."""
+    _validate_mcp_runtime_mode(
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+    password = _resolve_password(password, password_file)
+
     from .mcp_server import run_mcp_server
     run_mcp_server(
         agent_id=agent_id,
+        topic_address=topic_address,
         broker=broker,
         port=port,
         persistent=persistent,
         presence=presence,
+        lifecycle=lifecycle,
+        client_id=client_id,
+        capabilities=capabilities,
         state_dir=state_dir,
+        topic_root=topic_root,
         hop_limit=hop_limit,
+        registry_heartbeat_seconds=registry_heartbeat_seconds,
+        registry_stale_after_seconds=registry_stale_after_seconds,
         rate_limit=rate_limit,
         rate_cooldown=rate_cooldown,
         on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
@@ -1404,6 +1811,90 @@ def mcp_server(
         client_cert=client_cert,
         client_key=client_key,
     )
+
+
+@main.command("mcp-daemon")
+@click.option(
+    "--socket",
+    "socket_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Private AF_UNIX socket for local MCP frontends.",
+)
+@_mcp_runtime_options
+def mcp_daemon(
+    socket_path: str,
+    agent_id: str,
+    broker: str,
+    port: int,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+    client_id: str | None,
+    capabilities: tuple[str, ...],
+    registry_heartbeat_seconds: float,
+    registry_stale_after_seconds: float,
+    state_dir: str,
+    topic_root: str,
+    topic_address: str | None,
+    password_file: str | None,
+    hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
+    on_trip: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """Own one managed runtime for local stdio MCP frontends."""
+    _validate_mcp_runtime_mode(
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+    password = _resolve_password(password, password_file)
+    run_mcp_daemon(
+        socket_path=socket_path,
+        agent_id=agent_id,
+        topic_address=topic_address,
+        broker=broker,
+        port=port,
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+        client_id=client_id,
+        capabilities=capabilities,
+        state_dir=state_dir,
+        topic_root=topic_root,
+        registry_heartbeat_seconds=registry_heartbeat_seconds,
+        registry_stale_after_seconds=registry_stale_after_seconds,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        hop_limit=hop_limit,
+        rate_limit=rate_limit,
+        rate_cooldown=rate_cooldown,
+        on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
+    )
+
+
+@main.command("mcp-proxy")
+@click.option(
+    "--socket",
+    "socket_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Private AF_UNIX socket owned by mcp-daemon.",
+)
+def mcp_proxy(socket_path: str) -> None:
+    """Run a credential-free official stdio MCP frontend."""
+    run_mcp_proxy(socket_path)
 
 
 @main.command()

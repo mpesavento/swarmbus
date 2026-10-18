@@ -12,10 +12,10 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import AsyncIterator, Callable, Optional
+from typing import AsyncIterator, Callable, Literal, Optional
 
 import aiosqlite
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from .handlers.base import BaseHandler
 from .message import (
@@ -74,9 +74,15 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
     content_type    TEXT NOT NULL DEFAULT 'text/plain',
     priority        TEXT NOT NULL DEFAULT 'normal',
     reply_to        TEXT,
+    envelope        TEXT,
     received_at     TEXT NOT NULL,
     source_topic    TEXT NOT NULL,
-    acknowledged_at TEXT
+    acknowledged_at TEXT,
+    sender_lifecycle_observed TEXT NOT NULL DEFAULT 'unknown',
+    sender_online_observed INTEGER,
+    sender_registry_observed_at TEXT,
+    sender_started_at_observed TEXT,
+    sender_capabilities_observed TEXT NOT NULL DEFAULT '[]'
 )
 """
 
@@ -160,6 +166,37 @@ _INBOX_MESSAGE_COLUMNS = """
 id, from_agent, to_agent, ts, subject, body, content_type, priority, reply_to
 """
 
+_SENDER_PROVENANCE_COLUMNS = """
+sender_lifecycle_observed, sender_online_observed,
+sender_registry_observed_at, sender_started_at_observed,
+sender_capabilities_observed
+"""
+
+_INBOX_V1_TO_V2 = (
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_lifecycle_observed TEXT NOT NULL DEFAULT 'unknown'""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_online_observed INTEGER""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_registry_observed_at TEXT""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_started_at_observed TEXT""",
+    """ALTER TABLE inbox_messages
+       ADD COLUMN sender_capabilities_observed TEXT NOT NULL DEFAULT '[]'""",
+)
+
+_INBOX_V2_TO_V3 = (
+    """ALTER TABLE inbox_messages ADD COLUMN envelope TEXT""",
+)
+
+
+class SenderStateObserved(BaseModel):
+    lifecycle: Literal["named", "transient", "unknown"] = "unknown"
+    online: bool | None = None
+    observed_at: datetime | None = None
+    started_at: datetime | None = None
+    capabilities: list[str] = Field(default_factory=list)
+
 
 class MessageConflictError(RuntimeError):
     """A stable message ID was reused for a different envelope."""
@@ -169,7 +206,7 @@ class SQLiteMessageStore:
     """Durable inbound message store for the managed MCP runtime."""
 
     SCHEMA_COMPONENT = "inbox"
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 3
     HOLDS_SCHEMA_COMPONENT = "holds"
     HOLDS_SCHEMA_VERSION = 2
     _MANAGED_DIRECTORY_MODE = 0o700
@@ -401,7 +438,22 @@ class SQLiteMessageStore:
                                 self.HOLDS_SCHEMA_COMPONENT,
                             ),
                         )
-                    if schema_version is None:
+                    if schema_version == 1:
+                        for statement in _INBOX_V1_TO_V2:
+                            await db.execute(statement)
+                    if schema_version in {1, 2}:
+                        for statement in _INBOX_V2_TO_V3:
+                            await db.execute(statement)
+                        await db.execute(
+                            """UPDATE swarmbus_schema
+                               SET version = ?
+                               WHERE component = ?""",
+                            (
+                                self.SCHEMA_VERSION,
+                                self.SCHEMA_COMPONENT,
+                            ),
+                        )
+                    elif schema_version is None:
                         await db.execute(
                             """INSERT INTO swarmbus_schema
                                (component, version) VALUES (?, ?)""",
@@ -850,11 +902,21 @@ class SQLiteMessageStore:
         *,
         source_topic: str,
         received_at: datetime | None = None,
+        sender_provenance: dict | None = None,
     ) -> bool:
         """Commit one inbound message, returning whether it was newly inserted."""
         await self._ensure_open()
         received = received_at or datetime.now(timezone.utc)
-        envelope = (
+        observed = SenderStateObserved.model_validate(
+            sender_provenance
+            if sender_provenance is not None
+            else {
+                "lifecycle": "unknown",
+                "online": None,
+                "observed_at": received,
+            }
+        )
+        legacy_envelope = (
             msg.id,
             msg.from_agent,
             msg.to,
@@ -865,20 +927,28 @@ class SQLiteMessageStore:
             msg.priority,
             msg.reply_to,
         )
+        serialized_envelope = msg.to_json()
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
             trips: list[TripEvent] = []
             try:
                 async with db.execute(
-                    f"""SELECT {_INBOX_MESSAGE_COLUMNS}
+                    f"""SELECT {_INBOX_MESSAGE_COLUMNS}, envelope
                         FROM inbox_messages
                         WHERE id = ?""",
                     (msg.id,),
                 ) as existing_cursor:
                     existing = await existing_cursor.fetchone()
                 if existing is not None:
-                    if tuple(existing) != envelope:
+                    stored_envelope = existing[-1]
+                    same_envelope = (
+                        json.loads(stored_envelope)
+                        == json.loads(serialized_envelope)
+                        if stored_envelope is not None
+                        else tuple(existing[:-1]) == legacy_envelope
+                    )
+                    if not same_envelope:
                         raise MessageConflictError(
                             f"message ID {msg.id!r} is already bound to "
                             "a different envelope"
@@ -898,10 +968,35 @@ class SQLiteMessageStore:
                 await db.execute(
                     """INSERT INTO inbox_messages
                        (id, from_agent, to_agent, ts, subject, body,
-                        content_type, priority, reply_to, received_at,
-                        source_topic)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (*envelope, received.isoformat(), source_topic),
+                        content_type, priority, reply_to, envelope, received_at,
+                        source_topic, sender_lifecycle_observed,
+                        sender_online_observed, sender_registry_observed_at,
+                        sender_started_at_observed,
+                        sender_capabilities_observed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        *legacy_envelope,
+                        serialized_envelope,
+                        received.isoformat(),
+                        source_topic,
+                        observed.lifecycle,
+                        (
+                            None
+                            if observed.online is None
+                            else int(observed.online)
+                        ),
+                        (
+                            observed.observed_at.isoformat()
+                            if observed.observed_at
+                            else None
+                        ),
+                        (
+                            observed.started_at.isoformat()
+                            if observed.started_at
+                            else None
+                        ),
+                        json.dumps(observed.capabilities),
+                    ),
                 )
                 await db.commit()
                 committed = True
@@ -1158,29 +1253,87 @@ class SQLiteMessageStore:
 
     @staticmethod
     def _deserialize_row(row: aiosqlite.Row) -> dict:
-        message = AgentMessage(
-            id=row["id"],
-            **{
-                "from": row["from_agent"],
-                "to": row["to_agent"],
-                "ts": row["ts"],
-                "subject": row["subject"],
-                "body": row["body"],
-                "content_type": row["content_type"],
-                "priority": row["priority"],
-                "reply_to": row["reply_to"],
-            },
+        if row["envelope"] is not None:
+            message = AgentMessage.from_json(row["envelope"])
+            envelope_projection = (
+                message.id,
+                message.from_agent,
+                message.to,
+                message.ts.isoformat(),
+                message.subject,
+                message.body,
+                message.content_type,
+                message.priority,
+                message.reply_to,
+            )
+            stored_projection = (
+                row["id"],
+                row["from_agent"],
+                row["to_agent"],
+                row["ts"],
+                row["subject"],
+                row["body"],
+                row["content_type"],
+                row["priority"],
+                row["reply_to"],
+            )
+            if envelope_projection != stored_projection:
+                raise ValueError(
+                    "inbox envelope does not match its indexed projection"
+                )
+        else:
+            message = AgentMessage(
+                id=row["id"],
+                **{
+                    "from": row["from_agent"],
+                    "to": row["to_agent"],
+                    "ts": row["ts"],
+                    "subject": row["subject"],
+                    "body": row["body"],
+                    "content_type": row["content_type"],
+                    "priority": row["priority"],
+                    "reply_to": row["reply_to"],
+                },
+            )
+        payload = message.model_dump(by_alias=True, mode="json")
+        payload["untrusted"] = True
+        sender_state = SenderStateObserved.model_validate(
+            {
+                "lifecycle": row["sender_lifecycle_observed"],
+                "online": (
+                    None
+                    if row["sender_online_observed"] is None
+                    else bool(row["sender_online_observed"])
+                ),
+                "observed_at": row["sender_registry_observed_at"],
+                "started_at": row["sender_started_at_observed"],
+                "capabilities": json.loads(
+                    row["sender_capabilities_observed"] or "[]"
+                ),
+            }
         )
-        row = message.model_dump(
-            by_alias=True,
-            mode="json",
-            exclude={"in_reply_to", "hops", "origin", "envelope_version"},
-        )
-        row["untrusted"] = True
-        return row
+        payload["sender_state_observed"] = {
+            "lifecycle": sender_state.lifecycle,
+            "online": sender_state.online,
+            "observed_at": (
+                sender_state.observed_at.isoformat()
+                if sender_state.observed_at
+                else None
+            ),
+            "started_at": (
+                sender_state.started_at.isoformat()
+                if sender_state.started_at
+                else None
+            ),
+            "capabilities": sender_state.capabilities,
+        }
+        return payload
 
     @staticmethod
-    def _quarantine_error(exc: ValidationError) -> str:
+    def _quarantine_error(exc: Exception) -> str:
+        if not isinstance(exc, ValidationError):
+            return f"{type(exc).__name__}: {exc}"
+
         details = []
         for error in exc.errors(
             include_url=False,
@@ -1191,12 +1344,16 @@ class SQLiteMessageStore:
             details.append(f"{location}: {error['msg']}")
         return "; ".join(details)
 
-    async def read(self, max_messages: int = 10) -> list[dict]:
-        """Read valid unacknowledged rows and quarantine malformed rows."""
+    async def read_with_status(
+        self,
+        max_messages: int = 10,
+    ) -> tuple[list[dict], list[str]]:
+        """Read pending rows and report rows newly quarantined while decoding."""
         if max_messages < 1:
             raise ValueError("max_messages must be at least 1")
         await self._ensure_open()
         messages: list[dict] = []
+        quarantined_ids: list[str] = []
         async with self._inbox_lock:
             async with self._connect() as db:
                 db.row_factory = aiosqlite.Row
@@ -1208,7 +1365,8 @@ class SQLiteMessageStore:
                         remaining = max_messages - len(messages)
                         async with db.execute(
                             f"""SELECT rowid AS inbox_rowid,
-                                       {_INBOX_MESSAGE_COLUMNS}
+                                       {_INBOX_MESSAGE_COLUMNS}, envelope,
+                                       {_SENDER_PROVENANCE_COLUMNS}
                                 FROM inbox_messages
                                 WHERE rowid > ?
                                   AND acknowledged_at IS NULL
@@ -1231,7 +1389,12 @@ class SQLiteMessageStore:
                         for row in rows:
                             try:
                                 message = self._deserialize_row(row)
-                            except ValidationError as exc:
+                            except (
+                                ValidationError,
+                                json.JSONDecodeError,
+                                TypeError,
+                                ValueError,
+                            ) as exc:
                                 quarantined.append(
                                     (
                                         quarantine_time,
@@ -1239,6 +1402,7 @@ class SQLiteMessageStore:
                                         row["id"],
                                     )
                                 )
+                                quarantined_ids.append(row["id"])
                             else:
                                 messages.append(message)
 
@@ -1255,7 +1419,58 @@ class SQLiteMessageStore:
                 finally:
                     if not committed:
                         await db.rollback()
+        return messages, quarantined_ids
+
+    async def read(self, max_messages: int = 10) -> list[dict]:
+        """Read valid unacknowledged rows and quarantine malformed rows."""
+        messages, _ = await self.read_with_status(max_messages=max_messages)
         return messages
+
+    async def pending_metadata(self, limit: int = 1000) -> dict:
+        """Return a bounded, non-consuming view of pending inbox metadata."""
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        await self._ensure_open()
+        async with self._inbox_lock:
+            async with self._connect() as db:
+                async with db.execute(
+                    """SELECT COUNT(*)
+                       FROM inbox_messages
+                       WHERE acknowledged_at IS NULL
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM inbox_message_quarantine
+                             WHERE message_id = inbox_messages.id
+                         )"""
+                ) as cursor:
+                    pending_count = (await cursor.fetchone())[0]
+                async with db.execute(
+                    """SELECT id, from_agent, received_at, priority
+                       FROM inbox_messages
+                       WHERE acknowledged_at IS NULL
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM inbox_message_quarantine
+                             WHERE message_id = inbox_messages.id
+                         )
+                       ORDER BY rowid DESC
+                       LIMIT ?""",
+                    (limit,),
+                ) as cursor:
+                    rows = await cursor.fetchall()
+        return {
+            "pending_count": pending_count,
+            "pending_messages": [
+                {
+                    "id": row[0],
+                    "from": row[1],
+                    "received_at": row[2],
+                    "priority": row[3],
+                }
+                for row in rows
+            ],
+            "truncated": pending_count > len(rows),
+        }
 
     async def ack(self, message_ids: list[str]) -> int:
         """Acknowledge messages after the caller has durably handled them."""

@@ -8,7 +8,7 @@ If you're on a tailnet, see [cross-machine-tailscale.md](cross-machine-tailscale
 
 ## What swarmbus exposes
 
-Every CLI subcommand that opens a broker connection (`send`, `start`, `read`, `watch`, `list`, `mcp-server`, `doctor`) accepts the same six options. Each maps to an env-var fallback so you can set credentials once in a systemd unit's `Environment=` block instead of typing flags everywhere.
+Every CLI subcommand that opens a broker connection (`send`, `start`, `read`, `watch`, `list`, `mcp-server`, `mcp-daemon`, `doctor`) accepts the same six options. Each maps to an env-var fallback so you can set credentials once in a systemd unit's `Environment=` block instead of typing flags everywhere.
 
 | CLI flag         | Env var                       | Purpose                                                                                |
 |------------------|-------------------------------|----------------------------------------------------------------------------------------|
@@ -133,7 +133,8 @@ topic read agents/+/presence
 topic readwrite agents/broadcast
 ```
 
-- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
+- **Named identities use `%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing unless the launcher explicitly supplies `--client-id`.
+- **Shared transient principals use whole-level `%u/%c`.** Start the managed runtime with `--client-id session-... --agent-id principal__session-... --topic-address principal/session-...`. Grant `agents/%u/%c/inbox`, `agents/%u/%c/presence`, and `swarmbus/registry/%u/%c`. Mosquitto 2.1 only substitutes `%u` and `%c` when each token occupies a complete topic level; forms such as `%u-%c` do not match.
 - **Shared rules sit under `user`.** In an acl_file, `topic` lines before the first `user` line apply only to anonymous clients. mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`. So the rules every agent shares are repeated in one `user` block per agent id. Add a block when you add an agent.
 
 ### Broker config

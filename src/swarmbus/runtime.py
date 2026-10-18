@@ -5,9 +5,11 @@ import json
 import logging
 import random
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import aiomqtt
 
@@ -21,7 +23,13 @@ from .message import (
     _validate_registered_agent_id,
     sanitize_field,
 )
-from .topics import DEFAULT_TOPICS
+from .registry import (
+    AgentLifecycle,
+    RegistryCache,
+    RegistryRecord,
+    presence_payload,
+)
+from .topics import TopicMap
 from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
@@ -34,6 +42,10 @@ _REPLAY_SETTLE_SECONDS = 0.1
 
 class TransportUnavailable(RuntimeError):
     """The managed runtime has no live MQTT transport."""
+
+
+class PresenceRequiredError(RuntimeError):
+    """Raised when a directory operation requires disabled presence."""
 
 
 class RuntimeFatalError(RuntimeError):
@@ -92,17 +104,24 @@ class _ManualAckAdapter:
 
 
 class ManagedMCPRuntime:
-    """One MQTT connection and durable SQLite inbox for an MCP server."""
+    """One MQTT connection and persistent SQLite inbox for an MCP server."""
 
     def __init__(
         self,
         *,
         agent_id: str,
+        topic_address: str | None = None,
         broker: str = "localhost",
         port: int = 1883,
         persistent: bool = False,
         presence: bool = False,
+        lifecycle: AgentLifecycle = "named",
+        client_id: str | None = None,
+        heartbeat_seconds: float = 60,
+        stale_after_seconds: float = 180,
+        capabilities: list[str] | tuple[str, ...] = (),
         state_path: str | Path,
+        topic_root: str = "",
         username: str | None = None,
         password: str | None = None,
         tls: bool = False,
@@ -114,13 +133,55 @@ class ManagedMCPRuntime:
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
         on_trip: list[str] | None = None,
+        trip_listener: str = "mcp-server",
     ) -> None:
         _validate_registered_agent_id(agent_id)
+        if lifecycle not in {"named", "transient"}:
+            raise ValueError("lifecycle must be named or transient")
+        if lifecycle == "transient" and not presence:
+            raise ValueError(
+                "lifecycle='transient' requires presence=True "
+                "(--lifecycle transient requires --presence): lifecycle "
+                "describes how this identity's directory record is "
+                "retired, and a presence-free runtime has no directory "
+                "record, so the declaration applies to nothing. Enable "
+                "presence, or use lifecycle='named' "
+                "(--lifecycle named)."
+            )
+        if persistent and not presence:
+            raise ValueError(
+                "persistent=True requires presence=True (--persistent "
+                "requires --presence): a persistent MQTT session makes the "
+                "broker queue messages for this identity while it is "
+                "away, but a presence-free identity never appears in the "
+                "directory, so no operator can discover it with "
+                "`swarmbus list` or retire it with `swarmbus "
+                "registry-forget` and its queued backlog grows forever. "
+                "Enable presence, or use persistent=False "
+                "(--no-persistent) for a live-session runtime."
+            )
+        if client_id is not None:
+            _validate_registered_agent_id(client_id)
+        if heartbeat_seconds <= 0:
+            raise ValueError("heartbeat_seconds must be positive")
+        if stale_after_seconds < heartbeat_seconds * 2:
+            raise ValueError(
+                "stale_after_seconds must be at least twice heartbeat_seconds"
+            )
         self.agent_id = agent_id
+        self.topics = TopicMap(topic_root)
+        self.topic_address = topic_address or agent_id
+        self.topics.inbox(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
         self.broker = broker
         self.port = port
         self.persistent = persistent
         self.presence = presence
+        self.lifecycle = lifecycle
+        self.client_id = client_id
+        self.heartbeat_seconds = heartbeat_seconds
         self.username = username
         self.password = password
         self._tls_context = _build_tls_context(
@@ -136,19 +197,46 @@ class ManagedMCPRuntime:
             rate_cooldown=rate_cooldown,
         )
         self._trip_alerter: TripAlerter | None = (
-            TripAlerter(on_trip, agent_id=agent_id, listener="mcp-server")
+            TripAlerter(on_trip, agent_id=agent_id, listener=trip_listener)
             if on_trip
             else None
         )
-        self.topics = DEFAULT_TOPICS
-        self._online_agents: set[str] = set()
+        self.registry = RegistryCache(
+            stale_after_seconds=stale_after_seconds,
+            topics=self.topics,
+        )
+        self.started_at = datetime.now(timezone.utc)
+        self.status = ""
+        self.working_set: list[str] = []
+        self.runtime_capabilities = [
+            "messaging",
+            "durable-inbox",
+            "agent-state",
+        ]
+        normalized_capabilities = RegistryRecord(
+            agent_id=self.agent_id,
+            topic_address=topic_address,
+            capabilities=list(capabilities),
+            lifecycle=self.lifecycle,
+            started_at=self.started_at,
+            last_seen=self.started_at,
+        ).capabilities
+        runtime_capabilities = set(self.runtime_capabilities)
+        self.declared_capabilities = [
+            capability
+            for capability in normalized_capabilities
+            if capability not in runtime_capabilities
+        ]
         self._client: aiomqtt.Client | None = None
         self._connection_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         self._pending_client: aiomqtt.Client | None = None
         self._pending_ack_adapter: _ManualAckAdapter | None = None
         self._ready = asyncio.Event()
         self._stopping = asyncio.Event()
         self._inbox_condition = asyncio.Condition()
+        self._inbox_instance_id = uuid.uuid4().hex
+        self._inbox_generation = 0
         self._state = RuntimeState.STOPPED
         self._last_fatal_error: Exception | None = None
         self._last_store_error: Exception | None = None
@@ -161,9 +249,19 @@ class ManagedMCPRuntime:
         }
         if self.presence:
             kwargs["will"] = aiomqtt.Will(
-                topic=self.topics.presence(self.agent_id),
-                payload=json.dumps(
-                    {"agent": self.agent_id, "status": "offline"}
+                topic=self.topics.presence(
+                    self.agent_id,
+                    topic_address=self.topic_address,
+                ),
+                payload=presence_payload(
+                    self.agent_id,
+                    "offline",
+                    reason="connection-lost",
+                    topic_address=(
+                        self.topic_address
+                        if self.topic_address != self.agent_id
+                        else None
+                    ),
                 ),
                 qos=1,
                 retain=True,
@@ -174,9 +272,12 @@ class ManagedMCPRuntime:
             kwargs["password"] = self.password
         if self._tls_context is not None:
             kwargs["tls_context"] = self._tls_context
+        identifier = self.client_id
         if self.persistent:
-            kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            identifier = identifier or f"swarmbus-{self.agent_id}"
             kwargs["clean_session"] = False
+        if identifier is not None:
+            kwargs["identifier"] = identifier
         return kwargs
 
     def _new_client(self) -> aiomqtt.Client:
@@ -202,6 +303,14 @@ class ManagedMCPRuntime:
     def connected(self) -> bool:
         return self._client is not None
 
+    async def runtime_status(self) -> dict[str, Any]:
+        connected = self.connected
+        return {
+            "ready": connected and self._state is RuntimeState.CONNECTED,
+            "connected": connected,
+            "state": self._state.value,
+        }
+
     def _record_fatal(self, exc: Exception) -> None:
         self._last_fatal_error = exc
         self._state = RuntimeState.FATAL
@@ -214,6 +323,11 @@ class ManagedMCPRuntime:
 
     async def _notify_inbox_waiters(self) -> None:
         async with self._inbox_condition:
+            self._inbox_condition.notify_all()
+
+    async def _advance_inbox_generation(self) -> None:
+        async with self._inbox_condition:
+            self._inbox_generation += 1
             self._inbox_condition.notify_all()
 
     async def start(self) -> None:
@@ -252,7 +366,7 @@ class ManagedMCPRuntime:
             await self._connection_loop()
         except Exception as exc:
             self._record_fatal(exc)
-            await self._notify_inbox_waiters()
+            await self._advance_inbox_generation()
             raise
 
     def _connection_task_done(self, task: asyncio.Task[None]) -> None:
@@ -298,12 +412,28 @@ class ManagedMCPRuntime:
         if self._stopping.is_set():
             return
         self._stopping.set()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            await asyncio.gather(
+                self._heartbeat_task,
+                return_exceptions=True,
+            )
+            self._heartbeat_task = None
+        destroy_session = False
         try:
             if self._client is not None and self.presence:
                 try:
-                    await self._publish_presence("offline")
+                    if self.lifecycle == "transient":
+                        destroy_session = (
+                            await self._clear_transient_retained_state()
+                        )
+                    else:
+                        await self._publish_presence(
+                            "offline",
+                            reason="clean-shutdown",
+                        )
                 except (aiomqtt.MqttError, RuntimeError) as exc:
-                    logger.warning("failed to publish offline presence: %s", exc)
+                    logger.warning("failed to publish shutdown state: %s", exc)
         finally:
             try:
                 if self._connection_task is not None:
@@ -324,6 +454,10 @@ class ManagedMCPRuntime:
                 self._client = None
                 self._pending_client = None
                 self._pending_ack_adapter = None
+                # Only now is the willed connection gone, so reclaiming the
+                # client id cannot make the broker publish its will.
+                if destroy_session:
+                    await self._destroy_persistent_session()
                 try:
                     await self.store.close()
                 finally:
@@ -352,12 +486,19 @@ class ManagedMCPRuntime:
                 async with client:
                     connected_at = asyncio.get_running_loop().time()
                     await client.subscribe(
-                        self.topics.inbox(self.agent_id), qos=1
+                        self.topics.inbox(
+                            self.agent_id,
+                            topic_address=self.topic_address,
+                        ), qos=1
                     )
                     await client.subscribe(self.topics.broadcast, qos=1)
-                    await client.subscribe(
-                        self.topics.any_presence_filter(), qos=1
-                    )
+                    if self.presence:
+                        # Presence-free runtimes do not subscribe to directory data.
+                        for topic_filter in (
+                            *self.topics.presence_filters(),
+                            *self.topics.registry_filters(),
+                        ):
+                            await client.subscribe(topic_filter, qos=1)
                     self._client = client
                     if self.persistent:
                         self._replay_activity_at = (
@@ -368,9 +509,15 @@ class ManagedMCPRuntime:
                         self._replay_activity_at = None
                         self._replay_settled = True
                     if self.presence:
+                        # Publish registry first: GC can age out a registry orphan,
+                        # while a presence orphan has no timestamp to collect safely.
+                        await self._publish_registry()
                         await self._publish_presence("online")
+                        self._heartbeat_task = asyncio.create_task(
+                            self._heartbeat_loop()
+                        )
                     self._state = RuntimeState.CONNECTED
-                    await self._notify_inbox_waiters()
+                    await self._advance_inbox_generation()
                     self._ready.set()
                     async for message in client.messages:
                         if self.persistent and not self._replay_settled:
@@ -411,15 +558,54 @@ class ManagedMCPRuntime:
                 ):
                     backoff = 1.0
                 self._client = None
+                if self._heartbeat_task is not None:
+                    self._heartbeat_task.cancel()
+                    await asyncio.gather(
+                        self._heartbeat_task,
+                        return_exceptions=True,
+                    )
+                    self._heartbeat_task = None
                 if self._state is RuntimeState.CONNECTED:
                     self._state = RuntimeState.CONNECTING
-                await self._notify_inbox_waiters()
+                await self._advance_inbox_generation()
 
             client = None
             ack_adapter = None
             if not self._stopping.is_set():
                 await asyncio.sleep(backoff + random.uniform(0, backoff * 0.1))
                 backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
+
+    async def _heartbeat_loop(self) -> None:
+        while not self._stopping.is_set():
+            await asyncio.sleep(self.heartbeat_seconds)
+            if self._client is not None and self.presence:
+                try:
+                    await self._publish_registry()
+                except (aiomqtt.MqttError, RuntimeError) as exc:
+                    logger.warning("heartbeat registry publish failed: %s", exc)
+
+    def _observe_sender_state(self, agent_id: str) -> dict:
+        observed_at = datetime.now(timezone.utc).isoformat()
+        try:
+            state = self.registry.get_state(agent_id)
+        except KeyError:
+            return {
+                "lifecycle": "unknown",
+                "online": None,
+                "observed_at": observed_at,
+                "started_at": None,
+                "capabilities": [],
+            }
+        lifecycle = state["lifecycle"]
+        if lifecycle not in {"named", "transient"}:
+            lifecycle = "unknown"
+        return {
+            "lifecycle": lifecycle,
+            "online": state["online"],
+            "observed_at": observed_at,
+            "started_at": state["started_at"],
+            "capabilities": state["capabilities"],
+        }
 
     async def _store_inbox_message(
         self,
@@ -428,12 +614,14 @@ class ManagedMCPRuntime:
         source_topic: str,
     ) -> bool:
         """Store once in persistent mode; hold and retry in live-session mode."""
+        sender_provenance = self._observe_sender_state(message.from_agent)
         backoff = 1.0
         while not self._stopping.is_set():
             try:
                 inserted = await self._commit_inbox_message(
                     message,
                     source_topic=source_topic,
+                    sender_provenance=sender_provenance,
                 )
             except (OSError, sqlite3.Error) as exc:
                 self._last_store_error = exc
@@ -463,6 +651,7 @@ class ManagedMCPRuntime:
         message: AgentMessage,
         *,
         source_topic: str,
+        sender_provenance: dict,
     ) -> bool:
         """Commit one envelope; a reused id is recorded and dropped, not fatal.
 
@@ -473,7 +662,11 @@ class ManagedMCPRuntime:
         redelivery still returns False from ``store`` without raising.
         """
         try:
-            return await self.store.store(message, source_topic=source_topic)
+            return await self.store.store(
+                message,
+                source_topic=source_topic,
+                sender_provenance=sender_provenance,
+            )
         except MessageConflictError:
             await self.store.record_conflict(message, source_topic=source_topic)
             logger.warning(
@@ -491,7 +684,11 @@ class ManagedMCPRuntime:
         ack_adapter: _ManualAckAdapter | Any,
     ) -> None:
         topic = str(mqtt_message.topic)
-        if self.topics.is_message_topic(topic, agent_id=self.agent_id):
+        if self.topics.is_message_topic(
+            topic,
+            agent_id=self.agent_id,
+            topic_address=self.topic_address,
+        ):
             try:
                 message = AgentMessage.from_json(mqtt_message.payload)
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
@@ -505,25 +702,33 @@ class ManagedMCPRuntime:
                 source_topic=topic,
             )
             if inserted:
-                async with self._inbox_condition:
-                    self._inbox_condition.notify_all()
+                await self._advance_inbox_generation()
+            ack_adapter.ack(mqtt_message)
+            return
+
+        if self.topics.is_registry_topic(topic):
+            try:
+                if mqtt_message.payload:
+                    self.registry.update_registry(topic, mqtt_message.payload)
+                else:
+                    self.registry.remove_registry(topic)
+            except (
+                AttributeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+                UnicodeDecodeError,
+            ) as exc:
+                logger.warning("discarding invalid registry record: %s", exc)
             ack_adapter.ack(mqtt_message)
             return
 
         if self.topics.is_presence_topic(topic):
             try:
-                payload = json.loads(mqtt_message.payload)
-                topic_agent = self.topics.presence_agent(topic)
-                payload_agent = payload.get("agent")
-                if payload_agent != topic_agent:
-                    raise ValueError(
-                        f"presence agent {payload_agent!r} does not match "
-                        f"topic agent {topic_agent!r}"
-                    )
-                if payload.get("status") == "online":
-                    self._online_agents.add(topic_agent)
+                if mqtt_message.payload:
+                    self.registry.update_presence(topic, mqtt_message.payload)
                 else:
-                    self._online_agents.discard(topic_agent)
+                    self.registry.remove_presence(topic)
             except (
                 AttributeError,
                 json.JSONDecodeError,
@@ -546,6 +751,7 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
@@ -565,12 +771,16 @@ class ManagedMCPRuntime:
             subject=subject,
             body=body,
             content_type=content_type,
+            priority=priority,
             in_reply_to=in_reply_to or None,
             hops=hops,
             origin=origin,
         )
         await self._client.publish(
-            self.topics.route(to),
+            self.topics.route(
+                to,
+                topic_address=self.registry.topic_address(to),
+            ),
             message.to_json(),
             qos=1,
             retain=False,
@@ -594,6 +804,17 @@ class ManagedMCPRuntime:
             f"{self.broker}:{self.port}"
         )
 
+    def _presence_required(self, operation: str) -> PresenceRequiredError:
+        """Build the presence-required error for a directory operation."""
+        return PresenceRequiredError(
+            f"swarmbus runtime {self.agent_id!r} cannot {operation}: it "
+            "runs without presence (--no-presence), which makes it "
+            "messaging-only -- it is not subscribed to the registry or "
+            "presence topics and holds no directory data to answer "
+            "with. Restart it with presence enabled (--presence) to use "
+            "the directory."
+        )
+
     async def _await_startup_replay(self) -> None:
         """Wait for a quiet window while a persistent session replays."""
         while self.connected and not self._replay_settled:
@@ -607,6 +828,96 @@ class ManagedMCPRuntime:
                 await asyncio.sleep(remaining)
                 continue
             self._replay_settled = True
+
+    async def _read_stored_messages(self, *, max_messages: int) -> list[dict]:
+        reader = getattr(self.store, "read_with_status", None)
+        if reader is None:
+            return await self.store.read(max_messages=max_messages)
+        messages, quarantined_ids = await reader(max_messages=max_messages)
+        if quarantined_ids:
+            await self._advance_inbox_generation()
+        return messages
+
+    async def inbox_state(
+        self,
+        *,
+        cursor: dict[str, Any] | None = None,
+        wait_seconds: float = 0.0,
+        max_messages: int = 1000,
+    ) -> dict:
+        """Return or wait for a non-consuming pending-inbox snapshot."""
+        if wait_seconds < 0:
+            raise ValueError("wait_seconds must be non-negative")
+        if max_messages < 1:
+            raise ValueError("max_messages must be at least 1")
+        if (
+            self._state is RuntimeState.STORE_DEGRADED
+            and self._last_store_error is not None
+        ):
+            raise self._transport_unavailable()
+
+        cursor_instance: str | None = None
+        cursor_generation: int | None = None
+        if cursor is not None:
+            if not isinstance(cursor, dict):
+                raise ValueError("cursor must be an object")
+            cursor_instance = cursor.get("instance_id")
+            cursor_generation = cursor.get("generation")
+            if (
+                not isinstance(cursor_instance, str)
+                or not cursor_instance
+                or not isinstance(cursor_generation, int)
+                or isinstance(cursor_generation, bool)
+                or cursor_generation < 0
+            ):
+                raise ValueError(
+                    "cursor requires a non-empty instance_id and "
+                    "non-negative integer generation"
+                )
+
+        async with self._inbox_condition:
+            reset = cursor is not None and (
+                cursor_instance != self._inbox_instance_id
+                or cursor_generation > self._inbox_generation
+            )
+            unchanged = (
+                cursor is not None
+                and not reset
+                and cursor_generation == self._inbox_generation
+            )
+            if unchanged and wait_seconds > 0:
+                deadline = asyncio.get_running_loop().time() + wait_seconds
+                while cursor_generation == self._inbox_generation:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            self._inbox_condition.wait(),
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        break
+
+            try:
+                metadata = await self.store.pending_metadata(limit=max_messages)
+            except (OSError, sqlite3.Error) as exc:
+                self._last_store_error = exc
+                self._state = RuntimeState.STORE_DEGRADED
+                raise StoreUnavailable(
+                    f"swarmbus durable inbox is degraded: {exc}"
+                ) from exc
+            status = await self.runtime_status()
+            return {
+                "cursor": {
+                    "instance_id": self._inbox_instance_id,
+                    "generation": self._inbox_generation,
+                },
+                "reset": reset,
+                "runtime_state": status["state"],
+                "connected": status["connected"],
+                **metadata,
+            }
 
     async def read_inbox(
         self,
@@ -631,12 +942,12 @@ class ManagedMCPRuntime:
                 timeout=wait_seconds,
             )
 
-        messages = await self.store.read(max_messages=max_messages)
+        messages = await self._read_stored_messages(max_messages=max_messages)
         if messages:
             return messages
         if self.connected:
             await self._await_startup_replay()
-            messages = await self.store.read(max_messages=max_messages)
+            messages = await self._read_stored_messages(max_messages=max_messages)
             if messages:
                 return messages
             if self._state is RuntimeState.STORE_DEGRADED:
@@ -645,7 +956,10 @@ class ManagedMCPRuntime:
         raise self._transport_unavailable()
 
     async def ack_inbox(self, *, message_ids: list[str]) -> int:
-        return await self.store.ack(message_ids)
+        acknowledged = await self.store.ack(message_ids)
+        if acknowledged:
+            await self._advance_inbox_generation()
+        return acknowledged
 
     async def _wait_for_inbox(
         self,
@@ -657,7 +971,12 @@ class ManagedMCPRuntime:
         deadline = loop.time() + timeout
         await self._await_startup_replay()
         while True:
-            messages = await self.store.read(max_messages=max_messages)
+            async with self._inbox_condition:
+                observed_generation = self._inbox_generation
+
+            messages = await self._read_stored_messages(
+                max_messages=max_messages
+            )
             if messages:
                 return messages
             if (
@@ -668,10 +987,10 @@ class ManagedMCPRuntime:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return []
+
             async with self._inbox_condition:
-                messages = await self.store.read(max_messages=max_messages)
-                if messages:
-                    return messages
+                if self._inbox_generation != observed_generation:
+                    continue
                 if (
                     not self.connected
                     or self._state is RuntimeState.STORE_DEGRADED
@@ -699,21 +1018,194 @@ class ManagedMCPRuntime:
         return messages[0] if messages else None
 
     async def list_agents(self) -> list[str]:
+        if not self.presence:
+            raise self._presence_required("list online agents")
         if not self.connected:
             raise self._transport_unavailable()
-        return sorted(self._online_agents)
+        return self.registry.online_agent_ids()
 
-    async def _publish_presence(self, status: str) -> None:
+    async def list_states(
+        self,
+        *,
+        include_offline: bool = False,
+        lifecycle: AgentLifecycle | None = None,
+    ) -> list[dict]:
+        if not self.presence:
+            raise self._presence_required("list agent registry state")
+        if not self.connected:
+            raise self._transport_unavailable()
+        return self.registry.list_states(
+            include_offline=include_offline,
+            lifecycle=lifecycle,
+        )
+
+    async def get_state(self, agent_id: str) -> dict:
+        if not self.presence:
+            raise self._presence_required(
+                f"read registry state for agent {agent_id!r}"
+            )
+        if not self.connected:
+            raise self._transport_unavailable()
+        try:
+            return self.registry.get_state(agent_id)
+        except KeyError as exc:
+            raise ValueError(
+                f"no registry record for agent {agent_id!r}"
+            ) from exc
+
+    async def update_state(
+        self,
+        *,
+        status: str | None,
+        working_set: list[str] | None,
+        capabilities: list[str] | None = None,
+    ) -> dict:
+        if not self.presence:
+            raise self._presence_required("publish its own registry state")
+        if status is None and working_set is None and capabilities is None:
+            raise ValueError(
+                "update requires status, working_set, or capabilities"
+            )
+        declared = (
+            self.declared_capabilities
+            if capabilities is None
+            else capabilities
+        )
+        candidate = RegistryRecord(
+            agent_id=self.agent_id,
+            topic_address=(
+                self.topic_address
+                if self.topic_address != self.agent_id
+                else None
+            ),
+            status=self.status if status is None else status,
+            working_set=self.working_set if working_set is None else working_set,
+            capabilities=[*self.runtime_capabilities, *declared],
+            lifecycle=self.lifecycle,
+            durability="durable" if self.persistent else "ephemeral",
+            started_at=self.started_at,
+            last_seen=datetime.now(timezone.utc),
+        )
+        self.status = candidate.status
+        self.working_set = candidate.working_set
+        runtime_capabilities = set(self.runtime_capabilities)
+        self.declared_capabilities = [
+            capability
+            for capability in candidate.capabilities
+            if capability not in runtime_capabilities
+        ]
+        await self._publish_registry()
+        return self.registry.get_state(self.agent_id)
+
+    async def _publish_presence(
+        self,
+        state: Literal["online", "offline"],
+        *,
+        reason: str | None = None,
+    ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
-        payload = json.dumps({"agent": self.agent_id, "status": status})
+        topic = self.topics.presence(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
+        payload = presence_payload(
+            self.agent_id,
+            state,
+            reason=reason,
+            topic_address=(
+                self.topic_address
+                if self.topic_address != self.agent_id
+                else None
+            ),
+        )
         await self._client.publish(
-            self.topics.presence(self.agent_id),
+            topic,
             payload,
             qos=1,
             retain=True,
         )
-        if status == "online":
-            self._online_agents.add(self.agent_id)
-        else:
-            self._online_agents.discard(self.agent_id)
+        self.registry.update_presence(topic, payload)
+
+    async def _publish_registry(self) -> None:
+        if self._client is None:
+            raise self._transport_unavailable()
+        record = RegistryRecord(
+            agent_id=self.agent_id,
+            topic_address=(
+                self.topic_address
+                if self.topic_address != self.agent_id
+                else None
+            ),
+            status=self.status,
+            working_set=self.working_set,
+            capabilities=[
+                *self.runtime_capabilities,
+                *self.declared_capabilities,
+            ],
+            lifecycle=self.lifecycle,
+            durability="durable" if self.persistent else "ephemeral",
+            started_at=self.started_at,
+            last_seen=datetime.now(timezone.utc),
+        )
+        topic = self.topics.registry(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
+        payload = record.to_json()
+        await self._client.publish(
+            topic,
+            payload,
+            qos=1,
+            retain=True,
+        )
+        self.registry.update_registry(topic, payload)
+
+    async def _clear_transient_retained_state(self) -> bool:
+        """Tombstone retained state; report whether a session destroy is owed."""
+        if self._client is None:
+            raise self._transport_unavailable()
+        registry_topic = self.topics.registry(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
+        presence_topic = self.topics.presence(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
+        # Remove presence first so interruption leaves a GC-eligible registry
+        # orphan rather than an uncollectable presence orphan.
+        await self._client.publish(
+            presence_topic,
+            b"",
+            qos=1,
+            retain=True,
+        )
+        await self._client.publish(
+            registry_topic,
+            b"",
+            qos=1,
+            retain=True,
+        )
+        self.registry.remove_presence(presence_topic)
+        self.registry.remove_registry(registry_topic)
+        # Reclaiming the client id kicks the live connection, and the broker
+        # publishes that connection's will. Defer until after a clean close.
+        return self.persistent
+
+    async def _destroy_persistent_session(self) -> None:
+        """Destroy the broker session for a retired transient identity."""
+        # A will could recreate the presence orphan just removed.
+        kwargs = {
+            key: value
+            for key, value in self._client_kwargs().items()
+            if key != "will"
+        }
+        kwargs["clean_session"] = True
+        try:
+            async with aiomqtt.Client(self.broker, port=self.port, **kwargs):
+                pass
+        # Session cleanup is best-effort during shutdown; cancellation still
+        # propagates because CancelledError is a BaseException.
+        except (aiomqtt.MqttError, OSError, asyncio.TimeoutError) as exc:
+            logger.warning("failed to destroy persistent session: %s", exc)
