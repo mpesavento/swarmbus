@@ -16,7 +16,7 @@ import click
 from pydantic import ValidationError
 
 from .archive import SQLiteMessageStore
-from .bus import AgentBus
+from .bus import DEFAULT_OUTBOX_KEEP, DEFAULT_OUTBOX_MAX_BYTES, AgentBus
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
@@ -216,6 +216,27 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
          "SWARMBUS_OUTBOX_<UPPER_AGENT_ID> > SWARMBUS_OUTBOX.",
 )
 @click.option(
+    "--outbox-max-bytes",
+    "outbox_max_bytes",
+    type=click.IntRange(min=0),
+    default=DEFAULT_OUTBOX_MAX_BYTES,
+    envvar="SWARMBUS_MAX_OUTBOX_BYTES",
+    show_default=True,
+    help="Before an append would take the outbox past this many bytes, rename "
+         "it to <name>.<UTC time>Z<suffix> and start a new one. 0 never "
+         "rotates. [env: SWARMBUS_MAX_OUTBOX_BYTES]",
+)
+@click.option(
+    "--outbox-keep",
+    "outbox_keep",
+    type=click.IntRange(min=0),
+    default=DEFAULT_OUTBOX_KEEP,
+    envvar="SWARMBUS_KEEP_OUTBOX_FILES",
+    show_default=True,
+    help="Rotated outbox files to keep; older ones are deleted. 0 keeps "
+         "every one. [env: SWARMBUS_KEEP_OUTBOX_FILES]",
+)
+@click.option(
     "--in-reply-to",
     "in_reply_to",
     default=None,
@@ -246,6 +267,8 @@ def send(
     priority: str,
     reply_to: str | None,
     outbox: str | None,
+    outbox_max_bytes: int,
+    outbox_keep: int,
     in_reply_to: str | None,
     force: bool,
     hop_limit: int,
@@ -352,6 +375,8 @@ def send(
             priority=priority.lower(),
             reply_to=reply_to,
             outbox_path=resolved_outbox,
+            outbox_max_bytes=outbox_max_bytes,
+            outbox_keep=outbox_keep,
             in_reply_to=parent_id,
             hops=hops,
             origin=origin,
