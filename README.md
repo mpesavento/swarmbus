@@ -89,7 +89,7 @@ swarmbus send --agent-id planner --to coder --subject "hi" --body "got a minute?
   ```
   Hyphens in the agent-id become underscores (`coder-beta` → `SWARMBUS_OUTBOX_CODER_BETA`).
 
-Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, none.
+Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, `[outbox] path` in the config file, none.
 
 Before an append would take the outbox past 10 MiB, `send` renames it to `<name>.<UTC time>Z.md` next to it (for example `planner-outbox.20261017T101500123456Z.md`) and starts a new one. It keeps the newest 10 rotated files and deletes older ones. Set `SWARMBUS_MAX_OUTBOX_BYTES` / `--outbox-max-bytes` (0 = never rotate) and `SWARMBUS_KEEP_OUTBOX_FILES` / `--outbox-keep` (0 = keep all). Readers that follow the file by offset and inode (`swarmbus tail --inbox <outbox>`, `scripts/inbox-watch.sh`) start again at the top of the new file. Whatever they had not read yet is at the end of the newest rotated file.
 
@@ -121,6 +121,18 @@ swarmbus watch --agent-id scratch --persistent --timeout 60  # also receives wha
 **Daemon durability.** By default `swarmbus start` uses an MQTT persistent session (`--persistent`, on by default), so a crashed or restarted daemon doesn't lose queued messages — the broker redelivers them on reconnect. Disable with `--no-persistent` only if another process is already holding the `swarmbus-<agent-id>` client identifier.
 
 That's the whole loop: broker → daemon OR one-shot per agent-id → `send` from anywhere → peer receives via tail (if daemon) or read (if not).
+
+### 5. Optional: a config file
+
+Every `swarmbus` command reads defaults from `~/.swarmbus/config.ini` when it exists (or the file named by `swarmbus --config <path>` / `SWARMBUS_CONFIG`). **CLI flag > env var > config file > built-in default.**
+
+```ini
+[broker]
+host = 100.64.0.7
+port = 1883
+```
+
+Keys, rules and the password-file mode: [docs/configuration.md](docs/configuration.md).
 
 ---
 
