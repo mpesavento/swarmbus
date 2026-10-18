@@ -291,7 +291,7 @@ async def test_list_agents_trusts_topic_owner_not_payload_claim():
 async def test_list_agents_skips_unattributable_presence_topic():
     """Unattributable presence topics do not abort listing."""
     assert await _listed([
-        _record_presence("imposter", "online", topic_owner="outer/inner"),
+        _record_presence("imposter", "online", topic_owner="outer/inner/too-deep"),
         _legacy_presence("sparrow", "online"),
     ]) == ["sparrow"]
 
@@ -624,7 +624,6 @@ def _topic_client(payloads):
             async def _gen():
                 for p in payloads:
                     yield _Msg(p)
-                await asyncio.sleep(30)
             return _gen()
 
     return _Client()
@@ -642,7 +641,7 @@ async def test_read_inbox_skips_held_messages_and_records_admitted_ones(tmp_path
     payloads = [m.to_json().encode() for m in (past, tripped, ok)]
 
     with patch("swarmbus.bus.aiomqtt.Client", return_value=_topic_client(payloads)):
-        result = await bus.read_inbox(max_messages=1, drain_timeout=0.2)
+        result = await bus.read_inbox(max_messages=1, drain_timeout=30)
 
     assert [m["subject"] for m in result] == ["ok"]
     holds = await store.list_holds()

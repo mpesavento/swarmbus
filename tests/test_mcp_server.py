@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiomqtt
 import pytest
 
-from swarmbus.mcp_server import create_mcp_app
+from swarmbus.mcp_server import create_managed_runtime, create_mcp_app
 from swarmbus.message import AgentMessage
 from swarmbus.registry import presence_payload
 from swarmbus.runtime import (
@@ -27,6 +27,17 @@ class _FakeRuntime:
         self.list_states = AsyncMock(return_value=[])
         self.get_state = AsyncMock(return_value={})
         self.update_state = AsyncMock(return_value={})
+
+
+def test_create_managed_runtime_threads_trip_alert(tmp_path):
+    runtime = create_managed_runtime(
+        agent_id="foo",
+        state_dir=str(tmp_path),
+        on_trip=["notify", "--urgent"],
+    )
+
+    assert runtime._trip_alerter.command == ["notify", "--urgent"]
+    assert runtime._trip_alerter.listener == "mcp-server"
 
 
 def _directory_runtime(tmp_path) -> ManagedMCPRuntime:
@@ -53,6 +64,7 @@ async def test_send_message_tool_calls_runtime():
         to="wren",
         subject="hello",
         body="world",
+        priority="high",
     )
 
     assert result == "Sent to wren"
@@ -61,6 +73,7 @@ async def test_send_message_tool_calls_runtime():
         subject="hello",
         body="world",
         content_type="text/plain",
+        priority="high",
     )
 
 
@@ -365,12 +378,13 @@ async def test_send_message_tool_passes_in_reply_to():
     assert await tool(to="wren", subject="re", body="ok", in_reply_to="m-1") == "Sent to wren"
     runtime.send_message.assert_awaited_once_with(
         to="wren", subject="re", body="ok", content_type="text/plain",
-        in_reply_to="m-1",
+        priority="normal", in_reply_to="m-1",
     )
     runtime.send_message.reset_mock()
     await tool(to="wren", subject="s", body="b", in_reply_to="")
     runtime.send_message.assert_awaited_once_with(
         to="wren", subject="s", body="b", content_type="text/plain",
+        priority="normal",
     )
     assert "in_reply_to" in tool.__doc__
     assert "in_reply_to" in app._tool_fns["read_inbox"].__doc__

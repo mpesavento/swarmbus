@@ -92,6 +92,49 @@ def test_presence_topic_must_match_payload_agent():
         )
 
 
+def test_registry_record_carries_verified_transport_address():
+    agent_id = "agiter-loom__session-abc"
+    address = "agiter-loom/session-abc"
+    record = RegistryRecord.model_validate(
+        {**_record(agent_id).model_dump(), "topic_address": address}
+    )
+
+    parsed = RegistryRecord.from_mqtt(
+        DEFAULT_TOPICS.registry(agent_id, topic_address=address),
+        record.to_json(),
+    )
+
+    assert parsed.topic_address == address
+
+
+def test_registry_record_rejects_unbound_transport_address():
+    with pytest.raises(ValidationError, match="does not match"):
+        RegistryRecord.model_validate(
+            {
+                **_record("somebody-else").model_dump(),
+                "topic_address": "agiter-loom/session-abc",
+            }
+        )
+
+
+def test_presence_record_carries_verified_transport_address():
+    agent_id = "agiter-loom__session-abc"
+    address = "agiter-loom/session-abc"
+    payload = PresenceRecord(
+        agent_id=agent_id,
+        topic_address=address,
+        state="online",
+        connected_at=datetime.now(timezone.utc),
+    ).to_json()
+
+    parsed = PresenceRecord.from_mqtt(
+        DEFAULT_TOPICS.presence(agent_id, topic_address=address),
+        payload,
+    )
+
+    assert parsed.topic_address == address
+
+
 def test_cache_combines_presence_and_heartbeat_freshness():
     cache = RegistryCache(stale_after_seconds=180)
     fresh = _record("foo", age_seconds=30)

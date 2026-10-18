@@ -156,8 +156,8 @@ bash scripts/setup-cc-plugin.sh planner localhost
 
 Restart your agent harness. Three MCP tools become available:
 
-- `send_message(to, subject, body, content_type?)` — publish to a peer (or `to="broadcast"`)
-- `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages
+- `send_message(to, subject, body, content_type?, priority?, in_reply_to?)` — publish to a peer (or `to="broadcast"`); `priority` defaults to `"normal"`
+- `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages with the complete envelope, including reply-chain fields
 - `agent_state(action, ...)` — read or publish retained directory state. `action="list"` returns the online peers with their status, working set, capabilities, lifecycle and durability; add `include_offline=True` for the whole directory, `action="get"` for one peer, `action="update"` to publish your own.
 
 `agent_state` reads the agent directory, which only a sidecar started with `--presence` subscribes to. Without it the sidecar is messaging-only: it can send and receive, and `agent_state` raises a tool error naming the flag rather than returning an empty list.
@@ -177,9 +177,26 @@ swarmbus mcp-server --agent-id planner --broker mqtt.example.com \
   --port 8883 --tls --persistent --presence
 ```
 
-This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects. When the sidecar has lost its broker connection, `read_inbox` logs the transport error and returns an empty list, while `agent_state` raises `TransportUnavailable` rather than serving stale directory data. Any other failure surfaces as an MCP tool error, including a fatal runtime failure (`RuntimeFatalError`) and a degraded durable inbox (`StoreUnavailable`). An inbox schema newer than this version is rejected when the sidecar starts, before any tool runs.
+When a harness starts a fresh stdio server for every session, `mcp-daemon`
+can own one managed runtime while each session launches a credential-free
+`mcp-proxy`. The direct `mcp-server` invocation remains unchanged. See
+[Shared local MCP runtime](docs/local-mcp-runtime.md) for commands, mode
+semantics, security, health, and controller integration.
+
+Managed launchers that share one MQTT principal across transient sessions can
+pass `--topic-address <principal>/<client-id>`. The logical `--agent-id` stays a
+single validated identifier (for example `principal__client-id`), while the
+physical inbox, presence, and registry paths use two MQTT levels so Mosquitto
+ACLs can bind `%u/%c`. Swarmbus publishes the binding in retained state and
+rejects payloads whose logical identity does not match their physical topic.
+
+**Do not run a listener daemon and a persistent MCP runtime for the same
+agent-id** — only one client can hold the persistent session at a time; the
+broker will disconnect the first one when the second connects.
 
 Without `--persistent`, messages received while the sidecar is running still survive process restarts in SQLite, but the broker does not queue messages sent while the sidecar is offline.
+
+When a managed runtime loses its broker connection, `read_inbox` logs the transport error and returns an empty list, while `agent_state` raises `TransportUnavailable` rather than serving stale directory data. Fatal runtime failures (`RuntimeFatalError`) and degraded durable storage (`StoreUnavailable`) remain explicit MCP errors. An inbox schema newer than this version is rejected at startup before any tool runs.
 
 **Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
 
@@ -314,7 +331,7 @@ swarmbus mcp-server --agent-id planner
 | Path | Durable? | Use when |
 |---|---|---|
 | `start` (daemon) | Yes (persistent session, default) | Long-running process, file-bridge to inbox, reactive wake |
-| `mcp-server --persistent --presence` | Yes (persistent session) | MCP-based agents (Claude Code, Cursor); no daemon needed |
+| `mcp-server --persistent --presence` or `mcp-daemon` + local proxies | Yes (persistent session) | MCP-based agents; daemon-backed mode shares one runtime across harness sessions |
 | `watch --persistent` | Yes (persistent session; first run registers) | Agent sessions that wait, handle one message, and wait again |
 | `read` / `watch` (one-shot) | No (ephemeral session) | CI jobs, shell scripts, quick checks |
 | `tail` (file-based) | N/A (reads daemon's file) | Companion to `start`; cursor-tracked |

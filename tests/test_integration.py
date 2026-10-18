@@ -13,7 +13,9 @@ Scenarios not yet covered (deliberately -- see README or issues):
 import asyncio
 import inspect
 import json
+import multiprocessing
 import os
+import signal
 import sqlite3
 import stat
 import sys
@@ -29,6 +31,11 @@ from swarmbus.handlers.base import BaseHandler
 from swarmbus._compat import asyncio_timeout
 from swarmbus.handlers.direct_invoke import DirectInvocationHandler
 from swarmbus.handlers.file_bridge import FileBridgeHandler
+from swarmbus.local_rpc import (
+    LocalRuntimeDaemon,
+    LocalRuntimeProxy,
+    run_mcp_daemon,
+)
 from swarmbus.maintenance import RegistryMaintenance
 from swarmbus.mcp_server import create_mcp_app
 from swarmbus.message import AgentMessage
@@ -322,6 +329,78 @@ async def test_persistent_client_multiple_sends(mosquitto_broker):
     finally:
         await _stop(t)
         await _clear_retained(host, port, ["agents/rx/presence"])
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_two_clients_share_one_real_broker_inbox(
+    mosquitto_broker,
+    tmp_path,
+):
+    host, port = mosquitto_broker
+    runtime = ManagedMCPRuntime(
+        agent_id="local-rpc-consumer",
+        broker=host,
+        port=port,
+        state_path=tmp_path / "consumer.sqlite3",
+    )
+    socket_path = tmp_path / "runtime.sock"
+
+    async with LocalRuntimeDaemon(runtime, socket_path):
+        await runtime.wait_until_ready()
+        first = LocalRuntimeProxy(socket_path)
+        second = LocalRuntimeProxy(socket_path)
+        initial = await first.inbox_state()
+        waiters = [
+            asyncio.create_task(
+                proxy.inbox_state(
+                    cursor=initial["cursor"],
+                    wait_seconds=3,
+                )
+            )
+            for proxy in (first, second)
+        ]
+
+        sender = AgentBus(
+            agent_id="local-rpc-sender",
+            broker=host,
+            port=port,
+            retain=False,
+        )
+        await sender.send(
+            to="local-rpc-consumer",
+            subject="attention",
+            body="durable work",
+            priority="high",
+        )
+        states = await asyncio.gather(*waiters)
+
+        assert [state["pending_count"] for state in states] == [1, 1]
+        message_id = states[0]["pending_messages"][0]["id"]
+        assert states[1]["pending_messages"][0]["id"] == message_id
+        assert await first.read_inbox(
+            ack_ids=None,
+            max_messages=1,
+            wait_seconds=0,
+        ) == await second.read_inbox(
+            ack_ids=None,
+            max_messages=1,
+            wait_seconds=0,
+        )
+
+        await first.read_inbox(
+            ack_ids=[message_id],
+            max_messages=0,
+            wait_seconds=0,
+        )
+        acknowledged = await second.inbox_state(
+            cursor=states[1]["cursor"],
+        )
+
+        assert (
+            acknowledged["cursor"]["generation"]
+            > states[1]["cursor"]["generation"]
+        )
+        assert acknowledged["pending_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1205,6 +1284,82 @@ async def test_transient_durable_shutdown_destroys_queued_session(
 
 
 @pytest.mark.asyncio
+async def test_transient_mcp_daemon_sigterm_tombstones_retained_state(
+    mosquitto_broker,
+    tmp_path,
+):
+    host, port = mosquitto_broker
+    agent_id = "agiter-loom__session-clean-exit"
+    topic_address = "agiter-loom/session-clean-exit"
+    topics = TopicMap(root="loom")
+    presence_topic = topics.presence(
+        agent_id,
+        topic_address=topic_address,
+    )
+    registry_topic = topics.registry(
+        agent_id,
+        topic_address=topic_address,
+    )
+    socket_path = tmp_path / "swarmbus.sock"
+    await _clear_retained(host, port, [presence_topic, registry_topic])
+    process = multiprocessing.get_context("spawn").Process(
+        target=run_mcp_daemon,
+        kwargs={
+            "socket_path": str(socket_path),
+            "agent_id": agent_id,
+            "topic_address": topic_address,
+            "broker": host,
+            "port": port,
+            "persistent": False,
+            "presence": True,
+            "lifecycle": "transient",
+            "client_id": "agiter-loom-session-clean-exit",
+            "state_dir": str(tmp_path / "state"),
+            "topic_root": "loom",
+        },
+    )
+
+    try:
+        process.start()
+        deadline = asyncio.get_running_loop().time() + 10
+        while not socket_path.exists():
+            assert process.is_alive(), (
+                f"MCP daemon exited during startup with {process.exitcode}"
+            )
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail("MCP daemon did not create its readiness socket")
+            await asyncio.sleep(0.05)
+
+        online = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert json.loads(online[presence_topic])["state"] == "online"
+        assert json.loads(online[registry_topic])["lifecycle"] == "transient"
+
+        os.kill(process.pid, signal.SIGTERM)
+        await asyncio.to_thread(process.join, 10)
+        assert not process.is_alive(), "MCP daemon ignored SIGTERM"
+        assert process.exitcode == 0
+
+        retained = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert retained == {}, (
+            "SIGTERM left transient retained state: "
+            f"{_describe_retained(retained)}"
+        )
+    finally:
+        if process.is_alive():
+            process.kill()
+            await asyncio.to_thread(process.join, 5)
+        await _clear_retained(host, port, [presence_topic, registry_topic])
+
+
+@pytest.mark.asyncio
 async def test_transient_nondurable_clean_stop_tombstones_presence(
     mosquitto_broker,
     tmp_path,
@@ -1481,7 +1636,14 @@ async def test_mcp_tools_expose_expected_signatures(tmp_path):
 
     send_sig = inspect.signature(app._tool_fns["send_message"])
     # Positional/keyword params the LLM wire protocol depends on.
-    assert set(send_sig.parameters.keys()) >= {"to", "subject", "body", "content_type"}
+    assert set(send_sig.parameters.keys()) >= {
+        "to",
+        "subject",
+        "body",
+        "content_type",
+        "priority",
+    }
+    assert send_sig.parameters["priority"].default == "normal"
 
     read_sig = inspect.signature(app._tool_fns["read_inbox"])
     assert list(read_sig.parameters) == [

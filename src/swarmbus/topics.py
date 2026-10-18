@@ -5,10 +5,16 @@ parsed here.
 
 Layout (with the default empty root):
 
-    agents/<agent_id>/inbox        directed messages
-    agents/<agent_id>/presence     retained online/offline, also the LWT
-    agents/broadcast               bus-wide fan-out
-    swarmbus/registry/<agent_id>   retained registry record + heartbeat
+    agents/<topic_address>/inbox        directed messages
+    agents/<topic_address>/presence     retained online/offline, also the LWT
+    agents/broadcast                    bus-wide fan-out
+    swarmbus/registry/<topic_address>   retained registry record + heartbeat
+
+A topic address is normally the logical agent ID as one MQTT level. Managed
+runtimes may bind a logical ID such as ``host__session`` to the two-level
+address ``host/session`` so Mosquitto ACL patterns can use whole-level
+``%u/%c`` substitutions. Registry and presence payloads carry and verify that
+binding; callers must not infer an address from an untrusted payload alone.
 
 A non-empty ``root`` prefixes the agent and registry trees, e.g.
 ``TopicMap(root="foo")`` yields ``foo/agents/alice/inbox`` and
@@ -57,28 +63,70 @@ RESERVED_PREFIX = "$"
 #: An empty topic segment. Legal MQTT, and a DIFFERENT topic from the
 #: same path without it -- which is exactly why a root must not contain one.
 EMPTY_SEGMENT = "//"
+#: Separator encoding a two-level transport address as one logical agent ID.
+NAMESPACE_SEPARATOR = "__"
 
 _MQTT_WILDCARDS = (SINGLE_LEVEL_WILDCARD, "#")
 
 
-def _one_agent_segment(candidate: str, *, prefix: str, topic: str) -> str:
-    """Extract exactly one agent-id segment sitting directly under ``prefix``.
+def agent_id_for_topic_address(topic_address: str) -> str:
+    """Return the logical agent ID canonically bound to a transport address."""
+    segments = topic_address.split("/")
+    if len(segments) not in {1, 2} or any(not segment for segment in segments):
+        raise ValueError(
+            f"topic address {topic_address!r} must contain one or two segments"
+        )
+    for segment in segments:
+        _validate_agent_id(segment)
+        if len(segments) == 2 and NAMESPACE_SEPARATOR in segment:
+            raise ValueError(
+                f"topic address segments may not contain "
+                f"{NAMESPACE_SEPARATOR!r}"
+            )
+    return _validate_agent_id(NAMESPACE_SEPARATOR.join(segments))
 
-    ``candidate`` is ``topic`` with any trailing leaf already stripped;
-    ``topic`` is carried through only so error messages name the real topic.
 
-    Raises ValueError unless ``candidate`` is ``<prefix>/<one-segment>``.
-    A passthrough here (returning the input when the prefix is absent) is
-    how the old presence parser silently invented agent ids -- keep it
-    raising.
-    """
+def topic_address_for_agent_id(agent_id: str) -> str:
+    """Return the canonical transport address for a logical agent ID."""
+    _validate_agent_id(agent_id)
+    if NAMESPACE_SEPARATOR not in agent_id:
+        return agent_id
+    segments = agent_id.split(NAMESPACE_SEPARATOR)
+    if len(segments) != 2 or any(not segment for segment in segments):
+        raise ValueError(
+            f"namespaced agent_id {agent_id!r} must contain exactly one "
+            f"{NAMESPACE_SEPARATOR!r} separator"
+        )
+    address = "/".join(segments)
+    agent_id_for_topic_address(address)
+    return address
+
+
+def _bound_topic_address(agent_id: str, topic_address: str | None) -> str:
+    if topic_address is None:
+        return agent_id
+    address = topic_address
+    addressed_agent = agent_id_for_topic_address(address)
+    if addressed_agent != agent_id:
+        raise ValueError(
+            f"topic address {address!r} does not match agent_id {agent_id!r}"
+        )
+    return address
+
+
+def _agent_topic_address(
+    candidate: str,
+    *,
+    prefix: str,
+    topic: str,
+) -> str:
+    """Extract a one- or two-level agent address directly under ``prefix``."""
     head = f"{prefix}/"
     if not candidate.startswith(head):
         raise ValueError(f"topic {topic!r} is not under {prefix!r}")
-    agent_id = candidate[len(head):]
-    if "/" in agent_id or not agent_id:
-        raise ValueError(f"topic {topic!r} does not identify one agent")
-    return _validate_agent_id(agent_id)
+    address = candidate[len(head):]
+    agent_id_for_topic_address(address)
+    return address
 
 
 @dataclass(frozen=True)
@@ -156,23 +204,40 @@ class TopicMap:
     # ------------------------------------------------------------------
     # builders
     #
-    # These do NOT validate the agent id. Every current caller already
-    # validated it (AgentBus.__init__ and AgentMessage's `to`/`from`
-    # validators run _validate_agent_id), and adding a
-    # second gate here would change behaviour rather than centralise it.
+    # Legacy one-level calls preserve their historical no-validation
+    # behaviour. Supplying a transport address validates its canonical binding
+    # to the logical agent ID before a topic is built.
     # ------------------------------------------------------------------
 
-    def inbox(self, agent_id: str) -> str:
+    def inbox(
+        self,
+        agent_id: str,
+        *,
+        topic_address: str | None = None,
+    ) -> str:
         """Directed-message topic for one agent."""
-        return f"{self.agents_prefix}/{agent_id}/{INBOX_LEAF}"
+        address = _bound_topic_address(agent_id, topic_address)
+        return f"{self.agents_prefix}/{address}/{INBOX_LEAF}"
 
-    def presence(self, agent_id: str) -> str:
+    def presence(
+        self,
+        agent_id: str,
+        *,
+        topic_address: str | None = None,
+    ) -> str:
         """Retained presence topic for one agent (also used as the LWT)."""
-        return f"{self.agents_prefix}/{agent_id}/{PRESENCE_LEAF}"
+        address = _bound_topic_address(agent_id, topic_address)
+        return f"{self.agents_prefix}/{address}/{PRESENCE_LEAF}"
 
-    def registry(self, agent_id: str) -> str:
+    def registry(
+        self,
+        agent_id: str,
+        *,
+        topic_address: str | None = None,
+    ) -> str:
         """Retained registry/heartbeat topic for one agent."""
-        return f"{self.registry_prefix}/{agent_id}"
+        address = _bound_topic_address(agent_id, topic_address)
+        return f"{self.registry_prefix}/{address}"
 
     @property
     def broadcast(self) -> str:
@@ -183,13 +248,18 @@ class TopicMap:
         """
         return BROADCAST_TOPIC
 
-    def route(self, to: str) -> str:
-        """Topic a message addressed to ``to`` should be published on.
-
-        ``to="broadcast"`` is the reserved sentinel for fan-out; anything
-        else is a directed inbox delivery.
-        """
-        return self.broadcast if to == BROADCAST_AGENT_ID else self.inbox(to)
+    def route(
+        self,
+        to: str,
+        *,
+        topic_address: str | None = None,
+    ) -> str:
+        """Topic a message addressed to ``to`` should be published on."""
+        return (
+            self.broadcast
+            if to == BROADCAST_AGENT_ID
+            else self.inbox(to, topic_address=topic_address)
+        )
 
     # ------------------------------------------------------------------
     # subscribe filters
@@ -200,8 +270,28 @@ class TopicMap:
         return f"{self.agents_prefix}/{SINGLE_LEVEL_WILDCARD}/{PRESENCE_LEAF}"
 
     def any_registry_filter(self) -> str:
-        """Subscription matching every agent's registry topic."""
+        """Subscription matching every one-level agent registry topic."""
         return f"{self.registry_prefix}/{SINGLE_LEVEL_WILDCARD}"
+
+    def presence_filters(self) -> tuple[str, str]:
+        """Subscriptions covering one- and two-level agent addresses."""
+        return (
+            self.any_presence_filter(),
+            (
+                f"{self.agents_prefix}/{SINGLE_LEVEL_WILDCARD}/"
+                f"{SINGLE_LEVEL_WILDCARD}/{PRESENCE_LEAF}"
+            ),
+        )
+
+    def registry_filters(self) -> tuple[str, str]:
+        """Subscriptions covering one- and two-level agent addresses."""
+        return (
+            self.any_registry_filter(),
+            (
+                f"{self.registry_prefix}/{SINGLE_LEVEL_WILDCARD}/"
+                f"{SINGLE_LEVEL_WILDCARD}"
+            ),
+        )
 
     # ------------------------------------------------------------------
     # predicates
@@ -210,8 +300,8 @@ class TopicMap:
     # this arrive on" for dispatch, and preserve the exact startswith /
     # endswith semantics the runtime used before this module existed. A
     # topic can therefore pass a predicate and still fail its parser (e.g.
-    # `agents/a/b/presence`, which the `agents/+/presence` subscription
-    # cannot actually deliver) -- that raise is intended.
+    # `agents/a/b/c/presence`, which neither supported subscription can
+    # deliver) -- that raise is intended.
     # ------------------------------------------------------------------
 
     def is_registry_topic(self, topic: str) -> bool:
@@ -224,37 +314,43 @@ class TopicMap:
             f"/{PRESENCE_LEAF}"
         )
 
-    def is_message_topic(self, topic: str, *, agent_id: str) -> bool:
+    def is_message_topic(
+        self,
+        topic: str,
+        *,
+        agent_id: str,
+        topic_address: str | None = None,
+    ) -> bool:
         """True when ``topic`` carries a message envelope for ``agent_id``."""
-        return topic in (self.inbox(agent_id), self.broadcast)
+        return topic in (
+            self.inbox(agent_id, topic_address=topic_address),
+            self.broadcast,
+        )
 
     # ------------------------------------------------------------------
     # parsers -- all of these RAISE ValueError on a shape mismatch
     # ------------------------------------------------------------------
 
-    def registry_agent(self, topic: str) -> str:
-        """Agent id owning ``topic``, which must be a registry topic.
-
-        Raises ValueError otherwise. Callers compare this against the
-        agent_id inside the payload, so a lenient parse here would let a
-        record claim an identity the topic never granted it.
-        """
-        return _one_agent_segment(
+    def registry_address(self, topic: str) -> str:
+        """Transport address owning ``topic``, which must be a registry topic."""
+        return _agent_topic_address(
             topic, prefix=self.registry_prefix, topic=topic
         )
 
-    def presence_agent(self, topic: str) -> str:
-        """Agent id owning ``topic``, which must be a presence topic.
+    def registry_agent(self, topic: str) -> str:
+        """Logical agent ID canonically bound to a registry topic."""
+        return agent_id_for_topic_address(self.registry_address(topic))
 
-        Raises ValueError otherwise -- both when the leaf is wrong and when
-        the topic is outside this map's agent tree. The prefix check is the
-        half that used to be missing: ``removeprefix`` let `x/presence` and
-        `<root>/agents/x/presence` through with garbage agent ids.
-        """
+    def presence_agent(self, topic: str) -> str:
+        """Logical agent ID canonically bound to a presence topic."""
+        return agent_id_for_topic_address(self.presence_address(topic))
+
+    def presence_address(self, topic: str) -> str:
+        """Transport address owning ``topic``, which must be a presence topic."""
         leaf = f"/{PRESENCE_LEAF}"
         if not topic.endswith(leaf):
             raise ValueError(f"topic {topic!r} is not a presence topic")
-        return _one_agent_segment(
+        return _agent_topic_address(
             topic[: -len(leaf)], prefix=self.agents_prefix, topic=topic
         )
 

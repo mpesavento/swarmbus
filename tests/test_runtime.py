@@ -8,6 +8,7 @@ from typing import get_args
 from unittest.mock import AsyncMock, MagicMock
 
 import aiomqtt
+import aiosqlite
 import pytest
 
 from swarmbus.archive import MessageConflictError
@@ -88,6 +89,22 @@ class _FakeStore:
         self.messages = remaining
         return acknowledged
 
+    async def pending_metadata(self, limit=1000):
+        messages = list(reversed(self.messages))[:limit]
+        return {
+            "pending_count": len(self.messages),
+            "pending_messages": [
+                {
+                    "id": message.id,
+                    "from": message.from_agent,
+                    "received_at": message.ts.isoformat(),
+                    "priority": message.priority,
+                }
+                for message in messages
+            ],
+            "truncated": len(self.messages) > len(messages),
+        }
+
 
 class _FakeMqttMessage:
     def __init__(self, msg):
@@ -126,6 +143,28 @@ def _message():
         body="yo",
     )
 
+
+def test_runtime_uses_configured_topic_root():
+    runtime = _runtime(_FakeStore([]), topic_root=" /loom/ ")
+
+    assert runtime.topics.inbox("wren") == "loom/agents/wren/inbox"
+    assert runtime.registry.topics is runtime.topics
+
+
+def test_runtime_uses_explicit_transport_address_for_its_will(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="agiter-loom__session-abc",
+        topic_address="agiter-loom/session-abc",
+        presence=True,
+        state_path=tmp_path / "state.sqlite3",
+    )
+
+    will = runtime._client_kwargs()["will"]
+
+    assert str(will.topic) == "agents/agiter-loom/session-abc/presence"
+    assert json.loads(will.payload)["topic_address"] == (
+        "agiter-loom/session-abc"
+    )
 
 
 def _shutdown_runtime(events, **kwargs):
@@ -366,6 +405,239 @@ async def test_read_inbox_long_poll_wakes_after_committed_message():
 
 
 @pytest.mark.asyncio
+async def test_inbox_state_waits_for_generation_even_with_existing_pending():
+    events = []
+    store = _FakeStore(events)
+    first = _message()
+    store.messages.append(first)
+    runtime = _runtime(store)
+
+    initial = await runtime.inbox_state()
+    waiter = asyncio.create_task(
+        runtime.inbox_state(
+            cursor=initial["cursor"],
+            wait_seconds=1,
+        )
+    )
+    await asyncio.sleep(0)
+    assert waiter.done() is False
+
+    second = AgentMessage.create(
+        from_="sparrow",
+        to="foo",
+        subject="wake",
+        body="new body",
+        priority="high",
+    )
+    await runtime._handle_message(
+        _FakeMqttMessage(second),
+        _RecordingAck(events),
+    )
+    changed = await waiter
+
+    assert changed["cursor"]["generation"] == 1
+    assert changed["pending_count"] == 2
+    assert [item["id"] for item in changed["pending_messages"]] == [
+        second.id,
+        first.id,
+    ]
+    assert all(
+        "body" not in item and "subject" not in item
+        for item in changed["pending_messages"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_wakes_all_concurrent_waiters():
+    runtime = _runtime(_FakeStore([]))
+    cursor = (await runtime.inbox_state())["cursor"]
+    waiters = [
+        asyncio.create_task(
+            runtime.inbox_state(cursor=cursor, wait_seconds=1)
+        )
+        for _ in range(3)
+    ]
+    await asyncio.sleep(0)
+
+    message = _message()
+    await runtime._handle_message(
+        _FakeMqttMessage(message),
+        _RecordingAck(),
+    )
+    states = await asyncio.gather(*waiters)
+
+    assert [state["cursor"]["generation"] for state in states] == [1, 1, 1]
+    assert all(state["pending_count"] == 1 for state in states)
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_coalesces_a_burst_into_one_snapshot():
+    runtime = _runtime(_FakeStore([]))
+    cursor = (await runtime.inbox_state())["cursor"]
+
+    messages = [
+        AgentMessage.create(
+            from_=f"peer-{index}",
+            to="foo",
+            subject=f"message {index}",
+            body="work",
+        )
+        for index in range(3)
+    ]
+    for message in messages:
+        await runtime._handle_message(
+            _FakeMqttMessage(message),
+            _RecordingAck(),
+        )
+
+    state = await runtime.inbox_state(cursor=cursor)
+
+    assert state["cursor"]["generation"] == 3
+    assert state["pending_count"] == 3
+    assert {item["id"] for item in state["pending_messages"]} == {
+        message.id for message in messages
+    }
+
+
+@pytest.mark.asyncio
+async def test_quarantine_advances_inbox_state_after_commit(tmp_path):
+    state_path = tmp_path / "foo.sqlite3"
+    runtime = ManagedMCPRuntime(agent_id="foo", state_path=state_path)
+    await runtime.store.open()
+    message = _message()
+    try:
+        await runtime.store.store(
+            message,
+            source_topic="agents/foo/inbox",
+        )
+        initial = await runtime.inbox_state()
+        async with aiosqlite.connect(state_path) as db:
+            await db.execute(
+                "UPDATE inbox_messages SET from_agent = ? WHERE id = ?",
+                ("INVALID!", message.id),
+            )
+            await db.commit()
+
+        with pytest.raises(TransportUnavailable):
+            await runtime.read_inbox()
+        changed = await runtime.inbox_state(cursor=initial["cursor"])
+
+        assert changed["cursor"]["generation"] == 1
+        assert changed["pending_count"] == 0
+    finally:
+        await runtime.store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_ignores_unrelated_waiter_notifications():
+    runtime = _runtime(_FakeStore([]))
+    cursor = (await runtime.inbox_state())["cursor"]
+    waiter = asyncio.create_task(
+        runtime.inbox_state(cursor=cursor, wait_seconds=1)
+    )
+
+    await asyncio.sleep(0)
+    await runtime._notify_inbox_waiters()
+    await asyncio.sleep(0)
+    assert waiter.done() is False
+
+    await runtime._advance_inbox_generation()
+    changed = await waiter
+
+    assert changed["cursor"]["generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_reports_transport_health_and_wakes_on_disconnect():
+    runtime = _runtime(_FakeStore([]))
+    runtime._client = _FakeClient()
+    runtime._state = RuntimeState.CONNECTED
+    initial = await runtime.inbox_state()
+
+    assert initial["runtime_state"] == "connected"
+    assert initial["connected"] is True
+
+    waiter = asyncio.create_task(
+        runtime.inbox_state(cursor=initial["cursor"], wait_seconds=1)
+    )
+    await asyncio.sleep(0)
+    runtime._client = None
+    runtime._state = RuntimeState.CONNECTING
+    await runtime._advance_inbox_generation()
+    disconnected = await waiter
+
+    assert disconnected["runtime_state"] == "connecting"
+    assert disconnected["connected"] is False
+    assert disconnected["cursor"]["generation"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_is_not_ready_until_broker_connected():
+    runtime = _runtime(_FakeStore([]))
+
+    assert await runtime.runtime_status() == {
+        "ready": False,
+        "connected": False,
+        "state": "stopped",
+    }
+
+    runtime._client = _FakeClient()
+    runtime._state = RuntimeState.CONNECTED
+
+    assert await runtime.runtime_status() == {
+        "ready": True,
+        "connected": True,
+        "state": "connected",
+    }
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_ack_advances_generation_without_consuming_snapshot():
+    store = _FakeStore([])
+    message = _message()
+    store.messages.append(message)
+    runtime = _runtime(store)
+
+    initial = await runtime.inbox_state()
+    assert initial["pending_count"] == 1
+    assert store.messages == [message]
+
+    assert await runtime.ack_inbox(message_ids=[message.id]) == 1
+    changed = await runtime.inbox_state(cursor=initial["cursor"])
+
+    assert changed["cursor"]["generation"] == 1
+    assert changed["pending_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_surfaces_store_degradation():
+    store = _FakeStore([])
+    store.pending_metadata = AsyncMock(
+        side_effect=sqlite3.OperationalError("disk full")
+    )
+    runtime = _runtime(store)
+
+    with pytest.raises(StoreUnavailable, match="disk full"):
+        await runtime.inbox_state()
+
+    assert runtime.state is RuntimeState.STORE_DEGRADED
+    with pytest.raises(StoreUnavailable, match="disk full"):
+        await runtime.inbox_state()
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_rejects_stale_runtime_cursor_after_restart():
+    first = _runtime(_FakeStore([]))
+    cursor = (await first.inbox_state())["cursor"]
+    restarted = _runtime(_FakeStore([]))
+
+    state = await restarted.inbox_state(cursor=cursor, wait_seconds=10)
+
+    assert state["reset"] is True
+    assert state["cursor"]["instance_id"] != cursor["instance_id"]
+
+
+@pytest.mark.asyncio
 async def test_read_inbox_waits_for_startup_replay_commit():
     store = _FakeStore([])
     runtime = _runtime(store, persistent=True, presence=True)
@@ -598,6 +870,11 @@ async def test_background_connection_failure_is_recorded_and_stop_is_safe(caplog
     assert "managed MQTT runtime stopped: receiver exploded" in caplog.text
     assert runtime.state is RuntimeState.FATAL
     assert str(runtime.last_fatal_error) == "receiver exploded"
+    assert await runtime.runtime_status() == {
+        "ready": False,
+        "connected": False,
+        "state": "fatal",
+    }
     with pytest.raises(RuntimeFatalError, match="receiver exploded"):
         await runtime.read_inbox()
     await runtime.stop()
@@ -667,6 +944,7 @@ async def test_ack_failure_reconnects_instead_of_killing_receiver(monkeypatch):
 
     assert first._client.acks == [(42, 1)]
     assert runtime.last_fatal_error is None
+    assert (await runtime.inbox_state())["cursor"]["generation"] == 5
 
 
 @pytest.mark.asyncio
@@ -768,12 +1046,29 @@ async def test_send_message_uses_held_connection():
         subject="hello",
         body="ping",
         content_type="text/markdown",
+        priority="high",
     )
 
     topic, payload = runtime._client.publish.await_args.args
     message = AgentMessage.from_json(payload)
     assert topic == "agents/wren/inbox"
     assert message.content_type == "text/markdown"
+    assert message.priority == "high"
+
+
+@pytest.mark.asyncio
+async def test_send_message_routes_namespaced_agent_to_transport_address():
+    runtime = _runtime(_FakeStore([]))
+    runtime._client = _FakeClient()
+
+    await runtime.send_message(
+        to="agiter-loom__session-abc",
+        subject="hello",
+        body="ping",
+    )
+
+    topic, _ = runtime._client.publish.await_args.args
+    assert topic == "agents/agiter-loom/session-abc/inbox"
 
 
 def test_durable_runtime_uses_stable_session():
@@ -1249,9 +1544,17 @@ _DIRECTORY_OPERATIONS = (
     ),
 )
 _MESSAGING_OPERATIONS = frozenset(
-    {"send_message", "read_inbox", "ack_inbox", "watch_inbox"}
+    {
+        "send_message",
+        "read_inbox",
+        "ack_inbox",
+        "watch_inbox",
+        "inbox_state",
+    }
 )
-_LIFECYCLE_OPERATIONS = frozenset({"start", "wait_until_ready", "stop"})
+_RUNTIME_OPERATIONS = frozenset(
+    {"start", "wait_until_ready", "stop", "runtime_status"}
+)
 
 def test_directory_operation_matrix_covers_the_mcp_runtime_contract():
     """Cover every public directory method with presence-refusal tests."""
@@ -1265,7 +1568,7 @@ def test_directory_operation_matrix_covers_the_mcp_runtime_contract():
     }
 
     assert {name for name, _ in _DIRECTORY_OPERATIONS} == (
-        declared - _MESSAGING_OPERATIONS - _LIFECYCLE_OPERATIONS
+        declared - _MESSAGING_OPERATIONS - _RUNTIME_OPERATIONS
     )
 
 @pytest.mark.asyncio

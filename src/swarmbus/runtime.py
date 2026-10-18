@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -28,7 +29,7 @@ from .registry import (
     RegistryRecord,
     presence_payload,
 )
-from .topics import DEFAULT_TOPICS
+from .topics import TopicMap
 from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,7 @@ class ManagedMCPRuntime:
         self,
         *,
         agent_id: str,
+        topic_address: str | None = None,
         broker: str = "localhost",
         port: int = 1883,
         persistent: bool = False,
@@ -119,6 +121,7 @@ class ManagedMCPRuntime:
         stale_after_seconds: float = 180,
         capabilities: list[str] | tuple[str, ...] = (),
         state_path: str | Path,
+        topic_root: str = "",
         username: str | None = None,
         password: str | None = None,
         tls: bool = False,
@@ -130,6 +133,7 @@ class ManagedMCPRuntime:
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
         on_trip: list[str] | None = None,
+        trip_listener: str = "mcp-server",
     ) -> None:
         _validate_registered_agent_id(agent_id)
         if lifecycle not in {"named", "transient"}:
@@ -165,6 +169,12 @@ class ManagedMCPRuntime:
                 "stale_after_seconds must be at least twice heartbeat_seconds"
             )
         self.agent_id = agent_id
+        self.topics = TopicMap(topic_root)
+        self.topic_address = topic_address or agent_id
+        self.topics.inbox(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
         self.broker = broker
         self.port = port
         self.persistent = persistent
@@ -187,11 +197,10 @@ class ManagedMCPRuntime:
             rate_cooldown=rate_cooldown,
         )
         self._trip_alerter: TripAlerter | None = (
-            TripAlerter(on_trip, agent_id=agent_id, listener="mcp-server")
+            TripAlerter(on_trip, agent_id=agent_id, listener=trip_listener)
             if on_trip
             else None
         )
-        self.topics = DEFAULT_TOPICS
         self.registry = RegistryCache(
             stale_after_seconds=stale_after_seconds,
             topics=self.topics,
@@ -206,6 +215,7 @@ class ManagedMCPRuntime:
         ]
         normalized_capabilities = RegistryRecord(
             agent_id=self.agent_id,
+            topic_address=topic_address,
             capabilities=list(capabilities),
             lifecycle=self.lifecycle,
             started_at=self.started_at,
@@ -225,6 +235,8 @@ class ManagedMCPRuntime:
         self._ready = asyncio.Event()
         self._stopping = asyncio.Event()
         self._inbox_condition = asyncio.Condition()
+        self._inbox_instance_id = uuid.uuid4().hex
+        self._inbox_generation = 0
         self._state = RuntimeState.STOPPED
         self._last_fatal_error: Exception | None = None
         self._last_store_error: Exception | None = None
@@ -237,11 +249,19 @@ class ManagedMCPRuntime:
         }
         if self.presence:
             kwargs["will"] = aiomqtt.Will(
-                topic=self.topics.presence(self.agent_id),
+                topic=self.topics.presence(
+                    self.agent_id,
+                    topic_address=self.topic_address,
+                ),
                 payload=presence_payload(
                     self.agent_id,
                     "offline",
                     reason="connection-lost",
+                    topic_address=(
+                        self.topic_address
+                        if self.topic_address != self.agent_id
+                        else None
+                    ),
                 ),
                 qos=1,
                 retain=True,
@@ -283,6 +303,14 @@ class ManagedMCPRuntime:
     def connected(self) -> bool:
         return self._client is not None
 
+    async def runtime_status(self) -> dict[str, Any]:
+        connected = self.connected
+        return {
+            "ready": connected and self._state is RuntimeState.CONNECTED,
+            "connected": connected,
+            "state": self._state.value,
+        }
+
     def _record_fatal(self, exc: Exception) -> None:
         self._last_fatal_error = exc
         self._state = RuntimeState.FATAL
@@ -295,6 +323,11 @@ class ManagedMCPRuntime:
 
     async def _notify_inbox_waiters(self) -> None:
         async with self._inbox_condition:
+            self._inbox_condition.notify_all()
+
+    async def _advance_inbox_generation(self) -> None:
+        async with self._inbox_condition:
+            self._inbox_generation += 1
             self._inbox_condition.notify_all()
 
     async def start(self) -> None:
@@ -333,7 +366,7 @@ class ManagedMCPRuntime:
             await self._connection_loop()
         except Exception as exc:
             self._record_fatal(exc)
-            await self._notify_inbox_waiters()
+            await self._advance_inbox_generation()
             raise
 
     def _connection_task_done(self, task: asyncio.Task[None]) -> None:
@@ -453,17 +486,19 @@ class ManagedMCPRuntime:
                 async with client:
                     connected_at = asyncio.get_running_loop().time()
                     await client.subscribe(
-                        self.topics.inbox(self.agent_id), qos=1
+                        self.topics.inbox(
+                            self.agent_id,
+                            topic_address=self.topic_address,
+                        ), qos=1
                     )
                     await client.subscribe(self.topics.broadcast, qos=1)
                     if self.presence:
                         # Presence-free runtimes do not subscribe to directory data.
-                        await client.subscribe(
-                            self.topics.any_presence_filter(), qos=1
-                        )
-                        await client.subscribe(
-                            self.topics.any_registry_filter(), qos=1
-                        )
+                        for topic_filter in (
+                            *self.topics.presence_filters(),
+                            *self.topics.registry_filters(),
+                        ):
+                            await client.subscribe(topic_filter, qos=1)
                     self._client = client
                     if self.persistent:
                         self._replay_activity_at = (
@@ -482,7 +517,7 @@ class ManagedMCPRuntime:
                             self._heartbeat_loop()
                         )
                     self._state = RuntimeState.CONNECTED
-                    await self._notify_inbox_waiters()
+                    await self._advance_inbox_generation()
                     self._ready.set()
                     async for message in client.messages:
                         if self.persistent and not self._replay_settled:
@@ -532,7 +567,7 @@ class ManagedMCPRuntime:
                     self._heartbeat_task = None
                 if self._state is RuntimeState.CONNECTED:
                     self._state = RuntimeState.CONNECTING
-                await self._notify_inbox_waiters()
+                await self._advance_inbox_generation()
 
             client = None
             ack_adapter = None
@@ -649,7 +684,11 @@ class ManagedMCPRuntime:
         ack_adapter: _ManualAckAdapter | Any,
     ) -> None:
         topic = str(mqtt_message.topic)
-        if self.topics.is_message_topic(topic, agent_id=self.agent_id):
+        if self.topics.is_message_topic(
+            topic,
+            agent_id=self.agent_id,
+            topic_address=self.topic_address,
+        ):
             try:
                 message = AgentMessage.from_json(mqtt_message.payload)
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
@@ -663,8 +702,7 @@ class ManagedMCPRuntime:
                 source_topic=topic,
             )
             if inserted:
-                async with self._inbox_condition:
-                    self._inbox_condition.notify_all()
+                await self._advance_inbox_generation()
             ack_adapter.ack(mqtt_message)
             return
 
@@ -713,6 +751,7 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
@@ -732,12 +771,16 @@ class ManagedMCPRuntime:
             subject=subject,
             body=body,
             content_type=content_type,
+            priority=priority,
             in_reply_to=in_reply_to or None,
             hops=hops,
             origin=origin,
         )
         await self._client.publish(
-            self.topics.route(to),
+            self.topics.route(
+                to,
+                topic_address=self.registry.topic_address(to),
+            ),
             message.to_json(),
             qos=1,
             retain=False,
@@ -786,6 +829,96 @@ class ManagedMCPRuntime:
                 continue
             self._replay_settled = True
 
+    async def _read_stored_messages(self, *, max_messages: int) -> list[dict]:
+        reader = getattr(self.store, "read_with_status", None)
+        if reader is None:
+            return await self.store.read(max_messages=max_messages)
+        messages, quarantined_ids = await reader(max_messages=max_messages)
+        if quarantined_ids:
+            await self._advance_inbox_generation()
+        return messages
+
+    async def inbox_state(
+        self,
+        *,
+        cursor: dict[str, Any] | None = None,
+        wait_seconds: float = 0.0,
+        max_messages: int = 1000,
+    ) -> dict:
+        """Return or wait for a non-consuming pending-inbox snapshot."""
+        if wait_seconds < 0:
+            raise ValueError("wait_seconds must be non-negative")
+        if max_messages < 1:
+            raise ValueError("max_messages must be at least 1")
+        if (
+            self._state is RuntimeState.STORE_DEGRADED
+            and self._last_store_error is not None
+        ):
+            raise self._transport_unavailable()
+
+        cursor_instance: str | None = None
+        cursor_generation: int | None = None
+        if cursor is not None:
+            if not isinstance(cursor, dict):
+                raise ValueError("cursor must be an object")
+            cursor_instance = cursor.get("instance_id")
+            cursor_generation = cursor.get("generation")
+            if (
+                not isinstance(cursor_instance, str)
+                or not cursor_instance
+                or not isinstance(cursor_generation, int)
+                or isinstance(cursor_generation, bool)
+                or cursor_generation < 0
+            ):
+                raise ValueError(
+                    "cursor requires a non-empty instance_id and "
+                    "non-negative integer generation"
+                )
+
+        async with self._inbox_condition:
+            reset = cursor is not None and (
+                cursor_instance != self._inbox_instance_id
+                or cursor_generation > self._inbox_generation
+            )
+            unchanged = (
+                cursor is not None
+                and not reset
+                and cursor_generation == self._inbox_generation
+            )
+            if unchanged and wait_seconds > 0:
+                deadline = asyncio.get_running_loop().time() + wait_seconds
+                while cursor_generation == self._inbox_generation:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            self._inbox_condition.wait(),
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        break
+
+            try:
+                metadata = await self.store.pending_metadata(limit=max_messages)
+            except (OSError, sqlite3.Error) as exc:
+                self._last_store_error = exc
+                self._state = RuntimeState.STORE_DEGRADED
+                raise StoreUnavailable(
+                    f"swarmbus durable inbox is degraded: {exc}"
+                ) from exc
+            status = await self.runtime_status()
+            return {
+                "cursor": {
+                    "instance_id": self._inbox_instance_id,
+                    "generation": self._inbox_generation,
+                },
+                "reset": reset,
+                "runtime_state": status["state"],
+                "connected": status["connected"],
+                **metadata,
+            }
+
     async def read_inbox(
         self,
         *,
@@ -809,12 +942,12 @@ class ManagedMCPRuntime:
                 timeout=wait_seconds,
             )
 
-        messages = await self.store.read(max_messages=max_messages)
+        messages = await self._read_stored_messages(max_messages=max_messages)
         if messages:
             return messages
         if self.connected:
             await self._await_startup_replay()
-            messages = await self.store.read(max_messages=max_messages)
+            messages = await self._read_stored_messages(max_messages=max_messages)
             if messages:
                 return messages
             if self._state is RuntimeState.STORE_DEGRADED:
@@ -823,7 +956,10 @@ class ManagedMCPRuntime:
         raise self._transport_unavailable()
 
     async def ack_inbox(self, *, message_ids: list[str]) -> int:
-        return await self.store.ack(message_ids)
+        acknowledged = await self.store.ack(message_ids)
+        if acknowledged:
+            await self._advance_inbox_generation()
+        return acknowledged
 
     async def _wait_for_inbox(
         self,
@@ -835,7 +971,12 @@ class ManagedMCPRuntime:
         deadline = loop.time() + timeout
         await self._await_startup_replay()
         while True:
-            messages = await self.store.read(max_messages=max_messages)
+            async with self._inbox_condition:
+                observed_generation = self._inbox_generation
+
+            messages = await self._read_stored_messages(
+                max_messages=max_messages
+            )
             if messages:
                 return messages
             if (
@@ -846,10 +987,10 @@ class ManagedMCPRuntime:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return []
+
             async with self._inbox_condition:
-                messages = await self.store.read(max_messages=max_messages)
-                if messages:
-                    return messages
+                if self._inbox_generation != observed_generation:
+                    continue
                 if (
                     not self.connected
                     or self._state is RuntimeState.STORE_DEGRADED
@@ -932,6 +1073,11 @@ class ManagedMCPRuntime:
         )
         candidate = RegistryRecord(
             agent_id=self.agent_id,
+            topic_address=(
+                self.topic_address
+                if self.topic_address != self.agent_id
+                else None
+            ),
             status=self.status if status is None else status,
             working_set=self.working_set if working_set is None else working_set,
             capabilities=[*self.runtime_capabilities, *declared],
@@ -959,8 +1105,20 @@ class ManagedMCPRuntime:
     ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
-        topic = self.topics.presence(self.agent_id)
-        payload = presence_payload(self.agent_id, state, reason=reason)
+        topic = self.topics.presence(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
+        payload = presence_payload(
+            self.agent_id,
+            state,
+            reason=reason,
+            topic_address=(
+                self.topic_address
+                if self.topic_address != self.agent_id
+                else None
+            ),
+        )
         await self._client.publish(
             topic,
             payload,
@@ -974,6 +1132,11 @@ class ManagedMCPRuntime:
             raise self._transport_unavailable()
         record = RegistryRecord(
             agent_id=self.agent_id,
+            topic_address=(
+                self.topic_address
+                if self.topic_address != self.agent_id
+                else None
+            ),
             status=self.status,
             working_set=self.working_set,
             capabilities=[
@@ -985,7 +1148,10 @@ class ManagedMCPRuntime:
             started_at=self.started_at,
             last_seen=datetime.now(timezone.utc),
         )
-        topic = self.topics.registry(self.agent_id)
+        topic = self.topics.registry(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
         payload = record.to_json()
         await self._client.publish(
             topic,
@@ -999,8 +1165,14 @@ class ManagedMCPRuntime:
         """Tombstone retained state; report whether a session destroy is owed."""
         if self._client is None:
             raise self._transport_unavailable()
-        registry_topic = self.topics.registry(self.agent_id)
-        presence_topic = self.topics.presence(self.agent_id)
+        registry_topic = self.topics.registry(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
+        presence_topic = self.topics.presence(
+            self.agent_id,
+            topic_address=self.topic_address,
+        )
         # Remove presence first so interruption leaves a GC-eligible registry
         # orphan rather than an uncollectable presence orphan.
         await self._client.publish(

@@ -54,6 +54,45 @@ def test_route_picks_broadcast_only_for_the_reserved_sentinel():
     assert topics.route("wren") == "agents/wren/inbox"
 
 
+def test_explicit_transport_address_uses_two_topic_levels():
+    topics = TopicMap(root="foo")
+    agent_id = "agiter-loom__session-abc"
+    address = "agiter-loom/session-abc"
+
+    assert topics.inbox(agent_id, topic_address=address) == (
+        "foo/agents/agiter-loom/session-abc/inbox"
+    )
+    assert topics.presence(agent_id, topic_address=address) == (
+        "foo/agents/agiter-loom/session-abc/presence"
+    )
+    assert topics.registry(agent_id, topic_address=address) == (
+        "foo/swarmbus/registry/agiter-loom/session-abc"
+    )
+    assert topics.route(agent_id, topic_address=address) == (
+        "foo/agents/agiter-loom/session-abc/inbox"
+    )
+
+
+def test_transport_address_must_be_canonically_bound_to_agent_id():
+    topics = TopicMap()
+
+    with pytest.raises(ValueError, match="does not match"):
+        topics.inbox("somebody-else", topic_address="agiter-loom/session-abc")
+
+
+def test_directory_filters_cover_plain_and_namespaced_agents():
+    topics = TopicMap(root="foo")
+
+    assert topics.presence_filters() == (
+        "foo/agents/+/presence",
+        "foo/agents/+/+/presence",
+    )
+    assert topics.registry_filters() == (
+        "foo/swarmbus/registry/+",
+        "foo/swarmbus/registry/+/+",
+    )
+
+
 # ---------------------------------------------------------------------------
 # builders -- with a root
 # ---------------------------------------------------------------------------
@@ -176,6 +215,19 @@ def test_parsers_round_trip_their_builders():
         assert topics.registry_agent(topics.registry("wren")) == "wren"
 
 
+def test_parsers_derive_namespaced_agent_id_from_transport_address():
+    topics = TopicMap(root="foo")
+    agent_id = "agiter-loom__session-abc"
+    address = "agiter-loom/session-abc"
+
+    assert topics.presence_agent(
+        topics.presence(agent_id, topic_address=address)
+    ) == agent_id
+    assert topics.registry_agent(
+        topics.registry(agent_id, topic_address=address)
+    ) == agent_id
+
+
 # ---------------------------------------------------------------------------
 # parsers -- the regression that matters: mismatches RAISE
 # ---------------------------------------------------------------------------
@@ -194,7 +246,7 @@ def test_parsers_round_trip_their_builders():
         "agents/wren/inbox",
         "agents/wren",
         # Right tree, wrong depth.
-        "agents/wren/extra/presence",
+        "agents/wren/extra/too-deep/presence",
         # Empty agent segment.
         "agents//presence",
         "agents/presence",
@@ -215,7 +267,7 @@ def test_presence_parser_raises_on_a_mismatched_topic(topic):
     [
         "wren",
         "foo/swarmbus/registry/wren",
-        "swarmbus/registry/wren/extra",
+        "swarmbus/registry/wren/extra/too-deep",
         "swarmbus/registry/",
         "swarmbus/registry",
         "agents/wren/presence",

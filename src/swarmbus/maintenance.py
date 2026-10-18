@@ -20,7 +20,7 @@ from .registry import (
     stamp_presence_payload,
     transient_gc_decision,
 )
-from .topics import DEFAULT_TOPICS, TopicMap
+from .topics import DEFAULT_TOPICS, TopicMap, topic_address_for_agent_id
 
 logger = logging.getLogger(__name__)
 
@@ -405,8 +405,8 @@ class RegistryMaintenance:
 
         snapshot = await self._snapshot(
             (
-                self.topics.any_registry_filter(),
-                self.topics.any_presence_filter(),
+                *self.topics.registry_filters(),
+                *self.topics.presence_filters(),
             )
         )
         identities = []
@@ -477,8 +477,8 @@ class RegistryMaintenance:
 
         initial = await self._snapshot(
             (
-                self.topics.any_registry_filter(),
-                self.topics.any_presence_filter(),
+                *self.topics.registry_filters(),
+                *self.topics.presence_filters(),
             )
         )
         preserved: Counter[str] = Counter()
@@ -529,8 +529,14 @@ class RegistryMaintenance:
                     fresh = await self._snapshot_with_client(
                         client,
                         (
-                            self.topics.registry(original.agent_id),
-                            self.topics.presence(original.agent_id),
+                            self.topics.registry(
+                                original.agent_id,
+                                topic_address=original.resolved_topic_address,
+                            ),
+                            self.topics.presence(
+                                original.agent_id,
+                                topic_address=original.resolved_topic_address,
+                            ),
                         ),
                     )
                     report.malformed += fresh.invalid_messages
@@ -610,18 +616,30 @@ class RegistryMaintenance:
                         if destroy_session:
                             # A stable session is destroyed only with positive offline evidence.
                             async with self._new_client(
-                                identifier=f"swarmbus-{original.agent_id}",
+                                identifier=(
+                                    original.resolved_topic_address.rsplit(
+                                        "/", 1
+                                    )[-1]
+                                    if "/" in original.resolved_topic_address
+                                    else f"swarmbus-{original.agent_id}"
+                                ),
                                 clean_session=True,
                             ) as agent_client:
                                 await agent_client.publish(
-                                    self.topics.presence(original.agent_id),
+                                    self.topics.presence(
+                                        original.agent_id,
+                                        topic_address=original.resolved_topic_address,
+                                    ),
                                     b"",
                                     qos=1,
                                     retain=True,
                                 )
                                 presence_deleted = True
                                 await agent_client.publish(
-                                    self.topics.registry(original.agent_id),
+                                    self.topics.registry(
+                                        original.agent_id,
+                                        topic_address=original.resolved_topic_address,
+                                    ),
                                     b"",
                                     qos=1,
                                     retain=True,
@@ -629,14 +647,20 @@ class RegistryMaintenance:
                             report.sessions_destroyed += 1
                         else:
                             await client.publish(
-                                self.topics.presence(original.agent_id),
+                                self.topics.presence(
+                                        original.agent_id,
+                                        topic_address=original.resolved_topic_address,
+                                    ),
                                 b"",
                                 qos=1,
                                 retain=True,
                             )
                             presence_deleted = True
                             await client.publish(
-                                self.topics.registry(original.agent_id),
+                                self.topics.registry(
+                                        original.agent_id,
+                                        topic_address=original.resolved_topic_address,
+                                    ),
                                 b"",
                                 qos=1,
                                 retain=True,
@@ -733,6 +757,7 @@ class RegistryMaintenance:
                 await self._write_orphan_presence(
                     report,
                     agent_id=agent_id,
+                    topic_address=presence[agent_id].resolved_topic_address,
                     now=now,
                     retention_seconds=retention_seconds,
                     dry_run=dry_run,
@@ -755,6 +780,7 @@ class RegistryMaintenance:
         report: RegistryGCReport,
         *,
         agent_id: str,
+        topic_address: str,
         now: datetime,
         retention_seconds: float,
         dry_run: bool,
@@ -771,8 +797,14 @@ class RegistryMaintenance:
             fresh = await self._snapshot_with_client(
                 client,
                 (
-                    self.topics.registry(agent_id),
-                    self.topics.presence(agent_id),
+                    self.topics.registry(
+                        agent_id,
+                        topic_address=topic_address,
+                    ),
+                    self.topics.presence(
+                        agent_id,
+                        topic_address=topic_address,
+                    ),
                 ),
             )
             report.malformed += fresh.invalid_messages
@@ -842,7 +874,10 @@ class RegistryMaintenance:
                 # own client id would destroy any persistent session it holds,
                 # and an orphan carries no record saying whether it has one.
                 await client.publish(
-                    self.topics.presence(agent_id),
+                    self.topics.presence(
+                        agent_id,
+                        topic_address=topic_address,
+                    ),
                     body,
                     qos=1,
                     retain=True,
@@ -882,13 +917,33 @@ class RegistryMaintenance:
         if current.tzinfo is None or current.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
 
-        filters = (
-            self.topics.registry(agent_id),
-            self.topics.presence(agent_id),
+        snapshot = await self._snapshot(
+            (
+                *self.topics.registry_filters(),
+                *self.topics.presence_filters(),
+            )
         )
-        snapshot = await self._snapshot(filters)
         record = snapshot.records.get(agent_id)
         presence = snapshot.presence.get(agent_id)
+        topic_address = (
+            record.resolved_topic_address
+            if record is not None
+            else (
+                presence.resolved_topic_address
+                if presence is not None
+                else topic_address_for_agent_id(agent_id)
+            )
+        )
+        filters = (
+            self.topics.registry(
+                agent_id,
+                topic_address=topic_address,
+            ),
+            self.topics.presence(
+                agent_id,
+                topic_address=topic_address,
+            ),
+        )
         initial_absent = (
             record is None
             and presence is None
@@ -971,18 +1026,28 @@ class RegistryMaintenance:
         presence_deleted = False
         try:
             async with self._new_client(
-                identifier=f"swarmbus-{agent_id}",
+                identifier=(
+                    topic_address.rsplit("/", 1)[-1]
+                    if "/" in topic_address
+                    else f"swarmbus-{agent_id}"
+                ),
                 clean_session=True,
             ) as client:
                 await client.publish(
-                    self.topics.presence(agent_id),
+                    self.topics.presence(
+                        agent_id,
+                        topic_address=topic_address,
+                    ),
                     b"",
                     qos=1,
                     retain=True,
                 )
                 presence_deleted = True
                 await client.publish(
-                    self.topics.registry(agent_id),
+                    self.topics.registry(
+                        agent_id,
+                        topic_address=topic_address,
+                    ),
                     b"",
                     qos=1,
                     retain=True,

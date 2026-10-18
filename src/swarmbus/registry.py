@@ -5,10 +5,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .message import _validate_agent_id
-from .topics import DEFAULT_TOPICS, TopicMap
+from .topics import (
+    DEFAULT_TOPICS,
+    TopicMap,
+    agent_id_for_topic_address,
+    topic_address_for_agent_id,
+)
 
 MAX_STATUS_LENGTH = 280
 MAX_CAPABILITY_LENGTH = 128
@@ -48,6 +53,7 @@ def _normalize_string_list(
 class RegistryRecord(BaseModel):
     schema_version: Literal[1] = 1
     agent_id: str
+    topic_address: str | None = None
     status: str = ""
     working_set: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
@@ -60,6 +66,18 @@ class RegistryRecord(BaseModel):
     @classmethod
     def validate_agent_id(cls, value: str) -> str:
         return _validate_agent_id(value)
+
+    @model_validator(mode="after")
+    def validate_topic_address_binding(self) -> "RegistryRecord":
+        if (
+            self.topic_address is not None
+            and agent_id_for_topic_address(self.topic_address) != self.agent_id
+        ):
+            raise ValueError(
+                f"topic address {self.topic_address!r} does not match "
+                f"agent_id {self.agent_id!r}"
+            )
+        return self
 
     @field_validator("started_at", "last_seen")
     @classmethod
@@ -90,7 +108,11 @@ class RegistryRecord(BaseModel):
         )
 
     def to_json(self) -> str:
-        return self.model_dump_json()
+        return self.model_dump_json(exclude_none=True)
+
+    @property
+    def resolved_topic_address(self) -> str:
+        return self.topic_address or self.agent_id
 
     @classmethod
     def from_mqtt(
@@ -101,6 +123,7 @@ class RegistryRecord(BaseModel):
         topics: TopicMap = DEFAULT_TOPICS,
     ) -> "RegistryRecord":
         # Topic ownership is authoritative; reject conflicting payload identity.
+        topic_address = topics.registry_address(topic)
         topic_agent = topics.registry_agent(topic)
         record = cls.model_validate_json(payload)
         if record.agent_id != topic_agent:
@@ -108,12 +131,18 @@ class RegistryRecord(BaseModel):
                 f"registry agent_id {record.agent_id!r} does not match "
                 f"topic agent {topic_agent!r}"
             )
+        if record.resolved_topic_address != topic_address:
+            raise ValueError(
+                f"registry topic_address {record.resolved_topic_address!r} "
+                f"does not match topic address {topic_address!r}"
+            )
         return record
 
 
 class PresenceRecord(BaseModel):
     schema_version: Literal[1] = 1
     agent_id: str
+    topic_address: str | None = None
     state: Literal["online", "offline"]
     connected_at: datetime | None = None
     reason: str | None = None
@@ -125,6 +154,18 @@ class PresenceRecord(BaseModel):
     @classmethod
     def validate_agent_id(cls, value: str) -> str:
         return _validate_agent_id(value)
+
+    @model_validator(mode="after")
+    def validate_topic_address_binding(self) -> "PresenceRecord":
+        if (
+            self.topic_address is not None
+            and agent_id_for_topic_address(self.topic_address) != self.agent_id
+        ):
+            raise ValueError(
+                f"topic address {self.topic_address!r} does not match "
+                f"agent_id {self.agent_id!r}"
+            )
+        return self
 
     @field_validator("first_seen_offline")
     @classmethod
@@ -143,6 +184,10 @@ class PresenceRecord(BaseModel):
     def to_json(self) -> str:
         return self.model_dump_json(exclude_none=True)
 
+    @property
+    def resolved_topic_address(self) -> str:
+        return self.topic_address or self.agent_id
+
     @classmethod
     def from_mqtt(
         cls,
@@ -152,6 +197,7 @@ class PresenceRecord(BaseModel):
         topics: TopicMap = DEFAULT_TOPICS,
     ) -> "PresenceRecord":
         # Apply the same topic-identity check as RegistryRecord.
+        topic_address = topics.presence_address(topic)
         topic_agent = topics.presence_agent(topic)
 
         data = json.loads(payload)
@@ -162,6 +208,7 @@ class PresenceRecord(BaseModel):
             data = {
                 "schema_version": 1,
                 "agent_id": data["agent"],
+                "topic_address": data.get("topic_address"),
                 "state": data.get("status"),
                 "connected_at": data.get("connected_at"),
                 "reason": data.get("reason"),
@@ -175,6 +222,11 @@ class PresenceRecord(BaseModel):
                 f"presence agent_id {record.agent_id!r} does not match "
                 f"topic agent {topic_agent!r}"
             )
+        if record.resolved_topic_address != topic_address:
+            raise ValueError(
+                f"presence topic_address {record.resolved_topic_address!r} "
+                f"does not match topic address {topic_address!r}"
+            )
         return record
 
 
@@ -183,10 +235,12 @@ def presence_payload(
     state: Literal["online", "offline"],
     *,
     reason: str | None = None,
+    topic_address: str | None = None,
 ) -> str:
     """Serialize the current presence payload."""
     return PresenceRecord(
         agent_id=agent_id,
+        topic_address=topic_address,
         state=state,
         connected_at=(
             datetime.now(timezone.utc) if state == "online" else None
@@ -383,6 +437,15 @@ class RegistryCache:
     def remove_presence(self, topic: str) -> None:
         self._presence.pop(self.topics.presence_agent(topic), None)
 
+    def topic_address(self, agent_id: str) -> str:
+        record = self._registry.get(agent_id)
+        if record is not None:
+            return record.resolved_topic_address
+        presence = self._presence.get(agent_id)
+        if presence is not None:
+            return presence.resolved_topic_address
+        return topic_address_for_agent_id(agent_id)
+
     def _is_online(self, agent_id: str, *, now: datetime | None = None) -> bool:
         presence = self._presence.get(agent_id)
         if presence is None or presence.state != "online":
@@ -405,6 +468,7 @@ class RegistryCache:
         presence = self._presence.get(agent_id)
         state = {
             "agent_id": agent_id,
+            "topic_address": self.topic_address(agent_id),
             "online": self._is_online(agent_id),
             "status": record.status if record else "",
             "working_set": list(record.working_set) if record else [],

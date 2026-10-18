@@ -76,18 +76,27 @@ def _registry(
     now,
     age_seconds,
     lifecycle="transient",
+    topic_address=None,
 ):
     return RegistryRecord(
         agent_id=agent_id,
+        topic_address=topic_address,
         lifecycle=lifecycle,
         started_at=now - timedelta(hours=2),
         last_seen=now - timedelta(seconds=age_seconds),
     )
 
 
-def _presence(agent_id, state, *, first_seen_offline=None):
+def _presence(
+    agent_id,
+    state,
+    *,
+    first_seen_offline=None,
+    topic_address=None,
+):
     return PresenceRecord(
         agent_id=agent_id,
+        topic_address=topic_address,
         state=state,
         first_seen_offline=first_seen_offline,
     )
@@ -96,11 +105,17 @@ def _presence(agent_id, state, *, first_seen_offline=None):
 def _message(record):
     if isinstance(record, RegistryRecord):
         return _Message(
-            DEFAULT_TOPICS.registry(record.agent_id),
+            DEFAULT_TOPICS.registry(
+                record.agent_id,
+                topic_address=record.topic_address,
+            ),
             record.to_json(),
         )
     return _Message(
-        DEFAULT_TOPICS.presence(record.agent_id),
+        DEFAULT_TOPICS.presence(
+            record.agent_id,
+            topic_address=record.topic_address,
+        ),
         record.to_json(),
     )
 
@@ -322,6 +337,59 @@ async def test_gc_deletes_oldest_eligible_transient_in_bounded_batch():
     ]
     assert all(call.kwargs == {"qos": 1, "retain": True}
                for call in client.publish.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_gc_tombstones_the_observed_two_level_transport_address():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    agent_id = "agiter-loom__session-abc"
+    topic_address = "agiter-loom/session-abc"
+    stale = _registry(
+        agent_id,
+        now=now,
+        age_seconds=900,
+        topic_address=topic_address,
+    )
+    offline = _presence(
+        agent_id,
+        "offline",
+        topic_address=topic_address,
+    )
+    factory = _ClientFactory(
+        [
+            [_message(stale), _message(offline)],
+            [_message(stale), _message(offline)],
+        ]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=10,
+    )
+
+    assert report.deleted_agent_ids == [agent_id]
+    assert [call.args for call in factory.clients[1].publish.await_args_list] == [
+        (
+            DEFAULT_TOPICS.presence(
+                agent_id,
+                topic_address=topic_address,
+            ),
+            b"",
+        ),
+        (
+            DEFAULT_TOPICS.registry(
+                agent_id,
+                topic_address=topic_address,
+            ),
+            b"",
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1019,8 +1087,8 @@ async def test_snapshot_counts_tombstones_on_unparseable_topics():
     factory = _ClientFactory(
         [
             [
-                _Message("swarmbus/registry/nested/worker", b""),
-                _Message("agents/nested/worker/presence", b""),
+                _Message("swarmbus/registry/nested/worker/too-deep", b""),
+                _Message("agents/nested/worker/too-deep/presence", b""),
             ]
         ]
     )
@@ -1919,6 +1987,8 @@ def test_registry_list_cli_prints_full_directory():
             main,
             [
                 "registry-list",
+                "--topic-root",
+                "fleet",
                 "--stale-after-seconds",
                 "60",
                 "--snapshot-seconds",
@@ -1932,6 +2002,7 @@ def test_registry_list_cli_prints_full_directory():
         stale_after_seconds=60.0,
     )
     assert maintenance.call_args.kwargs["snapshot_seconds"] == 1.5
+    assert maintenance.call_args.kwargs["topics"] == TopicMap(root="fleet")
 
 
 def test_registry_list_cli_renders_orphan_stamps():
@@ -1993,6 +2064,8 @@ def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
             main,
             [
                 "registry-gc",
+                "--topic-root",
+                "fleet",
                 "--broker",
                 "mqtt.example",
                 "--stale-after-seconds",
@@ -2017,6 +2090,7 @@ def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
         ca_cert=None,
         client_cert=None,
         client_key=None,
+        topics=TopicMap(root="fleet"),
         snapshot_seconds=0.25,
     )
     maintenance.return_value.gc_transient.assert_awaited_once_with(
@@ -2134,10 +2208,18 @@ def test_registry_forget_tombstones_exact_agent_with_yes():
         )
         result = runner.invoke(
             main,
-            ["registry-forget", "--agent-id", "old-session", "--yes"],
+            [
+                "registry-forget",
+                "--agent-id",
+                "old-session",
+                "--topic-root",
+                "fleet",
+                "--yes",
+            ],
         )
 
     assert result.exit_code == 0, result.output
+    assert maintenance.call_args.kwargs["topics"] == TopicMap(root="fleet")
     maintenance.return_value.forget.assert_awaited_once_with(
         "old-session",
         dry_run=False,
@@ -2229,7 +2311,14 @@ def test_registry_forget_refusal_exits_non_zero(refused_reason):
         maintenance.return_value.forget = AsyncMock(return_value=report)
         result = runner.invoke(
             main,
-            ["registry-forget", "--agent-id", "old-session", "--yes"],
+            [
+                "registry-forget",
+                "--agent-id",
+                "old-session",
+                "--topic-root",
+                "fleet",
+                "--yes",
+            ],
         )
 
     assert result.exit_code != 0

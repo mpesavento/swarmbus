@@ -40,6 +40,8 @@ class _MCPRuntime(Protocol):
     broker: str
     port: int
 
+    async def runtime_status(self) -> dict[str, Any]: ...
+
     async def send_message(
         self,
         *,
@@ -47,6 +49,7 @@ class _MCPRuntime(Protocol):
         subject: str,
         body: str,
         content_type: str,
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> None: ...
 
@@ -57,6 +60,14 @@ class _MCPRuntime(Protocol):
         max_messages: int,
         wait_seconds: float,
     ) -> list[dict]: ...
+
+    async def inbox_state(
+        self,
+        *,
+        cursor: dict[str, Any] | None = None,
+        wait_seconds: float = 0.0,
+        max_messages: int = 1000,
+    ) -> dict[str, Any]: ...
 
     async def list_states(
         self,
@@ -86,19 +97,22 @@ def create_mcp_app(runtime: _MCPRuntime) -> _MCPApp:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> str:
         """Send a message to another agent.
 
-        When answering a message from read_inbox, pass its id as in_reply_to
-        so the reply carries the chain's hop count; without it the reply
-        starts a new chain.
+        Priority is envelope metadata; attention-enabled recipients may steer
+        an active turn only for high-priority messages. When answering a
+        message from read_inbox, pass its id as in_reply_to so the reply
+        carries the chain's hop count; without it the reply starts a new chain.
         """
         kwargs: dict[str, Any] = {
             "to": to,
             "subject": subject,
             "body": body,
             "content_type": content_type,
+            "priority": priority,
         }
         if in_reply_to:
             kwargs["in_reply_to"] = in_reply_to
@@ -202,17 +216,76 @@ def create_mcp_app(runtime: _MCPRuntime) -> _MCPApp:
     return app
 
 
-def run_mcp_server(
+def create_managed_runtime(
     agent_id: str,
     broker: str = "localhost",
     port: int = 1883,
     *,
+    topic_address: str | None = None,
     persistent: bool = False,
     presence: bool = False,
     lifecycle: Literal["named", "transient"] = "named",
     client_id: str | None = None,
     capabilities: tuple[str, ...] = (),
     state_dir: str = "~/.local/state/swarmbus",
+    topic_root: str = "",
+    registry_heartbeat_seconds: float = 60,
+    registry_stale_after_seconds: float = 180,
+    username: str | None = None,
+    password: str | None = None,
+    tls: bool = False,
+    ca_cert: str | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
+    hop_limit: int = DEFAULT_HOP_LIMIT,
+    rate_limit: int = DEFAULT_RATE_LIMIT,
+    rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+    on_trip: list[str] | None = None,
+    trip_listener: str = "mcp-server",
+) -> ManagedMCPRuntime:
+    """Build the runtime shared by direct and daemon-backed MCP modes."""
+    state_path = Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
+    return ManagedMCPRuntime(
+        agent_id=agent_id,
+        topic_address=topic_address,
+        broker=broker,
+        port=port,
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+        client_id=client_id,
+        heartbeat_seconds=registry_heartbeat_seconds,
+        stale_after_seconds=registry_stale_after_seconds,
+        capabilities=capabilities,
+        state_path=state_path,
+        topic_root=topic_root,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        hop_limit=hop_limit,
+        rate_limit=rate_limit,
+        rate_cooldown=rate_cooldown,
+        on_trip=on_trip,
+        trip_listener=trip_listener,
+    )
+
+
+def run_mcp_server(
+    agent_id: str,
+    broker: str = "localhost",
+    port: int = 1883,
+    *,
+    topic_address: str | None = None,
+    persistent: bool = False,
+    presence: bool = False,
+    lifecycle: Literal["named", "transient"] = "named",
+    client_id: str | None = None,
+    capabilities: tuple[str, ...] = (),
+    state_dir: str = "~/.local/state/swarmbus",
+    topic_root: str = "",
     registry_heartbeat_seconds: float = 60,
     registry_stale_after_seconds: float = 180,
     username: str | None = None,
@@ -234,19 +307,20 @@ def run_mcp_server(
 
     from mcp.server.fastmcp import FastMCP
 
-    state_path = Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
-    runtime = ManagedMCPRuntime(
+    runtime = create_managed_runtime(
         agent_id=agent_id,
+        topic_address=topic_address,
         broker=broker,
         port=port,
         persistent=persistent,
         presence=presence,
         lifecycle=lifecycle,
         client_id=client_id,
-        heartbeat_seconds=registry_heartbeat_seconds,
-        stale_after_seconds=registry_stale_after_seconds,
         capabilities=capabilities,
-        state_path=state_path,
+        state_dir=state_dir,
+        topic_root=topic_root,
+        registry_heartbeat_seconds=registry_heartbeat_seconds,
+        registry_stale_after_seconds=registry_stale_after_seconds,
         username=username,
         password=password,
         tls=tls,
