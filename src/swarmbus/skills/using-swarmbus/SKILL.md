@@ -220,7 +220,7 @@ export SWARMBUS_OUTBOX="$HOME/sync/{agent_id}-outbox.md"      # template
 export SWARMBUS_OUTBOX_PLANNER="$HOME/sync/planner-outbox.md" # agent-scoped
 ```
 
-Resolution precedence: `--outbox` flag > `SWARMBUS_OUTBOX_<UPPER_ID>` > `SWARMBUS_OUTBOX`.
+Resolution precedence: `--outbox` flag > `SWARMBUS_OUTBOX_<UPPER_ID>` > `SWARMBUS_OUTBOX` > `[outbox] path` in the config file (`docs/configuration.md`).
 
 The outbox rotates at 10 MiB and keeps 10 rotated files (`SWARMBUS_MAX_OUTBOX_BYTES`, `SWARMBUS_KEEP_OUTBOX_FILES`); rotated files sit next to it as `<name>.<UTC time>Z.md`.
 

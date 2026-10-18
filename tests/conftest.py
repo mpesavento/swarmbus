@@ -67,3 +67,9 @@ def _isolated_state_dir(tmp_path, monkeypatch):
         "SWARMBUS_KEEP_OUTBOX_FILES",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("SWARMBUS_CONFIG", raising=False)
+    try:
+        from swarmbus import config as sb_config
+    except ImportError:  # a checkout from before the config file (#5)
+        return
+    monkeypatch.setattr(sb_config, "default_config_path", lambda: tmp_path / "no-swarmbus-config.ini")

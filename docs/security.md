@@ -167,6 +167,7 @@ mosquitto 2.x warns about a password or ACL file it does not own or that others 
 | `swarmbus send`, `read`, `watch` | `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`, or `--username` / `--password`. The username must equal `--agent-id`. Prefer the env vars, because flags show in `ps`. |
 | `swarmbus mcp-server` | The same two env vars in the MCP host's `env` block for the server, or the flags in its `args`. |
 | `swarmbus list`, `swarmbus doctor` | Any agent's login. They only read presence. |
+| any `swarmbus` command, from the config file | The config file (`~/.swarmbus/config.ini`, `--config`, `SWARMBUS_CONFIG`) can hold `[broker] username` and `[broker] password`, below the flags and env vars. `[broker] password` is accepted only in a file with mode 0600 (or 0400): the CLI exits 2 when group or others can read the file. Prefer `SWARMBUS_BROKER_PASSWORD`. See [configuration.md](configuration.md). |
 
 ### What this does not stop
 

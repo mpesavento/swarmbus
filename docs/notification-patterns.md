@@ -49,7 +49,7 @@ swarmbus send --agent-id planner --to coder ...   # auto-logs
    ```
    Hyphens become underscores (`coder-beta` → `SWARMBUS_OUTBOX_CODER_BETA`).
 
-Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, none. The outbox rotates before an append would take it past 10 MiB (`SWARMBUS_MAX_OUTBOX_BYTES` / `--outbox-max-bytes`, 0 never rotates) and keeps the newest 10 rotated files (`SWARMBUS_KEEP_OUTBOX_FILES` / `--outbox-keep`, 0 keeps all).
+Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, `[outbox] path` in the config file, none. The outbox rotates before an append would take it past 10 MiB (`SWARMBUS_MAX_OUTBOX_BYTES` / `--outbox-max-bytes`, 0 never rotates) and keeps the newest 10 rotated files (`SWARMBUS_KEEP_OUTBOX_FILES` / `--outbox-keep`, 0 keeps all).
 
 Inbox and outbox share format (only `From:` vs `To:` differ) so you can merge-sort them into a single conversation view:
 
