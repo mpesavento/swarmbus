@@ -127,6 +127,37 @@ def test_send_outbox_template_substitution_via_env():
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/{agent_id}-outbox.md"
 
 
+def test_send_takes_outbox_rotation_options_and_env(monkeypatch):
+    for key in ("SWARMBUS_MAX_OUTBOX_BYTES", "SWARMBUS_KEEP_OUTBOX_FILES",
+                "SWARMBUS_OUTBOX", "SWARMBUS_OUTBOX_KEEP"):
+        monkeypatch.delenv(key, raising=False)
+    base = ["send", "--agent-id", "sparrow", "--to", "wren", "--subject", "x", "--body", "y"]
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        MockBus.return_value.send = AsyncMock()
+
+        def sent(args, env=None):
+            result = runner.invoke(main, args, env=env)
+            assert result.exit_code == 0, result.output
+            kw = MockBus.return_value.send.call_args.kwargs
+            return kw["outbox_max_bytes"], kw["outbox_keep"]
+
+        assert sent(base) == (10 * 1024 * 1024, 10)
+        assert sent([*base, "--outbox-max-bytes", "500", "--outbox-keep", "0"]) == (500, 0)
+        assert sent(base, {"SWARMBUS_MAX_OUTBOX_BYTES": "0", "SWARMBUS_KEEP_OUTBOX_FILES": "3"}) == (0, 3)
+        assert sent([*base, "--outbox-keep", "4"], {"SWARMBUS_KEEP_OUTBOX_FILES": "3"}) == (10 * 1024 * 1024, 4)
+        assert runner.invoke(main, [*base, "--outbox-keep", "-1"]).exit_code == 2
+
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        MockBus.return_value.send = AsyncMock()
+        result = runner.invoke(
+            main, ["send", "--agent-id", "keep", "--to", "wren", "--subject", "x", "--body", "y"],
+            env={"SWARMBUS_KEEP_OUTBOX_FILES": "3"},
+        )
+    assert result.exit_code == 0, result.output
+    assert MockBus.return_value.send.call_args.kwargs["outbox_path"] is None
+
+
 def test_send_priority_roundtrips_cli_to_envelope():
     """Regression: the --priority CLI flag must actually thread through
     to AgentBus.send's priority kwarg. An earlier version had no --priority
@@ -1238,6 +1269,57 @@ def test_doctor_reports_tripped_senders_and_held_count(tmp_path):
     result = run_doctor()
     assert "1 tripped: robin (rate-limit until " in result.output
     assert "[⚠] 8. tripped senders" in result.output
+
+
+def test_doctor_reports_channel_traffic_from_the_state_db(tmp_path):
+    import asyncio as _asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state = tmp_path / "state"
+    runner = CliRunner()
+
+    def run_doctor(*extra):
+        with patch("swarmbus.cli.AgentBus") as MockBus, patch("swarmbus.cli.aiomqtt"):
+            MockBus.probe.return_value._aiomqtt_kwargs = lambda: {}
+            MockBus.probe.return_value.list_agents = AsyncMock(return_value=["sparrow"])
+            return runner.invoke(
+                main, ["doctor", "--agent-id", "sparrow", "--state-dir", str(state), *extra],
+            )
+
+    result = run_doctor()
+    assert "9. channel traffic......... (no state db at" in result.output
+    assert not (state / "sparrow.sqlite3").exists()
+
+    async def traffic():
+        store = SQLiteMessageStore(state / "sparrow.sqlite3", rate_limit=0)
+        for i in range(7):                  # peer<i> sends i + 1 messages at hops i
+            for _ in range(i + 1):
+                msg = AgentMessage.create(from_=f"peer{i}", to="sparrow", subject="s", body="b", hops=i)
+                assert await store.admit(msg, source_topic="agents/sparrow/inbox") is True
+    _asyncio.run(traffic())
+
+    result = run_doctor()
+    line = next(l for l in result.output.splitlines() if "9. channel traffic" in l)
+    assert "[✓]" in line
+    assert "last 15 min: 28 admitted from 7 sender(s): peer6 7 (0.47/min, max hops 6), peer5 6 (0.40/min, max hops 5)" in line
+    assert ", +2 more; deepest hops 6; held: none" in line
+
+    result = run_doctor("--window", "1")
+    assert "last 1 min: 28 admitted from 7 sender(s): peer6 7 (7.00/min, max hops 6)" in result.output
+
+    async def deep():
+        store = SQLiteMessageStore(state / "sparrow.sqlite3")
+        msg = AgentMessage.create(from_="kite", to="sparrow", subject="s", body="b", hops=12)
+        assert await store.admit(msg, source_topic="agents/sparrow/inbox") is False
+    _asyncio.run(deep())
+
+    result = run_doctor()
+    line = next(l for l in result.output.splitlines() if "9. channel traffic" in l)
+    assert "[⚠]" in line
+    assert "held: 1 hop-limit (deepest held hops 12)" in line
+    assert "[✗] 8. tripped senders" in result.output   # probe 8 unchanged: kite is hop-tripped
+    assert run_doctor("--window", "0").exit_code == 2
 
 
 def _doctor():

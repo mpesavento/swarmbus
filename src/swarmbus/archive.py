@@ -1136,6 +1136,63 @@ class SQLiteMessageStore:
             "conflict_count": conflict_count,
         }
 
+    async def channel_metrics(self, window: float = 900.0, limit: int = 10) -> dict:
+        """Traffic this receiver admitted and held in the last `window` seconds."""
+        if window <= 0:
+            raise ValueError("window must be positive")
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        await self._ensure_open()
+        now_ts = self._clock()
+        now = datetime.fromtimestamp(now_ts, timezone.utc).isoformat()
+        cutoff = datetime.fromtimestamp(now_ts - window, timezone.utc).isoformat()
+        async with self._connect() as db:
+            async with db.execute(
+                """SELECT COUNT(*), COUNT(DISTINCT from_agent), MAX(hops)
+                   FROM admitted_messages WHERE seen_at >= ? AND seen_at <= ?""",
+                (cutoff, now),
+            ) as cursor:
+                admitted, sender_count, max_hops = await cursor.fetchone()
+            async with db.execute(
+                """SELECT from_agent, COUNT(*), MAX(hops)
+                   FROM admitted_messages WHERE seen_at >= ? AND seen_at <= ?
+                   GROUP BY from_agent ORDER BY COUNT(*) DESC, from_agent ASC
+                   LIMIT ?""",
+                (cutoff, now, limit),
+            ) as cursor:
+                senders = [
+                    {
+                        "sender": r[0],
+                        "admitted": r[1],
+                        "per_minute": round(r[1] * 60 / window, 2),
+                        "max_hops": r[2],
+                    }
+                    for r in await cursor.fetchall()
+                ]
+            async with db.execute(
+                "SELECT COUNT(*) FROM admitted_messages WHERE seen_at > ?",
+                (now,),
+            ) as cursor:
+                future_rows = (await cursor.fetchone())[0]
+            async with db.execute(
+                """SELECT reason, COUNT(*), MAX(hops)
+                   FROM held_messages WHERE held_at >= ? AND held_at <= ?
+                   GROUP BY reason ORDER BY reason""",
+                (cutoff, now),
+            ) as cursor:
+                held_rows = await cursor.fetchall()
+        return {
+            "window_seconds": window,
+            "since": cutoff,
+            "admitted": admitted,
+            "sender_count": sender_count,
+            "max_hops": max_hops,
+            "senders": senders,
+            "held": {r[0]: r[1] for r in held_rows},
+            "held_max_hops": max((r[2] for r in held_rows), default=None),
+            "future_rows": future_rows,
+        }
+
     async def lookup(self, message_id: str) -> dict | None:
         """Return from/hops/origin of an admitted or held message, if known."""
         await self._ensure_open()
