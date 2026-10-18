@@ -62,8 +62,7 @@ mkdir -p "$UNIT_DIR" "$HOME/logs" "$(dirname "$INBOX")"
 
 AGENT_ID_UPPER=$(printf '%s' "$AGENT_ID" | tr 'a-z-' 'A-Z_')
 
-# If invoke is empty, strip the --invoke line entirely from the template.
-# Otherwise substitute.
+# If invoke is empty, drop the --invoke argument from the one-line ExecStart. Otherwise substitute.
 if [ -z "$INVOKE" ]; then
   sed -e "s|@AGENT_ID@|$AGENT_ID|g" \
       -e "s|@AGENT_ID_UPPER@|$AGENT_ID_UPPER|g" \
@@ -71,8 +70,7 @@ if [ -z "$INVOKE" ]; then
       -e "s|@BROKER@|$BROKER|g" \
       -e "s|@INBOX@|$INBOX|g" \
       -e "s|@SWARMBUS_PATH@|$SWARMBUS_PATH|g" \
-      -e '/--invoke/d' \
-      -e 's| \\$||' \
+      -e 's| --invoke "@INVOKE@"||' \
       "$TEMPLATE" > "$UNIT_PATH"
 else
   sed -e "s|@AGENT_ID@|$AGENT_ID|g" \

@@ -243,8 +243,16 @@ async def test_inbox_commit_snapshots_sender_registry_state():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [OSError("disk full"), sqlite3.OperationalError("locked")])
-async def test_store_failure_leaves_message_unacked(error):
+@pytest.mark.parametrize(
+    ("error_type", "text"),
+    [(OSError, "disk full"), (sqlite3.OperationalError, "locked")],
+)
+async def test_store_failure_leaves_message_unacked(error_type, text):
+    # Build the error here, not in parametrize: a collection-time instance keeps its
+    # __traceback__ (frames, AgentMessage, pydantic TzInfo) alive until interpreter
+    # shutdown, and pydantic_core segfaults freeing it then on 3.12.
+    error = error_type(text)
+
     class _BrokenStore(_FakeStore):
         async def store(self, msg, *, source_topic, sender_provenance=None):
             raise error
@@ -1665,3 +1673,27 @@ async def test_runtime_rate_limits_a_sender_and_acks_the_held_message(tmp_path):
     default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
     assert (default.store.hop_limit, default.store.rate_limit, default.store.rate_cooldown) == (8, 20, 600)
 
+
+@pytest.mark.asyncio
+async def test_sidecar_alerts_once_when_a_sender_trips(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", hop_limit=1,
+        on_trip=["notify-me", "--now"],
+    )
+    assert runtime._trip_alerter.command == ["notify-me", "--now"]
+    assert runtime._trip_alerter.listener == "mcp-server"
+    trips = []
+    runtime._trip_alerter.submit = trips.append
+    await runtime.store.open()
+    ack = _RecordingAck()
+    over = AgentMessage.create(from_="wren", to="foo", subject="over", body="b", hops=2)
+    later = AgentMessage.create(from_="wren", to="foo", subject="later", body="b", hops=0)
+
+    await runtime._handle_message(_FakeMqttMessage(over), ack)
+    await runtime._handle_message(_FakeMqttMessage(later), ack)
+
+    assert [(t.sender, t.message_id) for t in trips] == [("wren", over.id)]
+    assert len(ack.messages) == 2
+    plain = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert plain._trip_alerter is None

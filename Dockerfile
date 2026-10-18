@@ -20,5 +20,7 @@ COPY tests/ tests/
 COPY scripts/ scripts/
 COPY docs/ docs/
 COPY examples/ examples/
+COPY systemd/ systemd/
+COPY .github/ .github/
 
 CMD ["pytest", "-v", "--tb=short"]

@@ -713,3 +713,84 @@ async def test_listeners_cap_the_incoming_queue():
         await AgentBus(agent_id="sparrow", broker="localhost").watch_inbox(timeout=0.1)
 
     assert seen == [1000, 1000]
+
+
+class RecordingAlerter:
+    def __init__(self):
+        self.trips = []
+        self.closed = False
+
+    def submit(self, trip):
+        self.trips.append(trip)
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_listen_alerts_once_per_new_trip(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "sparrow.sqlite3", managed=False, hop_limit=1)
+    alerter = RecordingAlerter()
+    bus = AgentBus(agent_id="sparrow", broker="localhost", hold_store=store, trip_alerter=alerter)
+    handler = RecordingHandler()
+    bus.register_handler(handler)
+    wren_past = AgentMessage.create(from_="wren", to="sparrow", subject="w1", body="b", hops=2)
+    robin_past = AgentMessage.create(from_="robin", to="sparrow", subject="r1", body="b", hops=3)
+    sent = [
+        wren_past,
+        AgentMessage.create(from_="wren", to="sparrow", subject="w2", body="b", hops=0),
+        wren_past,
+        AgentMessage.create(from_="lark", to="sparrow", subject="ok", body="b", hops=1),
+        robin_past,
+        AgentMessage.create(from_="robin", to="sparrow", subject="r2", body="b", hops=9),
+    ]
+
+    class FakeMessage:
+        def __init__(self, m):
+            self.topic = "agents/sparrow/inbox"
+            self.payload = m.to_json().encode()
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def publish(self, *args, **kwargs):
+            pass
+        async def subscribe(self, *args, **kwargs):
+            pass
+        @property
+        def messages(self):
+            async def _gen():
+                for m in sent:
+                    yield FakeMessage(m)
+            return _gen()
+
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
+        await bus.listen()
+
+    assert [m.subject for m in handler.received] == ["ok"]
+    assert [(t.sender, t.message_id) for t in alerter.trips] == [
+        ("wren", wren_past.id), ("robin", robin_past.id),
+    ]
+    assert alerter.closed is True
+
+
+@pytest.mark.asyncio
+async def test_watch_alerts_on_a_trip_and_still_returns_the_next_message(tmp_path):
+    from swarmbus.archive import SQLiteMessageStore
+
+    store = SQLiteMessageStore(tmp_path / "sparrow.sqlite3", managed=False, hop_limit=4)
+    alerter = RecordingAlerter()
+    bus = AgentBus(agent_id="sparrow", broker="localhost", hold_store=store, trip_alerter=alerter)
+    past = AgentMessage.create(from_="wren", to="sparrow", subject="past", body="b", hops=5)
+    ok = AgentMessage.create(from_="robin", to="sparrow", subject="ok", body="b", hops=0)
+
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_watch_client([past, ok])):
+        result = await bus.watch_inbox(timeout=5)
+
+    assert result["subject"] == "ok"
+    assert [t.sender for t in alerter.trips] == ["wren"]
+    assert alerter.closed is True

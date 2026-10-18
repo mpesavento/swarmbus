@@ -163,7 +163,7 @@ mosquitto 2.x warns about a password or ACL file it does not own or that others 
 | Surface | How it gets the login |
 |---|---|
 | `swarmbus start` (the daemon) | `Environment=SWARMBUS_BROKER_USERNAME=<id>` and `SWARMBUS_BROKER_PASSWORD=…` in the unit (see "systemd unit example" above), or `swarmbus init --username <id> --password …`, which writes the `auth.conf` drop-in. |
-| the `--invoke` wake command | Inherits the daemon's environment (`src/swarmbus/handlers/direct_invoke.py:20-30`), so a `swarmbus send` run from the woken session uses the daemon's login with no extra setup. |
+| the `--invoke` wake command | `DirectInvocationHandler.handle` (`src/swarmbus/handlers/direct_invoke.py`) runs the command with the daemon's environment. With `examples/claude-code-wake.sh` the woken `claude` session inherits it, so a `swarmbus send` from that session uses the daemon's login with no extra setup. With `examples/openclaw-wake.sh` on its default bridge path, the agent turn runs inside the OpenClaw gateway, which does not inherit the wake's environment: a `swarmbus send` from the OpenClaw agent uses the gateway's environment, so set `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD` there. |
 | `swarmbus send`, `read`, `watch` | `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`, or `--username` / `--password`. The username must equal `--agent-id`. Prefer the env vars, because flags show in `ps`. |
 | `swarmbus mcp-server` | The same two env vars in the MCP host's `env` block for the server, or the flags in its `args`. |
 | `swarmbus list`, `swarmbus doctor` | Any agent's login. They only read presence. |
@@ -171,7 +171,7 @@ mosquitto 2.x warns about a password or ACL file it does not own or that others 
 ### What this does not stop
 
 - **Writing into another agent's inbox.** Every login may publish to `agents/+/inbox`, because that is how `send` works. What the ACL stops is a process with no login connecting at all, an agent reading another agent's inbox, and an agent publishing another agent's presence.
-- **Lying in `from`.** The broker checks topics, not message bodies. A process holding the `coder` login can still send an envelope with `"from": "planner"` and it is delivered. A swarmbus-side check that `from` matches the login is planned separately.
+- **Lying in `from`.** The broker checks topics, not message bodies. A process holding the `coder` login can still send an envelope with `"from": "planner"` and it is delivered. A swarmbus-side check that `from` matches the login is planned separately. A spoofed `from` on a receiver's inbox topic can trip that sender there or start its cool-down; `--on-trip` tells a person when it happens, and alerts are capped (one per trip, 64 queued).
 - **Floods.** Any login can publish as fast as it likes, including to `agents/broadcast`. See "Broker limits" in the README and [#26](https://github.com/mpesavento/swarmbus/issues/26).
 - **Anyone who can read the credentials.** That means the unit file, the drop-in, the MCP host config, or root on the box. Passwords cross loopback in plain text; add TLS (above) if the broker listens anywhere but `127.0.0.1`.
 - **Silent denials.** mosquitto drops a denied publish without telling the client, so `swarmbus send` still prints `Sent to …`. A login that does not match `--agent-id` connects without error but never receives anything, and its presence never shows in `swarmbus list`.

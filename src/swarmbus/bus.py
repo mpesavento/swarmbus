@@ -19,6 +19,7 @@ from ._compat import asyncio_timeout
 
 if TYPE_CHECKING:
     from .archive import SQLiteMessageStore
+    from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ class AgentBus:
     topics: TopicMap = DEFAULT_TOPICS
     # Same reasoning: a probe bus never runs __init__ and holds nothing.
     hold_store: "SQLiteMessageStore | None" = None
+    trip_alerter: "TripAlerter | None" = None
 
     def __init__(
         self,
@@ -111,6 +113,7 @@ class AgentBus:
         client_cert: str | None = None,
         client_key: str | None = None,
         hold_store: "SQLiteMessageStore | None" = None,
+        trip_alerter: "TripAlerter | None" = None,
     ) -> None:
         """Construct an AgentBus.
 
@@ -150,6 +153,9 @@ class AgentBus:
         hold_store: when set, ``listen()``, ``read_inbox()`` and ``watch_inbox()`` refuse
         messages the store holds (past its hop limit, or from a tripped
         sender). When None they behave exactly as before.
+
+        trip_alerter: runs once per sender newly tripped by ``hold_store``;
+        closed when ``listen()`` or ``watch_inbox()`` returns.
         """
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -173,6 +179,7 @@ class AgentBus:
             client_key=client_key,
         )
         self.hold_store = hold_store
+        self.trip_alerter = trip_alerter
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -240,6 +247,7 @@ class AgentBus:
         )
         self._handlers = []
         self.hold_store = None
+        self.trip_alerter = None
         self._client = None
         self._client_cm = None
         return self
@@ -352,6 +360,11 @@ class AgentBus:
                 None, _append_outbox_entry, resolved, msg
             )
 
+    def _alert_new_trips(self) -> None:
+        if self.trip_alerter is not None and self.hold_store is not None:
+            for trip in self.hold_store.pop_trips():
+                self.trip_alerter.submit(trip)
+
     async def listen(
         self,
         reconnect_initial: float = 1.0,
@@ -368,6 +381,13 @@ class AgentBus:
         qos=1, retain=True so late subscribers see current state and stale
         "online" is overwritten when an agent crashes unexpectedly.
         """
+        try:
+            await self._listen(reconnect_initial, reconnect_max)
+        finally:
+            if self.trip_alerter is not None:
+                await self.trip_alerter.aclose()
+
+    async def _listen(self, reconnect_initial: float, reconnect_max: float) -> None:
         will = aiomqtt.Will(
             topic=self.topics.presence(self.agent_id),
             payload=_legacy_presence_payload(self.agent_id, "offline"),
@@ -471,6 +491,7 @@ class AgentBus:
                                     break
                                 await self._archive_unchecked(msg)
                                 continue
+                            self._alert_new_trips()
                             hold_backoff = reconnect_initial
                             if not admitted:
                                 if not ack(mqtt_msg):
@@ -621,6 +642,13 @@ class AgentBus:
         is unreachable; callers that want graceful None-on-error (e.g. the
         MCP tool surface) must catch it themselves.
         """
+        try:
+            return await self._watch_inbox(timeout)
+        finally:
+            if self.trip_alerter is not None:
+                await self.trip_alerter.aclose()
+
+    async def _watch_inbox(self, timeout: float) -> dict | None:
         if self.hold_store is not None:
             # A failure propagates, before any connection is made.
             await self.hold_store.open()
@@ -704,6 +732,7 @@ class AgentBus:
                                         sanitize_field(msg.id), exc,
                                     )
                                     continue
+                                self._alert_new_trips()
                                 if not admitted:
                                     if ack_adapter is not None:
                                         ack_adapter.ack(mqtt_msg)

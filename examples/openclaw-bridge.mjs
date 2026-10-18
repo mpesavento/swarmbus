@@ -14,7 +14,7 @@
 //   $1               — OpenClaw agent id (e.g. "main")
 //   ~/.openclaw/openclaw.json
 //                    — gateway.port, gateway.auth.token
-//   env SWARMBUS_ID  — used as the gateway idempotencyKey
+//   env SWARMBUS_ID, SWARMBUS_TO — gateway idempotencyKey "swarmbus:<to>:<id>"
 //   env OPENCLAW_BRIDGE_TIMEOUT_MS
 //                    — overall request timeout (default 600_000)
 //
@@ -128,7 +128,10 @@ async function main() {
   logTimed("imported GatewayClient");
 
   const { url, token } = loadOpenClawConfig();
-  const idempotencyKey = process.env.SWARMBUS_ID || randomUUID();
+  // Scoped to this swarmbus agent: SWARMBUS_ID is chosen by the sending peer.
+  const idempotencyKey = process.env.SWARMBUS_ID
+    ? `swarmbus:${process.env.SWARMBUS_TO || "unknown"}:${process.env.SWARMBUS_ID}`
+    : randomUUID();
   const timeoutMs = Number(process.env.OPENCLAW_BRIDGE_TIMEOUT_MS) || 600_000;
 
   const params = {
@@ -140,8 +143,11 @@ async function main() {
   };
 
   // Forward the swarmbus envelope as a label so it shows up in run history.
-  const subject = process.env.SWARMBUS_SUBJECT;
-  if (subject) params.label = `swarmbus: ${subject}`.slice(0, 128);
+  // The subject is peer text: control, format and line/paragraph separator
+  // characters become spaces (the rule of swarmbus.message.sanitize_field),
+  // and the cut is by code point, so it never splits a surrogate pair.
+  const subject = (process.env.SWARMBUS_SUBJECT || "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ");
+  if (subject) params.label = Array.from(`swarmbus: ${subject}`).slice(0, 128).join("");
 
   await new Promise((resolveCall, rejectCall) => {
     let settled = false;

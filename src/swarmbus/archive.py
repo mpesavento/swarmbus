@@ -8,6 +8,8 @@ import logging
 import os
 import stat
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import AsyncIterator, Callable, Literal, Optional
@@ -29,6 +31,21 @@ from .topics import BROADCAST_TOPIC
 logger = logging.getLogger(__name__)
 
 _SQLITE_MAX_INTEGER = 2**63 - 1
+_MAX_PENDING_TRIPS = 256
+
+
+@dataclass(frozen=True)
+class TripEvent:
+    """One sender newly tripped by this store (not a message held after it)."""
+
+    sender: str
+    kind: str              # "hop-limit" (hop_trips row) or "rate-limit" (rate_holds row)
+    message_id: str        # the message that tripped it
+    hops: int
+    origin: str | None
+    source_topic: str
+    tripped_at: str        # ISO 8601: hop_trips.tripped_at, or rate_holds.held_at
+    until: str | None = None   # rate-limit: held_until as ISO UTC; hop-limit: None (a person resets it)
 
 _CREATE_ARCHIVE_TABLE = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -227,6 +244,7 @@ class SQLiteMessageStore:
         self._inbox_lock = asyncio.Lock()
         self._opened = False
         self._admissions_since_prune = 0
+        self._new_trips: deque[TripEvent] = deque(maxlen=_MAX_PENDING_TRIPS)
 
     @contextlib.asynccontextmanager
     async def _connect(self) -> AsyncIterator[aiosqlite.Connection]:
@@ -514,6 +532,7 @@ class SQLiteMessageStore:
         msg: AgentMessage,
         *,
         source_topic: str,
+        trips: list[TripEvent],
     ) -> bool:
         """Decide admission on a connection whose transaction is already open."""
         now_ts = self._clock()
@@ -622,8 +641,19 @@ class SQLiteMessageStore:
                    VALUES (?, ?, ?)""",
                 (msg.from_agent, now, msg.id),
             )
+            trips.append(
+                TripEvent(
+                    sender=msg.from_agent,
+                    kind="hop-limit",
+                    message_id=msg.id,
+                    hops=msg.hops,
+                    origin=msg.origin,
+                    source_topic=source_topic,
+                    tripped_at=now,
+                )
+            )
             await self._cap_held(db)
-            sender = sanitize_field(msg.from_agent)
+            sender =sanitize_field(msg.from_agent)
             logger.error(
                 "hop limit %s exceeded: holding message %s from %s "
                 "(hops=%s, origin=%s); every message from %s is held until "
@@ -731,6 +761,20 @@ class SQLiteMessageStore:
                        VALUES (?, ?, ?, ?)""",
                     (msg.from_agent, held_until, now, msg.id),
                 )
+                trips.append(
+                    TripEvent(
+                        sender=msg.from_agent,
+                        kind="rate-limit",
+                        message_id=msg.id,
+                        hops=msg.hops,
+                        origin=msg.origin,
+                        source_topic=source_topic,
+                        tripped_at=now,
+                        until=datetime.fromtimestamp(
+                            held_until, timezone.utc
+                        ).isoformat(),
+                    )
+                )
                 sender = sanitize_field(msg.from_agent)
                 logger.warning(
                     "rate limit %s per %ss exceeded by %s: holding message "
@@ -825,16 +869,24 @@ class SQLiteMessageStore:
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
+            trips: list[TripEvent] = []
             try:
                 admitted = await self._admit_in(
-                    db, msg, source_topic=source_topic
+                    db, msg, source_topic=source_topic, trips=trips
                 )
                 await db.commit()
                 committed = True
             finally:
                 if not committed:
                     await db.rollback()
+        self._new_trips.extend(trips)
         return admitted
+
+    def pop_trips(self) -> list[TripEvent]:
+        """Return and forget the trips this instance committed since the last call."""
+        trips = list(self._new_trips)
+        self._new_trips.clear()
+        return trips
 
     async def store(
         self,
@@ -870,6 +922,7 @@ class SQLiteMessageStore:
         async with self._connect() as db:
             await db.execute("BEGIN IMMEDIATE")
             committed = False
+            trips: list[TripEvent] = []
             try:
                 async with db.execute(
                     f"""SELECT {_INBOX_MESSAGE_COLUMNS}
@@ -889,10 +942,11 @@ class SQLiteMessageStore:
                     return False
 
                 if not await self._admit_in(
-                    db, msg, source_topic=source_topic
+                    db, msg, source_topic=source_topic, trips=trips
                 ):
                     await db.commit()
                     committed = True
+                    self._new_trips.extend(trips)
                     return False
 
                 await db.execute(
@@ -929,6 +983,7 @@ class SQLiteMessageStore:
                 )
                 await db.commit()
                 committed = True
+                self._new_trips.extend(trips)
                 return True
             finally:
                 if not committed:

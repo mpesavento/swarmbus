@@ -224,6 +224,7 @@ def run_mcp_server(
     hop_limit: int = DEFAULT_HOP_LIMIT,
     rate_limit: int = DEFAULT_RATE_LIMIT,
     rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+    on_trip: list[str] | None = None,
 ) -> None:
     """Start the MCP sidecar with one managed MQTT connection."""
     if not _MCP_AVAILABLE:
@@ -255,6 +256,7 @@ def run_mcp_server(
         hop_limit=hop_limit,
         rate_limit=rate_limit,
         rate_cooldown=rate_cooldown,
+        on_trip=on_trip,
     )
 
     @asynccontextmanager

@@ -30,6 +30,7 @@ from .message import (
     frame_body,
     sanitize_field,
 )
+from .trip_alert import TripAlerter
 
 
 @click.group()
@@ -139,6 +140,21 @@ def _rate_limit_options(func):
              "--rate-cooldown seconds, then admitted again on its own. 0 turns "
              "it off. [env: SWARMBUS_RATE_LIMIT]",
     )(func)
+
+
+def _on_trip_option(func):
+    return click.option(
+        "--on-trip", "on_trip", default=None, envvar="SWARMBUS_ON_TRIP",
+        help="Command run once, in the background, each time a sender is newly "
+             "tripped (SWARMBUS_TRIP_* variables describe the trip; no stdin). "
+             "Killed after 30s. [env: SWARMBUS_ON_TRIP]",
+    )(func)
+
+
+def _trip_alerter(on_trip: str | None, agent_id: str, listener: str) -> TripAlerter | None:
+    if on_trip is None or not on_trip.strip():
+        return None
+    return TripAlerter(shlex.split(on_trip), agent_id=agent_id, listener=listener)
 
 
 def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
@@ -376,6 +392,7 @@ def send(
 @_state_dir_option
 @_hop_limit_option
 @_rate_limit_options
+@_on_trip_option
 @_broker_auth_options
 def start(
     agent_id: str,
@@ -389,6 +406,7 @@ def start(
     hop_limit: int,
     rate_limit: int,
     rate_cooldown: float,
+    on_trip: str | None,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -417,6 +435,7 @@ def start(
             rate_limit=rate_limit,
             rate_cooldown=rate_cooldown,
         ),
+        trip_alerter=_trip_alerter(on_trip, agent_id, "start"),
     )
 
     if inbox:
@@ -446,6 +465,7 @@ def start(
     else:
         click.echo("  rate limit:  off")
     click.echo(f"  holds:       {holds_db}")
+    click.echo(f"  on trip:     {on_trip if on_trip and on_trip.strip() else '(unset — trips are logged only)'}")
     scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
     outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX") or "(unset)"
     click.echo(f"  outbox env:  {outbox_env}")
@@ -558,6 +578,7 @@ def read(
 @_state_dir_option
 @_hop_limit_option
 @_rate_limit_options
+@_on_trip_option
 @_broker_auth_options
 def watch(
     agent_id: str,
@@ -570,6 +591,7 @@ def watch(
     hop_limit: int,
     rate_limit: int,
     rate_cooldown: float,
+    on_trip: str | None,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -616,6 +638,7 @@ def watch(
             rate_limit=rate_limit,
             rate_cooldown=rate_cooldown,
         ),
+        trip_alerter=_trip_alerter(on_trip, agent_id, "watch"),
     )
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
@@ -862,15 +885,44 @@ def tail(
         click.echo("", err=True)  # newline after ^C
 
 
+def _doctor_holds(db: Path, agent_id: str) -> tuple[str, str, str | None]:
+    """The doctor's tripped-senders probe; never creates the state db."""
+    prefix = "tripped senders........."
+    if not db.exists():
+        return (f"{prefix} (no state db at {db})", "skip", None)
+    try:
+        holds = asyncio.run(SQLiteMessageStore(db).list_holds(limit=0))
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        return (f"{prefix} cannot read {db}: {sanitize_field(exc)}", "warn", None)
+    tripped, cooling = holds["tripped"], holds["cooling"]
+    if not tripped and not cooling:
+        return (f"{prefix} none; {holds['held_count']} message(s) held", "ok", None)
+    entries = [f"{sanitize_field(t['sender'])} (hop-limit)" for t in tripped]
+    entries += [
+        f"{sanitize_field(c['sender'])} (rate-limit until {sanitize_field(c['until'])})"
+        for c in cooling
+    ]
+    shown = ", ".join(entries[:5])
+    if len(entries) > 5:
+        shown += f", +{len(entries) - 5} more"
+    return (
+        f"{prefix} {len(entries)} tripped: {shown}; {holds['held_count']} message(s) held",
+        "fail" if tripped else "warn",
+        f"swarmbus held --agent-id {agent_id}   (review, then --reset <sender>)",
+    )
+
+
 @main.command()
 @click.option("--agent-id", default=None, help="Agent id to audit. Defaults to auto-detect from systemd unit or env.")
 @click.option("--broker", default="localhost", show_default=True)
 @click.option("--port", default=1883, show_default=True)
+@_state_dir_option
 @_broker_auth_options
 def doctor(
     agent_id: str | None,
     broker: str,
     port: int,
+    state_dir: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -880,10 +932,11 @@ def doctor(
 ) -> None:
     """Run a self-diagnosis of the local swarmbus install + daemon state.
 
-    Prints a checklist of 7 probes: CLI version, broker reachability, my
+    Prints a checklist of 8 probes: CLI version, broker reachability, my
     systemd unit state, daemon library freshness (catches stale in-memory
     Python — the root cause of the 2026-04-14 priority-field incident),
-    --invoke wired, outbox env resolvable, peer discovery. Each failure
+    --invoke wired, outbox env resolvable, peer discovery, tripped senders
+    and held messages from the state db. Each failure
     prints a one-line fix hint. Exits 0 if every check is green, 1 if
     any is red, 2 if the doctor itself couldn't run.
 
@@ -944,8 +997,7 @@ def doctor(
     # 3. Systemd daemon state
     unit_name = f"swarmbus-{agent_id_resolved}.service"
     try:
-        env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
-               "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
+        env = _systemd_user_env()
         probe = subprocess.run(
             ["systemctl", "--user", "show", unit_name,
              "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecStart"],
@@ -1057,12 +1109,26 @@ def doctor(
         resolved = outbox_env.replace("{agent_id}", agent_id_resolved)
         try:
             p = Path(resolved).expanduser()
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.touch(exist_ok=True)
-            results.append((
-                f"outbox env resolvable... {resolved}",
-                "ok", None,
-            ))
+            if p.exists():
+                writable = p.is_file() and os.access(p, os.W_OK)
+            else:
+                # _append_outbox_entry creates missing parents on the first send,
+                # so a writable existing ancestor directory is enough.
+                ancestor = p.parent
+                while not ancestor.exists() and ancestor != ancestor.parent:
+                    ancestor = ancestor.parent
+                writable = ancestor.is_dir() and os.access(ancestor, os.W_OK | os.X_OK)
+            if writable:
+                results.append((
+                    f"outbox env resolvable... {resolved}",
+                    "ok", None,
+                ))
+            else:
+                results.append((
+                    f"outbox env resolvable... {resolved}: NOT WRITABLE",
+                    "fail",
+                    "check parent dir permissions",
+                ))
         except Exception as exc:
             results.append((
                 f"outbox env resolvable... {resolved}: NOT WRITABLE ({exc})",
@@ -1109,6 +1175,19 @@ def doctor(
     except Exception as exc:
         results.append((f"peer discovery.......... ERROR {exc}", "fail", None))
 
+    # 8. Tripped senders and held messages
+    try:
+        _validate_agent_id(agent_id_resolved)
+    except ValueError:
+        results.append((
+            "tripped senders......... (agent id is not valid; no state db to read)",
+            "skip", None,
+        ))
+    else:
+        results.append(_doctor_holds(
+            _state_db_path(state_dir, agent_id_resolved), agent_id_resolved,
+        ))
+
     # Render
     click.echo(f"\n[doctor] swarmbus health check for agent-id={agent_id_resolved}\n")
     icon_char = {"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "·"}
@@ -1137,12 +1216,24 @@ def doctor(
         sys.exit(0)
 
 
+def _systemd_user_env() -> dict[str, str]:
+    """The caller's environment, with the systemd user-bus variables defaulted only when unset or empty."""
+    env = dict(os.environ)
+    uid = os.getuid()
+    for key, default in (
+        ("XDG_RUNTIME_DIR", f"/run/user/{uid}"),
+        ("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"),
+    ):
+        if not env.get(key):
+            env[key] = default
+    return env
+
+
 def _detect_agent_id() -> str:
     """Best-effort agent-id detection: look for an active systemd user
     unit named swarmbus-*.service. Error out if ambiguous or none."""
     import subprocess
-    env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
-           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{os.getuid()}/bus"}
+    env = _systemd_user_env()
     res = subprocess.run(
         ["systemctl", "--user", "list-units", "--type=service", "--no-legend",
          "--no-pager", "swarmbus-*.service"],
@@ -1503,6 +1594,7 @@ def registry_forget(
 )
 @_hop_limit_option
 @_rate_limit_options
+@_on_trip_option
 @_broker_auth_options
 def mcp_server(
     agent_id: str,
@@ -1519,6 +1611,7 @@ def mcp_server(
     hop_limit: int,
     rate_limit: int,
     rate_cooldown: float,
+    on_trip: str | None,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1563,6 +1656,7 @@ def mcp_server(
         registry_stale_after_seconds=registry_stale_after_seconds,
         rate_limit=rate_limit,
         rate_cooldown=rate_cooldown,
+        on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
         username=username,
         password=password,
         tls=tls,

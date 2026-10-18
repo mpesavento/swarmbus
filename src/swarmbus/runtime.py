@@ -29,6 +29,7 @@ from .registry import (
     presence_payload,
 )
 from .topics import DEFAULT_TOPICS
+from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ class ManagedMCPRuntime:
         hop_limit: int = DEFAULT_HOP_LIMIT,
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+        on_trip: list[str] | None = None,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         if lifecycle not in {"named", "transient"}:
@@ -183,6 +185,11 @@ class ManagedMCPRuntime:
             hop_limit=hop_limit,
             rate_limit=rate_limit,
             rate_cooldown=rate_cooldown,
+        )
+        self._trip_alerter: TripAlerter | None = (
+            TripAlerter(on_trip, agent_id=agent_id, listener="mcp-server")
+            if on_trip
+            else None
         )
         self.topics = DEFAULT_TOPICS
         self.registry = RegistryCache(
@@ -418,7 +425,11 @@ class ManagedMCPRuntime:
                 # client id cannot make the broker publish its will.
                 if destroy_session:
                     await self._destroy_persistent_session()
-                await self.store.close()
+                try:
+                    await self.store.close()
+                finally:
+                    if self._trip_alerter is not None:
+                        await self._trip_alerter.aclose()
                 if self._state is not RuntimeState.FATAL:
                     self._state = RuntimeState.STOPPED
 
@@ -594,6 +605,9 @@ class ManagedMCPRuntime:
             else:
                 self._last_store_error = None
                 self._state = RuntimeState.CONNECTED
+                if self._trip_alerter is not None:
+                    for trip in self.store.pop_trips():
+                        self._trip_alerter.submit(trip)
                 return inserted
         raise asyncio.CancelledError
 

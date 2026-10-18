@@ -1,5 +1,6 @@
 import json
-from unittest.mock import patch, AsyncMock
+import os
+from unittest.mock import patch, AsyncMock, MagicMock
 from click.testing import CliRunner
 import aiomqtt
 from swarmbus.cli import main
@@ -1169,3 +1170,140 @@ def test_held_lists_and_resets_a_rate_cooldown(tmp_path):
     assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 0
     assert json.loads(runner.invoke(main, [*base, "--json"]).stdout)["cooling"] == []
     assert runner.invoke(main, [*base, "--reset", "wren"]).exit_code == 1
+
+
+def test_on_trip_builds_an_alerter_for_start_watch_and_mcp_server(tmp_path, monkeypatch):
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.SQLiteMessageStore"):
+        MockBus.return_value.run = lambda: None
+        result = runner.invoke(main, [
+            "start", "--agent-id", "sparrow", "--on-trip", "notify --label 'trip alert'",
+        ])
+        assert result.exit_code == 0, result.output
+        alerter = MockBus.call_args.kwargs["trip_alerter"]
+        assert alerter.command == ["notify", "--label", "trip alert"]
+        assert (alerter.agent_id, alerter.listener) == ("sparrow", "start")
+
+        result = runner.invoke(main, ["start", "--agent-id", "sparrow"])
+        assert result.exit_code == 0, result.output
+        assert MockBus.call_args.kwargs["trip_alerter"] is None
+
+        MockBus.return_value.watch_inbox = AsyncMock(return_value=None)
+        monkeypatch.setenv("SWARMBUS_ON_TRIP", "notify-watch")
+        result = runner.invoke(main, ["watch", "--agent-id", "sparrow", "--timeout", "1"])
+        assert result.exit_code == 1
+        alerter = MockBus.call_args.kwargs["trip_alerter"]
+        assert (alerter.command, alerter.listener) == (["notify-watch"], "watch")
+
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = runner.invoke(main, ["mcp-server", "--agent-id", "sparrow"])
+    assert result.exit_code == 0, result.output
+    assert run_server.call_args.kwargs["on_trip"] == ["notify-watch"]
+
+
+def test_doctor_reports_tripped_senders_and_held_count(tmp_path):
+    import asyncio as _asyncio
+    from swarmbus.archive import SQLiteMessageStore
+    from swarmbus.message import AgentMessage
+
+    state = tmp_path / "state"
+    runner = CliRunner()
+
+    def run_doctor():
+        with patch("swarmbus.cli.AgentBus") as MockBus, patch("swarmbus.cli.aiomqtt"):
+            MockBus.probe.return_value._aiomqtt_kwargs = lambda: {}
+            MockBus.probe.return_value.list_agents = AsyncMock(return_value=["sparrow"])
+            return runner.invoke(main, ["doctor", "--agent-id", "sparrow", "--state-dir", str(state)])
+
+    result = run_doctor()
+    assert "no state db at" in result.output
+    assert not (state / "sparrow.sqlite3").exists()
+
+    async def trip():
+        store = SQLiteMessageStore(state / "sparrow.sqlite3", hop_limit=1, rate_limit=1)
+        topic = "agents/sparrow/inbox"
+        for sender, hops in (("wren", 2), ("wren", 0), ("robin", 0), ("robin", 0)):
+            msg = AgentMessage.create(from_=sender, to="sparrow", subject="s", body="b", hops=hops)
+            await store.admit(msg, source_topic=topic)
+    _asyncio.run(trip())
+
+    result = run_doctor()
+    assert result.exit_code == 1, result.output
+    assert "2 tripped: wren (hop-limit), robin (rate-limit until " in result.output
+    assert "; 3 message(s) held" in result.output
+    assert "swarmbus held --agent-id sparrow" in result.output
+
+    _asyncio.run(SQLiteMessageStore(state / "sparrow.sqlite3").reset_trips("wren"))
+    result = run_doctor()
+    assert "1 tripped: robin (rate-limit until " in result.output
+    assert "[⚠] 8. tripped senders" in result.output
+
+
+def _doctor():
+    envs = []
+
+    def fake_run(cmd, **kwargs):
+        envs.append(kwargs.get("env"))
+        return MagicMock(returncode=1, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run), \
+         patch("swarmbus.cli.AgentBus") as MockBus, \
+         patch("swarmbus.cli.aiomqtt"):
+        MockBus.probe.return_value._aiomqtt_kwargs = lambda: {}
+        MockBus.probe.return_value.list_agents = AsyncMock(return_value=[])
+        result = CliRunner().invoke(main, ["doctor", "--agent-id", "doc-agent"])
+    return result, envs
+
+
+def test_doctor_does_not_create_the_outbox(tmp_path, monkeypatch):
+    monkeypatch.delenv("SWARMBUS_OUTBOX", raising=False)
+    outbox = tmp_path / "missing" / "deeper" / "doc-agent-outbox.md"
+    monkeypatch.setenv("SWARMBUS_OUTBOX_DOC_AGENT", str(outbox))
+    result, _ = _doctor()
+    assert f"outbox env resolvable... {outbox}" in result.output, result.output
+    assert "NOT WRITABLE" not in result.output
+    assert not (tmp_path / "missing").exists()
+
+    blocker = tmp_path / "a-file"
+    blocker.write_text("")
+    monkeypatch.setenv("SWARMBUS_OUTBOX_DOC_AGENT", str(blocker / "out.md"))
+    result, _ = _doctor()
+    assert "NOT WRITABLE" in result.output, result.output
+
+
+def test_doctor_keeps_callers_systemd_user_env(monkeypatch):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/custom/run")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/bus")
+    result, envs = _doctor()
+    assert envs, result.output
+    assert {(e["XDG_RUNTIME_DIR"], e["DBUS_SESSION_BUS_ADDRESS"]) for e in envs} == {
+        ("/custom/run", "unix:path=/custom/bus"),
+    }
+
+
+def test_detect_agent_id_keeps_callers_env_and_defaults_when_unset(monkeypatch):
+    from swarmbus.cli import _detect_agent_id
+
+    envs = []
+
+    def fake_run(cmd, **kwargs):
+        envs.append(kwargs["env"])
+        return MagicMock(returncode=0, stdout="swarmbus-planner.service loaded active running x\n")
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/custom/run")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/custom/bus")
+    with patch("subprocess.run", side_effect=fake_run):
+        assert _detect_agent_id() == "planner"
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "")
+    with patch("subprocess.run", side_effect=fake_run):
+        assert _detect_agent_id() == "planner"
+
+    assert (envs[0]["XDG_RUNTIME_DIR"], envs[0]["DBUS_SESSION_BUS_ADDRESS"]) == (
+        "/custom/run", "unix:path=/custom/bus",
+    )
+    uid = os.getuid()
+    assert (envs[1]["XDG_RUNTIME_DIR"], envs[1]["DBUS_SESSION_BUS_ADDRESS"]) == (
+        f"/run/user/{uid}", f"unix:path=/run/user/{uid}/bus",
+    )
