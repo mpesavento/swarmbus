@@ -9,9 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-
+import re
 import pytest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiomqtt
 
@@ -378,6 +378,106 @@ async def test_send_outbox_disabled_when_unset(tmp_path):
         bus = AgentBus(agent_id="sparrow")
         await bus.send(to="wren", subject="x", body="y")
     assert not outbox.exists()
+
+
+ROTATED = re.compile(r"sparrow-outbox\.\d{8}T\d{12}Z\.md")
+
+
+async def _send_n(outbox, n, **kw):
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=_NullPublishClient()):
+        bus = AgentBus(agent_id="sparrow")
+        for i in range(n):
+            await bus.send(to="wren", subject=f"s{i}", body="x" * 100,
+                           outbox_path=str(outbox), **kw)
+
+
+def _rotated(dir_):
+    return sorted(p for p in dir_.iterdir() if ROTATED.fullmatch(p.name))
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_rotates_by_size_and_keeps_the_newest(tmp_path):
+    outbox = tmp_path / "sparrow-outbox.md"
+    other = tmp_path / "coder-outbox.20200101T000000000000Z.md"
+    other.write_text("coder's")
+    loose = tmp_path / "sparrow-outbox.old.md"
+    loose.write_text("hand-made")
+
+    # One entry is about 138 bytes, so 150 holds one entry per file.
+    await _send_n(outbox, 5, outbox_max_bytes=150, outbox_keep=2)
+
+    assert "s4" in outbox.read_text() and "s3" not in outbox.read_text()
+    kept = _rotated(tmp_path)
+    assert [p.read_text().count("## [") for p in kept] == [1, 1]
+    assert ["s2" in kept[0].read_text(), "s3" in kept[1].read_text()] == [True, True]
+    assert other.read_text() == "coder's" and loose.read_text() == "hand-made"
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_rotation_off_keep_all_and_oversized_entries(tmp_path):
+    off = tmp_path / "off" / "sparrow-outbox.md"
+    await _send_n(off, 4, outbox_max_bytes=0)
+    assert off.read_text().count("## [") == 4 and _rotated(off.parent) == []
+
+    keep_all = tmp_path / "all" / "sparrow-outbox.md"
+    await _send_n(keep_all, 4, outbox_max_bytes=150, outbox_keep=0)
+    assert len(_rotated(keep_all.parent)) == 3
+
+    big = tmp_path / "big" / "sparrow-outbox.md"
+    await _send_n(big, 3, outbox_max_bytes=50, outbox_keep=0)
+    files = [big, *_rotated(big.parent)]
+    assert [p.read_text().count("## [") for p in files] == [1, 1, 1]
+    assert all(p.read_text().count("x" * 100) == 1 for p in files)
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_rotation_loses_nothing_a_stale_writer_appends(tmp_path):
+    outbox = tmp_path / "sparrow-outbox.md"
+    await _send_n(outbox, 1, outbox_max_bytes=150)
+    stale = outbox.open("ab")            # a sender that opened the file before the rotation
+    await _send_n(outbox, 1, outbox_max_bytes=150)
+    stale.write(b"\n## [late] To: wren | late\nlate\n")
+    stale.close()
+    (rotated,) = _rotated(tmp_path)
+    assert "| late" in rotated.read_text() and "| late" not in outbox.read_text()
+
+
+@pytest.mark.asyncio
+async def test_send_rejects_negative_outbox_rotation_before_publishing(tmp_path):
+    client = _NullPublishClient()
+    client.publish = AsyncMock()
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=client):
+        bus = AgentBus(agent_id="sparrow")
+        with pytest.raises(ValueError):
+            await bus.send(to="wren", subject="x", body="y",
+                           outbox_path=str(tmp_path / "o.md"), outbox_keep=-1)
+    client.publish.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_outbox_skips_the_entry_when_the_file_keeps_rotating(tmp_path, monkeypatch, caplog):
+    import fcntl
+    import itertools
+    import logging
+    import os
+
+    outbox = tmp_path / "sparrow-outbox.md"
+    real_flock = fcntl.flock
+    rotations = itertools.count()
+
+    def rotating_flock(fd, op):
+        # Another sender rotates the file each time this one gets the lock.
+        real_flock(fd, op)
+        if op & fcntl.LOCK_EX:
+            os.rename(outbox, tmp_path / f"gone-{next(rotations)}.md")
+            outbox.touch()
+
+    monkeypatch.setattr(fcntl, "flock", rotating_flock)
+    with caplog.at_level(logging.WARNING, logger="swarmbus.bus"):
+        await _send_n(outbox, 1)
+    assert "file kept rotating" in caplog.text
+    assert next(rotations) == 100
+    assert not any("| s0" in p.read_text() for p in tmp_path.iterdir() if p.is_file())
 
 
 @pytest.mark.asyncio

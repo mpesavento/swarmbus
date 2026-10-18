@@ -1067,3 +1067,41 @@ async def test_pop_trips_reports_a_rate_limit_trip_once_per_cooldown(db_path):
     again = wren("8")
     assert await store.admit(again, source_topic=inbox) is False
     assert [(t.kind, t.message_id) for t in store.pop_trips()] == [("rate-limit", again.id)]
+
+
+@pytest.mark.asyncio
+async def test_channel_metrics_counts_one_window_per_sender_and_caps_the_listing(db_path):
+    now = [100_000.0]
+    store = _rate_store(db_path, now, rate_limit=3, hop_limit=4)
+
+    empty = await store.channel_metrics(window=600, limit=2)
+    assert (empty["admitted"], empty["sender_count"], empty["max_hops"]) == (0, 0, None)
+    assert (empty["senders"], empty["held"], empty["future_rows"]) == ([], {}, 0)
+
+    now[0] = 99_000.0                       # 1000 s ago: outside a 600 s window
+    assert await store.admit(_from("old", hops=4), source_topic=INBOX) is True
+    now[0] = 100_000.0
+    for sender, hops in (("wren", 1), ("wren", 3), ("wren", 2), ("robin", 0), ("jay", 0), ("jay", 1)):
+        assert await store.admit(_from(sender, hops=hops), source_topic=INBOX) is True
+    assert await store.admit(_from("wren"), source_topic=INBOX) is False          # rate-limit
+    assert await store.admit(_from("kite", hops=6), source_topic=INBOX) is False  # hop-limit
+
+    m = await store.channel_metrics(window=600, limit=2)
+    assert m["window_seconds"] == 600
+    assert (m["admitted"], m["sender_count"], m["max_hops"]) == (6, 3, 3)
+    assert m["senders"] == [
+        {"sender": "wren", "admitted": 3, "per_minute": 0.3, "max_hops": 3},
+        {"sender": "jay", "admitted": 2, "per_minute": 0.2, "max_hops": 1},
+    ]
+    assert m["held"] == {"hop-limit": 1, "rate-limit": 1}
+    assert m["held_max_hops"] == 6
+    assert m["future_rows"] == 0
+    assert (await store.channel_metrics(window=600, limit=0))["senders"] == []
+
+    now[0] = 99_500.0                       # the clock moves back 500 s
+    m = await store.channel_metrics(window=600, limit=10)
+    assert (m["admitted"], m["max_hops"], m["future_rows"]) == (1, 4, 6)
+    assert m["held"] == {}
+
+    with pytest.raises(ValueError):
+        await store.channel_metrics(window=0)
