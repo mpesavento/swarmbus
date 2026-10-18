@@ -127,6 +127,37 @@ def test_send_outbox_template_substitution_via_env():
     assert instance.send.call_args.kwargs["outbox_path"] == "/tmp/{agent_id}-outbox.md"
 
 
+def test_send_takes_outbox_rotation_options_and_env(monkeypatch):
+    for key in ("SWARMBUS_MAX_OUTBOX_BYTES", "SWARMBUS_KEEP_OUTBOX_FILES",
+                "SWARMBUS_OUTBOX", "SWARMBUS_OUTBOX_KEEP"):
+        monkeypatch.delenv(key, raising=False)
+    base = ["send", "--agent-id", "sparrow", "--to", "wren", "--subject", "x", "--body", "y"]
+    runner = CliRunner()
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        MockBus.return_value.send = AsyncMock()
+
+        def sent(args, env=None):
+            result = runner.invoke(main, args, env=env)
+            assert result.exit_code == 0, result.output
+            kw = MockBus.return_value.send.call_args.kwargs
+            return kw["outbox_max_bytes"], kw["outbox_keep"]
+
+        assert sent(base) == (10 * 1024 * 1024, 10)
+        assert sent([*base, "--outbox-max-bytes", "500", "--outbox-keep", "0"]) == (500, 0)
+        assert sent(base, {"SWARMBUS_MAX_OUTBOX_BYTES": "0", "SWARMBUS_KEEP_OUTBOX_FILES": "3"}) == (0, 3)
+        assert sent([*base, "--outbox-keep", "4"], {"SWARMBUS_KEEP_OUTBOX_FILES": "3"}) == (10 * 1024 * 1024, 4)
+        assert runner.invoke(main, [*base, "--outbox-keep", "-1"]).exit_code == 2
+
+    with patch("swarmbus.cli.AgentBus") as MockBus:
+        MockBus.return_value.send = AsyncMock()
+        result = runner.invoke(
+            main, ["send", "--agent-id", "keep", "--to", "wren", "--subject", "x", "--body", "y"],
+            env={"SWARMBUS_KEEP_OUTBOX_FILES": "3"},
+        )
+    assert result.exit_code == 0, result.output
+    assert MockBus.return_value.send.call_args.kwargs["outbox_path"] is None
+
+
 def test_send_priority_roundtrips_cli_to_envelope():
     """Regression: the --priority CLI flag must actually thread through
     to AgentBus.send's priority kwarg. An earlier version had no --priority
