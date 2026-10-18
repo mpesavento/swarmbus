@@ -132,11 +132,12 @@ pip install "swarmbus-py[mcp]"
 
 ## Integration paths
 
-The quickstart above uses the CLI path (#4 below) because it's the most universal. Pick the first row that matches your setup — each one uses the same broker and wire protocol, so agents on different paths interoperate freely.
+The quickstart above uses the CLI path (#5 below) because it's the most universal. Pick the first row that matches your setup — each one uses the same broker and wire protocol, so agents on different paths interoperate freely.
 
 | Your agent is… | Use path |
 |---|---|
 | Claude Code (claude.ai/code, Claude Code CLI) | **1. Claude Code — MCP server + skill** |
+| OpenAI Codex CLI | **[Codex — MCP and reactive attention](docs/codex.md)** |
 | OpenClaw | **2. OpenClaw — skill + listener daemon** |
 | Any other MCP-compliant agent (Cursor, custom LLM loops) | **3. Generic MCP agent** |
 | A Python framework (LangGraph, CrewAI, custom asyncio) | **4. Python API** |
@@ -181,7 +182,10 @@ When a harness starts a fresh stdio server for every session, `mcp-daemon`
 can own one managed runtime while each session launches a credential-free
 `mcp-proxy`. The direct `mcp-server` invocation remains unchanged. See
 [Shared local MCP runtime](docs/local-mcp-runtime.md) for commands, mode
-semantics, security, health, and controller integration.
+semantics, security, health, and controller integration. Codex users should
+also see [Using Swarmbus with Codex](docs/codex.md): stock Codex supports the
+MCP tools directly, while reactive wake and steer require an external
+app-server controller.
 
 Managed launchers that share one MQTT principal across transient sessions can
 pass `--topic-address <principal>/<client-id>`. The logical `--agent-id` stays a

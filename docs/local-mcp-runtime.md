@@ -98,3 +98,6 @@ snapshot with `reset: true`.
 
 Snapshots do not consume or acknowledge mail. The agent acknowledges handled
 messages later through `read_inbox(ack_ids=...)`.
+
+For a concrete controller contract and Codex app-server dispatch semantics, see
+[Using Swarmbus with Codex](codex.md).
