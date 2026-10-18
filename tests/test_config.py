@@ -256,3 +256,29 @@ def test_broker_password_needs_a_private_file_and_is_read_verbatim(tmp_path):
     no_pw = _write(tmp_path / "no-pw.ini", "[agent]\nid = sparrow\n", mode=0o644)
     result, _ = _send(["--config", str(no_pw), *SEND])
     assert result.exit_code == 0, result.output
+
+
+def test_config_docs_cover_every_key_and_are_linked():
+    from pathlib import Path
+
+    from swarmbus import config as sb_config
+
+    root = Path(__file__).resolve().parent.parent
+    doc = (root / "docs" / "configuration.md").read_text()
+    for section, key in sb_config._KEYS:
+        assert f"`[{section}] {key}`" in doc, (section, key)
+    for needle in ("**CLI flag > env var > config file > built-in default.**",
+                   "SWARMBUS_CONFIG", "~/.swarmbus/config.ini", "chmod 600"):
+        assert needle in doc, needle
+
+    chain = "`[outbox] path` in the config file"
+    for rel in ("README.md", "docs/notification-patterns.md",
+                "src/swarmbus/skills/using-swarmbus/SKILL.md"):
+        assert chain in (root / rel).read_text(), rel
+    assert "docs/configuration.md" in (root / "README.md").read_text()
+    assert "configuration.md" in (root / "docs" / "security.md").read_text()
+
+    changelog = (root / "CHANGELOG.md").read_text()
+    unreleased = changelog.split("## [Unreleased]")[1].split("\n## [")[0]
+    assert "**Config file**" in unreleased and "(#5)" in unreleased
+    assert "The config file (#5) changes none of the four either" in unreleased
