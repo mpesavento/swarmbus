@@ -4,10 +4,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import ssl
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
 
 import aiomqtt
+
+try:
+    import fcntl
+except ImportError:  # swarmbus runs on Linux and macOS; this only keeps the import safe
+    fcntl = None  # type: ignore[assignment]
 
 from .message import AgentMessage, _validate_registered_agent_id, sanitize_field
 from .handlers.base import BaseHandler
@@ -23,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 # aiomqtt discards (with a WARNING) once its incoming queue is this full.
 MAX_QUEUED_INCOMING_MESSAGES = 1000
+
+DEFAULT_OUTBOX_MAX_BYTES = 10 * 1024 * 1024  # rotate before an append would pass this; 0 never rotates
+DEFAULT_OUTBOX_KEEP = 10                     # rotated files kept; 0 keeps every one
+_OUTBOX_OPEN_TRIES = 100
 
 
 def _build_tls_context(
@@ -57,25 +70,111 @@ def _build_tls_context(
     return context
 
 
-def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
+def _open_outbox_locked(p: Path):
+    """Open `p` for append and hold an exclusive lock on it, or return None.
+
+    A sender that waited on the lock may find the file renamed away by the
+    one that held it, so the handle is only good if its inode is still the
+    one at `p`; otherwise it is dropped and the file is opened again.
+    """
+    for _ in range(_OUTBOX_OPEN_TRIES):
+        f = p.open("ab")
+        try:
+            if fcntl is None:
+                return f
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                current = os.stat(p).st_ino
+            except FileNotFoundError:
+                current = None
+            if os.fstat(f.fileno()).st_ino == current:
+                return f
+        except BaseException:
+            f.close()
+            raise
+        f.close()
+    return None
+
+
+def _rotated_outbox_path(p: Path) -> Path:
+    dt = datetime.now(timezone.utc)
+
+    def candidate() -> Path:
+        return p.parent / f"{p.stem}.{dt.strftime('%Y%m%dT%H%M%S%f')}Z{p.suffix}"
+
+    path = candidate()
+    while path.exists():
+        dt += timedelta(microseconds=1)
+        path = candidate()
+    return path
+
+
+def _prune_rotated_outboxes(p: Path, keep: int) -> None:
+    """Delete all but the newest `keep` rotated files of `p`. Never raises."""
+    pat = re.compile(re.escape(p.stem) + r"\.\d{8}T\d{12}Z" + re.escape(p.suffix))
+    try:
+        names = sorted(n for n in os.listdir(p.parent) if pat.fullmatch(n))
+    except OSError as exc:
+        logger.warning("outbox prune of %s failed: %s", p, exc)
+        return
+    for name in names[:-keep]:
+        try:
+            os.unlink(p.parent / name)
+        except OSError as exc:
+            logger.warning("outbox prune of %s failed: %s", p, exc)
+
+
+def _append_outbox_entry(
+    path: str,
+    msg: AgentMessage,
+    max_bytes: int = DEFAULT_OUTBOX_MAX_BYTES,
+    keep: int = DEFAULT_OUTBOX_KEEP,
+) -> None:
     """Append a sent message to the sender's outbox log.
 
     Mirrors FileBridgeHandler's inbox format so an agent's outbound and
     inbound logs are structurally identical (same heading shape, swapped
-    direction). Failures to write are logged but never raise — archive
+    direction). The file is rotated to `<stem>.<UTC time>Z<suffix>` before
+    an append would take it past `max_bytes` (0 never rotates), and all but
+    the newest `keep` rotated files are deleted (0 keeps every one). The
+    rotation runs under an exclusive `flock`, so concurrent senders rotate
+    one at a time. Failures to write are logged but never raise — archive
     loss should not break message delivery.
     """
-    from pathlib import Path
     p = Path(path).expanduser()
     entry = (
         f"\n## [{msg.ts.strftime('%Y-%m-%d %H:%M')}] "
         f"To: {msg.to} | {msg.subject}\n"
         f"{msg.body}\n"
     )
+    data = entry.encode("utf-8")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(entry)
+        f = _open_outbox_locked(p)
+        if f is None:
+            logger.warning("outbox append to %s skipped: file kept rotating", p)
+            return
+        try:
+            size = os.fstat(f.fileno()).st_size
+            if max_bytes > 0 and size > 0 and size + len(data) > max_bytes:
+                try:
+                    os.rename(p, _rotated_outbox_path(p))
+                except OSError as exc:
+                    logger.warning("outbox rotate of %s failed: %s", p, exc)
+                else:
+                    if keep > 0:
+                        _prune_rotated_outboxes(p, keep)
+                    f.close()
+                    f = _open_outbox_locked(p)
+                    if f is None:
+                        logger.warning(
+                            "outbox append to %s skipped: file kept rotating", p
+                        )
+                        return
+            f.write(data)
+        finally:
+            if f is not None:
+                f.close()
     except OSError as exc:
         logger.warning("outbox append to %s failed: %s", p, exc)
 
@@ -305,6 +404,9 @@ class AgentBus:
         in_reply_to: str | None = None,
         hops: int = 0,
         origin: str | None = None,
+        *,
+        outbox_max_bytes: int = DEFAULT_OUTBOX_MAX_BYTES,
+        outbox_keep: int = DEFAULT_OUTBOX_KEEP,
     ) -> None:
         """Publish a message.
 
@@ -322,8 +424,14 @@ class AgentBus:
         The path may contain `{agent_id}` as a placeholder — it expands to
         `self.agent_id` at call time. This lets multiple agents in the same
         process space safely share one outbox-path template:
-        `outbox_path="~/sync/{agent_id}-outbox.md"`.
+        `outbox_path="~/sync/{agent_id}-outbox.md"`. Before an append would
+        take the file past `outbox_max_bytes` (0 never rotates) it is renamed
+        to `<name>.<UTC time>Z<suffix>` next to it and a new one is started;
+        all but the newest `outbox_keep` rotated files are deleted (0 keeps
+        every one).
         """
+        if outbox_max_bytes < 0 or outbox_keep < 0:
+            raise ValueError("outbox_max_bytes and outbox_keep must be >= 0")
         msg = AgentMessage.create(
             from_=self.agent_id,
             to=to,
@@ -350,7 +458,12 @@ class AgentBus:
         if outbox_path:
             resolved = outbox_path.replace("{agent_id}", self.agent_id)
             await asyncio.get_running_loop().run_in_executor(
-                None, _append_outbox_entry, resolved, msg
+                None,
+                _append_outbox_entry,
+                resolved,
+                msg,
+                outbox_max_bytes,
+                outbox_keep,
             )
 
     def _alert_new_trips(self) -> None:
