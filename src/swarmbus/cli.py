@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 from .archive import SQLiteMessageStore
 from .bus import DEFAULT_OUTBOX_KEEP, DEFAULT_OUTBOX_MAX_BYTES, AgentBus
+from .config import ConfigError, LoadedConfig, load_config
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
@@ -34,8 +35,31 @@ from .trip_alert import TripAlerter
 
 
 @click.group()
-def main() -> None:
+@click.option("--config", "config_path", default=None, envvar="SWARMBUS_CONFIG",
+              help="INI file of defaults for host settings (broker, agent id, limits, outbox). "
+                   "Flags and env vars beat it. Default ~/.swarmbus/config.ini when present. "
+                   "[env: SWARMBUS_CONFIG]")
+@click.pass_context
+def main(ctx: click.Context, config_path: str | None) -> None:
     """swarmbus — reactive MQTT messaging for AI agents."""
+    try:
+        loaded = load_config(config_path)
+    except ConfigError as exc:
+        click.echo(f"[swarmbus] {exc}", err=True)
+        ctx.exit(2)
+    for warning in loaded.warnings:
+        click.echo(f"[swarmbus] warning: {warning}", err=True)
+    ctx.obj = loaded
+    ctx.default_map = {
+        name: {k: v for k, v in loaded.params.items() if k in {p.name for p in cmd.params}}
+        for name, cmd in main.commands.items()
+    }
+
+
+def _config() -> LoadedConfig:
+    """The root group's loaded config, or an empty one when a subcommand runs bare."""
+    obj = click.get_current_context().find_root().obj
+    return obj if isinstance(obj, LoadedConfig) else LoadedConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +181,17 @@ def _trip_alerter(on_trip: str | None, agent_id: str, listener: str) -> TripAler
     return TripAlerter(shlex.split(on_trip), agent_id=agent_id, listener=listener)
 
 
-def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
+def _resolve_outbox(
+    explicit: str | None, agent_id: str, configured: str | None = None
+) -> str | None:
     """Resolve the outbox path with this precedence:
 
     1. `--outbox` flag (passed in `explicit`) — highest.
     2. `SWARMBUS_OUTBOX_<UPPER_AGENT_ID>` — agent-scoped env var. Hyphens in
        the agent-id become underscores so `coder-beta` → `SWARMBUS_OUTBOX_CODER_BETA`.
     3. `SWARMBUS_OUTBOX` — shared env var. Supports `{agent_id}` template.
-    4. None — no archive.
+    4. `[outbox] path` from the config file (passed in `configured`).
+    5. None — no archive.
 
     The agent-scoped form exists so shells that leak a plain `SWARMBUS_OUTBOX`
     to multiple agent processes can still pin each agent to its own file.
@@ -175,7 +202,7 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
     scoped = os.environ.get(scoped_key)
     if scoped is not None:
         return scoped
-    return os.environ.get("SWARMBUS_OUTBOX")
+    return os.environ.get("SWARMBUS_OUTBOX") or configured
 
 
 @main.command()
@@ -214,7 +241,8 @@ def _resolve_outbox(explicit: str | None, agent_id: str) -> str | None:
     default=None,
     help="Append each sent message to this file (audit trail). Supports "
          "`{agent_id}` template. Resolution order: --outbox > "
-         "SWARMBUS_OUTBOX_<UPPER_AGENT_ID> > SWARMBUS_OUTBOX.",
+         "SWARMBUS_OUTBOX_<UPPER_AGENT_ID> > SWARMBUS_OUTBOX > "
+         "[outbox] path in the config file.",
 )
 @click.option(
     "--outbox-max-bytes",
@@ -366,7 +394,7 @@ def send(
     else:
         origin = os.environ.get("SWARMBUS_ORIGIN") or agent_id
 
-    resolved_outbox = _resolve_outbox(outbox, agent_id)
+    resolved_outbox = _resolve_outbox(outbox, agent_id, _config().outbox_path)
     try:
         asyncio.run(bus.send(
             to=to_agent,
@@ -478,6 +506,7 @@ def start(
     # daemon was actually launched with.
     click.echo(f"[swarmbus] {agent_id} ready")
     click.echo(f"  version:     {__version__}")
+    click.echo(f"  config:      {_config().path or '(none)'}")
     click.echo(f"  broker:      {broker}:{port}")
     click.echo(f"  persistent:     {'yes' if persistent else 'no'}")
     click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
@@ -492,7 +521,12 @@ def start(
     click.echo(f"  holds:       {holds_db}")
     click.echo(f"  on trip:     {on_trip if on_trip and on_trip.strip() else '(unset — trips are logged only)'}")
     scoped_key = "SWARMBUS_OUTBOX_" + agent_id.replace("-", "_").upper()
-    outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX") or "(unset)"
+    outbox_env = (
+        os.environ.get(scoped_key)
+        or os.environ.get("SWARMBUS_OUTBOX")
+        or _config().outbox_path
+        or "(unset)"
+    )
     click.echo(f"  outbox env:  {outbox_env}")
     try:
         bus.run()
@@ -1175,7 +1209,9 @@ def doctor(
 
     # 6. Outbox env var resolvable
     scoped_key = "SWARMBUS_OUTBOX_" + agent_id_resolved.replace("-", "_").upper()
-    outbox_env = os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX")
+    outbox_env = (
+        os.environ.get(scoped_key) or os.environ.get("SWARMBUS_OUTBOX") or _config().outbox_path
+    )
     if outbox_env:
         resolved = outbox_env.replace("{agent_id}", agent_id_resolved)
         try:
