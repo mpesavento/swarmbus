@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import ssl
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
@@ -212,6 +213,7 @@ class AgentBus:
         client_key: str | None = None,
         hold_store: "SQLiteMessageStore | None" = None,
         trip_alerter: "TripAlerter | None" = None,
+        registry_heartbeat_seconds: float = 60.0,
     ) -> None:
         """Construct an AgentBus.
 
@@ -256,6 +258,8 @@ class AgentBus:
         closed when ``listen()`` or ``watch_inbox()`` returns.
         """
         _validate_registered_agent_id(agent_id)
+        if registry_heartbeat_seconds <= 0:
+            raise ValueError("registry_heartbeat_seconds must be positive")
         self.agent_id = agent_id
         self.broker = broker
         self.port = port
@@ -278,12 +282,127 @@ class AgentBus:
         )
         self.hold_store = hold_store
         self.trip_alerter = trip_alerter
+        self.registry_heartbeat_seconds = registry_heartbeat_seconds
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
         # When None, send() falls back to opening a per-call client.
         self._client: aiomqtt.Client | None = None
         self._client_cm: Any = None
+
+    def _registry_record(self, started_at: datetime) -> RegistryRecord:
+        return RegistryRecord(
+            agent_id=self.agent_id,
+            lifecycle="named",
+            durability="durable" if self.persistent else "ephemeral",
+            started_at=started_at,
+            last_seen=datetime.now(timezone.utc),
+        )
+
+    async def _publish_registry_heartbeat(
+        self,
+        client: aiomqtt.Client,
+        started_at: datetime,
+    ) -> None:
+        await client.publish(
+            self.topics.registry(self.agent_id),
+            self._registry_record(started_at).to_json(),
+            qos=1,
+            retain=True,
+        )
+
+    async def _registry_heartbeat_loop(
+        self,
+        client: aiomqtt.Client,
+        started_at: datetime,
+    ) -> None:
+        while True:
+            await asyncio.sleep(self.registry_heartbeat_seconds)
+            try:
+                await self._publish_registry_heartbeat(client, started_at)
+            except aiomqtt.MqttError as exc:
+                logger.warning("registry heartbeat failed: %s", exc)
+
+    @asynccontextmanager
+    async def _identity_lease(
+        self,
+        client: aiomqtt.Client,
+        started_at: datetime,
+        *,
+        enabled: bool = True,
+    ):
+        if not enabled:
+            yield
+            return
+
+        heartbeat: asyncio.Task | None = None
+        heartbeat_error: BaseException | None = None
+        heartbeat_cancelled_owner = False
+        primary_error: BaseException | None = None
+        owner = asyncio.current_task()
+
+        def stop_owner_on_heartbeat_failure(task: asyncio.Task[None]) -> None:
+            nonlocal heartbeat_cancelled_owner, heartbeat_error
+            if task.cancelled():
+                return
+            heartbeat_error = task.exception() or RuntimeError(
+                "registry heartbeat stopped unexpectedly"
+            )
+            if (
+                primary_error is None
+                and owner is not None
+                and not owner.done()
+                and owner.cancelling() == 0
+            ):
+                heartbeat_cancelled_owner = True
+                owner.cancel()
+
+        try:
+            await self._publish_registry_heartbeat(client, started_at)
+            await client.publish(
+                self.topics.presence(self.agent_id),
+                presence_payload(self.agent_id, "online"),
+                qos=1,
+                retain=True,
+            )
+            heartbeat = asyncio.create_task(
+                self._registry_heartbeat_loop(client, started_at)
+            )
+            heartbeat.add_done_callback(stop_owner_on_heartbeat_failure)
+            yield
+        except BaseException as exc:
+            primary_error = exc
+            if (
+                isinstance(exc, asyncio.CancelledError)
+                and heartbeat_cancelled_owner
+                and heartbeat_error is not None
+            ):
+                raise heartbeat_error from exc
+            raise
+        finally:
+            if heartbeat is not None:
+                if not heartbeat.done():
+                    heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                try:
+                    await client.publish(
+                        self.topics.presence(self.agent_id),
+                        presence_payload(
+                            self.agent_id,
+                            "offline",
+                            reason="clean-shutdown",
+                        ),
+                        qos=1,
+                        retain=True,
+                    )
+                except (aiomqtt.MqttError, RuntimeError) as exc:
+                    if primary_error is None:
+                        raise
+                    logger.warning(
+                        "offline presence publish failed while handling %s: %s",
+                        type(primary_error).__name__,
+                        exc,
+                    )
 
     def _aiomqtt_kwargs(self) -> dict[str, Any]:
         """Return aiomqtt.Client kwargs for username/password/TLS.
@@ -346,6 +465,7 @@ class AgentBus:
         self._handlers = []
         self.hold_store = None
         self.trip_alerter = None
+        self.registry_heartbeat_seconds = 60.0
         self._client = None
         self._client_cm = None
         return self
@@ -502,10 +622,15 @@ class AgentBus:
     async def _listen(self, reconnect_initial: float, reconnect_max: float) -> None:
         will = aiomqtt.Will(
             topic=self.topics.presence(self.agent_id),
-            payload=_legacy_presence_payload(self.agent_id, "offline"),
+            payload=presence_payload(
+                self.agent_id,
+                "offline",
+                reason="connection-lost",
+            ),
             qos=1,
             retain=True,
         )
+        started_at = datetime.now(timezone.utc)
         # Persistent session: stable client identifier + clean_session=False
         # so the broker queues QoS1 messages for this agent when the listener
         # is offline, and redelivers them on reconnect.
@@ -557,13 +682,10 @@ class AgentBus:
 
             leave: str | None = None  # "hold" or "ack" when we break out
             try:
-                async with client_cm as client:
-                    await client.publish(
-                        self.topics.presence(self.agent_id),
-                        _legacy_presence_payload(self.agent_id, "online"),
-                        qos=1,
-                        retain=True,
-                    )
+                async with (
+                    client_cm as client,
+                    self._identity_lease(client, started_at),
+                ):
                     await client.subscribe(
                         self.topics.inbox(self.agent_id), qos=1
                     )
@@ -793,80 +915,53 @@ class AgentBus:
             # right after CONNACK, before our SUBSCRIBE.
             ack_adapter = _ManualAckAdapter(client_cm)
             ack_adapter.enable()
-        async with client_cm as client:
-            if self.persistent:
-                now = datetime.now(timezone.utc)
-                record = RegistryRecord(
-                    agent_id=self.agent_id,
-                    lifecycle="named",
-                    durability="durable",
-                    started_at=started_at or now,
-                    last_seen=now,
-                )
-                await client.publish(
-                    self.topics.registry(self.agent_id),
-                    record.to_json(),
-                    qos=1,
-                    retain=True,
-                )
-                await client.publish(
-                    self.topics.presence(self.agent_id),
-                    presence_payload(self.agent_id, "online"),
-                    qos=1,
-                    retain=True,
-                )
+        async with (
+            client_cm as client,
+            self._identity_lease(
+                client,
+                started_at or datetime.now(timezone.utc),
+                enabled=self.persistent,
+            ),
+        ):
+            await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
             try:
-                await client.subscribe(self.topics.inbox(self.agent_id), qos=1)
-                try:
-                    async with asyncio_timeout(timeout):
-                        async for mqtt_msg in client.messages:
+                async with asyncio_timeout(timeout):
+                    async for mqtt_msg in client.messages:
+                        try:
+                            msg = AgentMessage.from_json(mqtt_msg.payload)
+                            result = json.loads(msg.to_json())
+                        except Exception as exc:
+                            logger.warning(
+                                "watch_inbox: skipping bad envelope: %s",
+                                sanitize_field(exc),
+                            )
+                            if ack_adapter is not None:
+                                ack_adapter.ack(mqtt_msg)
+                            continue
+                        if self.hold_store is not None:
                             try:
-                                msg = AgentMessage.from_json(mqtt_msg.payload)
-                                result = json.loads(msg.to_json())
-                            except Exception as exc:
-                                logger.warning(
-                                    "watch_inbox: skipping bad envelope: %s",
-                                    sanitize_field(exc),
+                                admitted = await self.hold_store.admit(
+                                    msg, source_topic=str(mqtt_msg.topic)
                                 )
+                            except Exception as exc:
+                                # Fail closed and leave it unacknowledged:
+                                # a persistent session redelivers it.
+                                logger.error(
+                                    "hold check failed for message %s: %s",
+                                    sanitize_field(msg.id), exc,
+                                )
+                                continue
+                            self._alert_new_trips()
+                            if not admitted:
                                 if ack_adapter is not None:
                                     ack_adapter.ack(mqtt_msg)
                                 continue
-                            if self.hold_store is not None:
-                                try:
-                                    admitted = await self.hold_store.admit(
-                                        msg, source_topic=str(mqtt_msg.topic)
-                                    )
-                                except Exception as exc:
-                                    # Fail closed and leave it unacknowledged:
-                                    # a persistent session redelivers it.
-                                    logger.error(
-                                        "hold check failed for message %s: %s",
-                                        sanitize_field(msg.id), exc,
-                                    )
-                                    continue
-                                self._alert_new_trips()
-                                if not admitted:
-                                    if ack_adapter is not None:
-                                        ack_adapter.ack(mqtt_msg)
-                                    continue
-                            if ack_adapter is not None:
-                                ack_adapter.ack(mqtt_msg)
-                            return result
-                except asyncio.TimeoutError:
-                    return None
+                        if ack_adapter is not None:
+                            ack_adapter.ack(mqtt_msg)
+                        return result
+            except asyncio.TimeoutError:
+                return None
 
-            finally:
-                if self.persistent:
-                    await client.publish(
-                        self.topics.presence(self.agent_id),
-                        presence_payload(
-                            self.agent_id,
-                            "offline",
-                            reason="clean-shutdown",
-                        ),
-                        qos=1,
-                        retain=True,
-                    )
         return None
 
     async def list_agents(self, collect_window: float = 0.5) -> list[str]:
@@ -930,7 +1025,11 @@ class AgentBus:
         ) as client:
             await client.publish(
                 self.topics.presence(self.agent_id),
-                _legacy_presence_payload(self.agent_id, "offline"),
+                presence_payload(
+                    self.agent_id,
+                    "offline",
+                    reason="clean-shutdown",
+                ),
                 qos=1,
                 retain=True,
             )

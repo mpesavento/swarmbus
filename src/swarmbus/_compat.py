@@ -15,11 +15,20 @@ else:
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         assert task is not None, "asyncio_timeout must run inside a Task"
-        handle = loop.call_later(delay, task.cancel)
+        deadline_expired = False
+
+        def cancel_at_deadline() -> None:
+            nonlocal deadline_expired
+            deadline_expired = True
+            task.cancel()
+
+        handle = loop.call_later(delay, cancel_at_deadline)
         try:
             yield
         except asyncio.CancelledError as exc:
-            raise asyncio.TimeoutError() from exc
+            if deadline_expired:
+                raise asyncio.TimeoutError() from exc
+            raise
         finally:
             handle.cancel()
 

@@ -12,13 +12,11 @@ from click.testing import CliRunner
 from swarmbus.bus import _legacy_presence_payload
 from swarmbus.cli import main
 from swarmbus.maintenance import (
-    OnlineIdentityError,
     OrphanPresenceEntry,
     RegistryForgetReport,
     RegistryGCReport,
     RegistryListReport,
     RegistryMaintenance,
-    UnconfirmedOfflineError,
 )
 from swarmbus.registry import PresenceRecord, RegistryRecord
 from swarmbus.topics import DEFAULT_TOPICS, TopicMap
@@ -76,10 +74,12 @@ def _registry(
     now,
     age_seconds,
     lifecycle="transient",
+    durability="ephemeral",
 ):
     return RegistryRecord(
         agent_id=agent_id,
         lifecycle=lifecycle,
+        durability=durability,
         started_at=now - timedelta(hours=2),
         last_seen=now - timedelta(seconds=age_seconds),
     )
@@ -214,6 +214,9 @@ async def test_registry_list_joins_registry_and_presence_without_writes():
         True,
         None,
     ]
+    assert [
+        identity.presence_evidence for identity in report.identities
+    ] == ["offline", "online", "unconfirmed"]
     assert report.identities[1].lifecycle == "named"
     _assert_nothing_published(factory)
 
@@ -266,6 +269,36 @@ async def test_registry_list_surfaces_orphan_stamps_and_waiting_age():
 
 
 @pytest.mark.asyncio
+async def test_gc_preserves_unknown_durability_with_explicit_reason():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    record = _registry(
+        "legacy",
+        now=now,
+        age_seconds=900,
+        durability="unknown",
+    )
+    factory = _ClientFactory([
+        [_message(record), _message(_presence("legacy", "offline"))]
+    ])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.eligible == 0
+    assert report.retained == 1
+    assert report.preserved_by_reason == {"unknown-durability": 1}
+    _assert_nothing_published(factory)
+
+
+@pytest.mark.asyncio
 async def test_gc_deletes_oldest_eligible_transient_in_bounded_batch():
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     old = _registry("old", now=now, age_seconds=900)
@@ -279,7 +312,15 @@ async def test_gc_deletes_oldest_eligible_transient_in_bounded_batch():
     fresh = _registry("fresh", now=now, age_seconds=30)
     factory = _ClientFactory(
         [
-            [_message(old), _message(older), _message(persistent), _message(fresh)],
+            [
+                _message(old),
+                _message(_presence("old", "offline")),
+                _message(older),
+                _message(_presence("older", "offline")),
+                _message(persistent),
+                _message(fresh),
+                _message(_presence("fresh", "offline")),
+            ],
             [_message(older), _message(_presence("older", "offline"))],
         ]
     )
@@ -359,7 +400,12 @@ async def test_gc_fresh_reread_preserves_agent_that_resumed():
 async def test_gc_dry_run_rechecks_but_never_publishes():
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     stale = _registry("worker", now=now, age_seconds=900)
-    factory = _ClientFactory([[_message(stale)], [_message(stale)]])
+    factory = _ClientFactory(
+        [
+            [_message(stale), _message(_presence("worker", "offline"))],
+            [_message(stale), _message(_presence("worker", "offline"))],
+        ]
+    )
     maintenance = RegistryMaintenance(
         client_factory=factory,
         snapshot_seconds=0.001,
@@ -379,6 +425,46 @@ async def test_gc_dry_run_rechecks_but_never_publishes():
     assert report.skipped == 0
     _assert_gc_identities(report)
     assert factory.clients[1].publish.await_count == 0
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.asyncio
+async def test_gc_never_touches_a_stale_online_identity(dry_run):
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    stale = _registry("worker", now=now, age_seconds=900)
+    stale.durability = "durable"
+    factory = _ClientFactory(
+        [[_message(stale), _message(_presence("worker", "online"))]]
+    )
+    audit_events = []
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=audit_events.append,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=10,
+        dry_run=dry_run,
+    )
+
+    assert report.eligible == 0
+    assert report.selected == 0
+    assert report.deleted == 0
+    assert report.would_delete == 0
+    assert report.sessions_destroyed == 0
+    assert report.preserved_by_reason == {"unconfirmed": 1}
+    assert audit_events == []
+    assert len(factory.clients) == 1
+    assert all(
+        kwargs.get("identifier") != "Worker/client:2"
+        for _, kwargs in factory.calls
+    )
+    _assert_nothing_published(factory)
+    _assert_gc_identities(report)
 
 
 @pytest.mark.asyncio
@@ -421,7 +507,12 @@ async def test_gc_partial_failure_leaves_registry_for_next_repair():
 async def test_gc_audit_failure_preserves_retained_state():
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     stale = _registry("worker", now=now, age_seconds=900)
-    factory = _ClientFactory([[_message(stale)], [_message(stale)]])
+    factory = _ClientFactory(
+        [
+            [_message(stale), _message(_presence("worker", "offline"))],
+            [_message(stale), _message(_presence("worker", "offline"))],
+        ]
+    )
 
     def broken_audit(_event):
         raise OSError("audit unavailable")
@@ -879,9 +970,13 @@ async def test_gc_counter_identities_hold_across_a_mixed_batch():
             [
                 _message(keeper),
                 _message(fresh),
+                _message(_presence("fresh", "offline")),
                 _message(oldest),
+                _message(_presence("oldest", "offline")),
                 _message(middle),
+                _message(_presence("middle", "offline")),
                 _message(spare),
+                _message(_presence("spare", "offline")),
             ],
             [],
             [_message(middle), _message(_presence("middle", "offline"))],
@@ -1007,7 +1102,7 @@ async def test_snapshot_presence_tombstone_drops_the_online_observation():
     assert control_report.online == 1
     assert control_report.preserved_by_reason == {"online": 1}
     assert report.online == 0
-    assert report.preserved_by_reason == {"within-retention": 1}
+    assert report.preserved_by_reason == {"unconfirmed": 1}
     assert report.scanned == 1
     assert report.malformed == 0
     _assert_gc_identities(report)
@@ -1107,6 +1202,9 @@ async def test_forget_tombstones_state_and_destroys_durable_session():
         age_seconds=900,
         lifecycle="named",
     )
+    record = RegistryRecord.model_validate(
+        {**record.model_dump(), "mqtt_client_id": "another-session"}
+    )
     offline = _presence(record.agent_id, "offline")
     factory = _ClientFactory(
         [
@@ -1131,6 +1229,7 @@ async def test_forget_tombstones_state_and_destroys_durable_session():
     assert result.deleted is True
     assert result.session_destroyed is True
     assert result.online is False
+    assert result.presence_evidence == "offline"
     assert result.rechecked is True
     assert result.refused is False
     assert result.refused_reason is None
@@ -1168,15 +1267,17 @@ async def test_forget_refuses_online_identity_without_override():
         snapshot_seconds=0.001,
     )
 
-    with pytest.raises(OnlineIdentityError, match="active-worker") as caught:
-        await maintenance.forget(
-            "active-worker",
-            now=now,
-            stale_after_seconds=60,
-        )
+    result = await maintenance.forget(
+        "active-worker",
+        now=now,
+        stale_after_seconds=60,
+    )
 
-    assert not isinstance(caught.value, UnconfirmedOfflineError)
-    assert "refusing to forget online identity" in str(caught.value)
+    assert result.refused is True
+    assert result.refused_reason == "online"
+    assert result.online is True
+    assert result.presence_evidence == "online"
+    assert result.rechecked is False
     assert len(factory.calls) == 1
     _assert_nothing_published(factory)
 
@@ -1199,18 +1300,17 @@ async def test_forget_refuses_when_presence_was_never_observed():
         audit_sink=audit_events.append,
     )
 
-    with pytest.raises(UnconfirmedOfflineError, match="live-worker") as caught:
-        await maintenance.forget(
-            "live-worker",
-            now=now,
-            stale_after_seconds=60,
-        )
+    result = await maintenance.forget(
+        "live-worker",
+        now=now,
+        stale_after_seconds=60,
+    )
 
-    message = str(caught.value)
-    assert "could not confirm" in message
-    assert "offline" in message
-    assert "refusing to forget online identity" not in message
-    assert isinstance(caught.value, OnlineIdentityError)
+    assert result.refused is True
+    assert result.refused_reason == "unconfirmed-offline"
+    assert result.online is None
+    assert result.presence_evidence == "unconfirmed"
+    assert result.rechecked is False
     assert len(factory.calls) == 1
     assert audit_events == []
     _assert_nothing_published(factory)
@@ -1708,9 +1808,15 @@ async def test_gc_durable_transient_tombstones_on_its_own_client_id():
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     rec = _registry("ghost", now=now, age_seconds=1200)
     rec.durability = "durable"
+    rec = RegistryRecord.model_validate(
+        {**rec.model_dump(), "mqtt_client_id": "another-session"}
+    )
     factory = _ClientFactory(
         [
-            [_message(rec)],                                   # scan
+            [
+                _message(rec),
+                _message(_presence("ghost", "offline")),
+            ],                                                  # scan
             [_message(rec), _message(_presence("ghost", "offline"))],
             [],                                                # per-agent
         ]
@@ -1772,20 +1878,17 @@ async def test_gc_keeps_a_durable_session_when_presence_is_unconfirmed():
         batch_size=1,
     )
 
-    assert report.deleted == 1
+    assert report.deleted == 0
+    assert report.eligible == 0
     assert report.sessions_destroyed == 0
-    assert report.sessions_preserved == 1
-    # No third client: impersonating the agent id is what destroys the
-    # session, so never opening one is the property under test.
-    assert len(factory.clients) == 2
+    assert report.sessions_preserved == 0
+    assert report.preserved_by_reason == {"unconfirmed": 1}
+    assert len(factory.clients) == 1
     assert all(
         "identifier" not in kwargs or kwargs["identifier"] != "swarmbus-ghost"
         for _, kwargs in factory.calls
     )
-    assert [c.args for c in factory.clients[1].publish.await_args_list] == [
-        (DEFAULT_TOPICS.presence("ghost"), b""),
-        (DEFAULT_TOPICS.registry("ghost"), b""),
-    ]
+    _assert_nothing_published(factory)
     _assert_gc_identities(report)
 
 
@@ -1797,7 +1900,7 @@ async def test_gc_ephemeral_transient_stays_on_the_anonymous_client():
     rec.durability = "ephemeral"
     factory = _ClientFactory(
         [
-            [_message(rec)],
+            [_message(rec), _message(_presence("plain", "offline"))],
             [_message(rec), _message(_presence("plain", "offline"))],
         ]
     )
@@ -1843,7 +1946,14 @@ async def test_gc_transport_failure_preserves_report_of_prior_deletions():
     ccc = _registry("ccc", now=now, age_seconds=1000)
     factory = _BrokerDiesMidBatch(
         [
-            [_message(aaa), _message(bbb), _message(ccc)],
+            [
+                _message(aaa),
+                _message(_presence("aaa", "offline")),
+                _message(bbb),
+                _message(_presence("bbb", "offline")),
+                _message(ccc),
+                _message(_presence("ccc", "offline")),
+            ],
             [_message(aaa), _message(_presence("aaa", "offline"))],
         ],
         fail_at_client=2,

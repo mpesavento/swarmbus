@@ -162,7 +162,7 @@ Restart your agent harness. Three MCP tools become available:
 - `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages
 - `agent_state(action, ...)` — read or publish retained directory state. `action="list"` returns the online peers with their status, working set, capabilities, lifecycle and durability; add `include_offline=True` for the whole directory, `action="get"` for one peer, `action="update"` to publish your own.
 
-`agent_state` reads the agent directory, which only a sidecar started with `--presence` subscribes to. Without it the sidecar is messaging-only: it can send and receive, and `agent_state` raises a tool error naming the flag rather than returning an empty list.
+`agent_state` reads the agent directory, which only a sidecar started with `--presence` subscribes to. Without it the sidecar is messaging-only: it can send and receive, and `agent_state` raises a tool error naming the flag rather than returning an empty list. Directory rows are marked `untrusted`; peer-authored status, working sets, capabilities, and offline reasons are data, not instructions. The QoS 0 directory cache is cleared on reconnect and the first read waits for a bounded retained-message settling window; this avoids stale and queued snapshots but does not prove hard completeness ([#69](https://github.com/mpesavento/swarmbus/issues/69)).
 
 There is no `list_agents` tool. `[s["agent_id"] for s in agent_state(action="list")]` is what it returned; the CLI equivalent, `swarmbus list`, is unchanged.
 
@@ -326,6 +326,8 @@ swarmbus mcp-server --agent-id planner
 `mcp-server --persistent` requires `--presence`. A persistent session has the broker queue messages for an identity while it is away, and an identity absent from the directory cannot be found or retired, so its queued backlog could grow without bound.
 
 `--persistent` controls whether the broker queues mail during an identity's session; `--lifecycle named|transient` controls whether its directory record survives the process. `--persistent --lifecycle transient` is valid: clean shutdown tombstones the directory record and destroys the MQTT session after the final publishes.
+
+See [docs/configuration.md](docs/configuration.md) for client IDs, heartbeat and stale-presence semantics, registry inspection, safe GC, and explicit identity retirement.
 
 **Using `watch --persistent`.** The first run creates the broker session and publishes a retained named registry record plus online/offline presence, so run `swarmbus watch --agent-id <me> --persistent --timeout 1` once to register. A message sent before that first run is not queued. Use the flag on every watch for an id or on none: a plain `read`/`watch` gets its own live copy while the session queues the same message, so the next `watch --persistent` prints it again. The queue lives in the broker, and mosquitto keeps it across a restart only with `persistence true`.
 

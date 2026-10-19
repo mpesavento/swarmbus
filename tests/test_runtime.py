@@ -16,6 +16,7 @@ from swarmbus.message import AgentMessage
 from swarmbus.registry import AgentLifecycle, RegistryRecord, presence_payload
 from swarmbus.runtime import (
     AcknowledgementError,
+    DirectoryState,
     ManagedMCPRuntime,
     PresenceRequiredError,
     RuntimeFatalError,
@@ -116,6 +117,11 @@ def _runtime(store, **kwargs):
         store=store,
         **kwargs,
     )
+
+
+def _mark_directory_ready(runtime):
+    runtime._client = _FakeClient()
+    runtime._directory_state = DirectoryState.READY
 
 
 def _message():
@@ -313,7 +319,7 @@ async def test_invalid_envelope_is_acked_without_being_stored():
 @pytest.mark.asyncio
 async def test_presence_updates_list_agents_from_retained_protocol():
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
     ack = _RecordingAck()
 
     online = _FakeMqttMessage(_message())
@@ -334,7 +340,7 @@ async def test_presence_updates_list_agents_from_retained_protocol():
 @pytest.mark.asyncio
 async def test_presence_identity_mismatch_is_acked_and_ignored():
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
     ack = _RecordingAck()
     message = _FakeMqttMessage(_message())
     message.topic = runtime.topics.presence("wren")
@@ -455,7 +461,7 @@ async def test_empty_inbox_reports_disconnected_transport():
 async def test_list_states_refuses_instead_of_reading_a_stale_cache():
     """Disconnected directory lists reject cached results."""
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
     presence = _FakeMqttMessage(_message())
     presence.topic = runtime.topics.presence("wren")
     presence.payload = presence_payload("wren", "online").encode()
@@ -475,7 +481,7 @@ async def test_list_states_refuses_instead_of_reading_a_stale_cache():
 async def test_list_states_still_answers_empty_for_an_empty_swarm():
     """Connected empty directory lists return an empty result."""
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
 
     assert await runtime.list_states(include_offline=True) == []
 
@@ -484,7 +490,7 @@ async def test_list_states_still_answers_empty_for_an_empty_swarm():
 async def test_get_state_refuses_instead_of_reading_a_stale_cache():
     """Disconnected directory gets reject cached and uncached peers."""
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
     presence = _FakeMqttMessage(_message())
     presence.topic = runtime.topics.presence("wren")
     presence.payload = presence_payload("wren", "online").encode()
@@ -603,6 +609,25 @@ async def test_background_connection_failure_is_recorded_and_stop_is_safe(caplog
     await runtime.stop()
     await runtime.stop()
     assert store.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_unexpected_heartbeat_failure_is_fatal_and_stops_receiver():
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._connection_task = asyncio.create_task(asyncio.Event().wait())
+
+    async def fail():
+        raise ValueError("heartbeat exploded")
+
+    heartbeat = asyncio.create_task(fail())
+    heartbeat.add_done_callback(runtime._heartbeat_task_done)
+    await asyncio.gather(heartbeat, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert runtime.state is RuntimeState.FATAL
+    assert str(runtime.last_fatal_error) == "heartbeat exploded"
+    assert runtime._connection_task.cancelled()
 
 
 @pytest.mark.asyncio
@@ -1011,7 +1036,7 @@ async def test_published_presence_timestamps_only_the_online_record():
 @pytest.mark.asyncio
 async def test_runtime_registry_reads_and_updates_use_held_connection():
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
 
     await runtime._publish_presence("online")
     initial = await runtime.update_state(
@@ -1033,10 +1058,73 @@ async def test_runtime_registry_reads_and_updates_use_held_connection():
     assert listed == [fetched]
     assert fetched["online"] is True
 
+
+@pytest.mark.asyncio
+async def test_update_state_does_not_mutate_before_transport_is_available():
+    runtime = _runtime(
+        _FakeStore([]),
+        presence=True,
+        capabilities=["development.files.write"],
+    )
+
+    with pytest.raises(TransportUnavailable):
+        await runtime.update_state(
+            status="working",
+            working_set=["repo"],
+            capabilities=["development.files.read"],
+        )
+
+    assert runtime.status == ""
+    assert runtime.working_set == []
+    assert runtime.declared_capabilities == ["development.files.write"]
+    assert runtime.registry.list_states(include_offline=True) == []
+
+
+@pytest.mark.asyncio
+async def test_update_state_publish_failure_is_transactional():
+    runtime = _runtime(
+        _FakeStore([]),
+        presence=True,
+        capabilities=["development.files.write"],
+    )
+    runtime._client = _FakeClient()
+    runtime._client.publish.side_effect = RuntimeError("publish failed")
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        await runtime.update_state(
+            status="working",
+            working_set=["repo"],
+            capabilities=["development.files.read"],
+        )
+
+    assert runtime.status == ""
+    assert runtime.working_set == []
+    assert runtime.declared_capabilities == ["development.files.write"]
+    assert runtime.registry.list_states(include_offline=True) == []
+
+
+@pytest.mark.asyncio
+async def test_persistent_runtime_uses_only_canonical_mqtt_client_id():
+    runtime = _runtime(
+        _FakeStore([]),
+        presence=True,
+        persistent=True,
+    )
+    runtime._client = _FakeClient()
+
+    await runtime._publish_registry()
+
+    assert runtime._client_kwargs()["identifier"] == "swarmbus-foo"
+    record = RegistryRecord.model_validate_json(
+        runtime._client.publish.await_args.args[1]
+    )
+    assert "mqtt_client_id" not in record.model_dump()
+
+
 @pytest.mark.asyncio
 async def test_runtime_merges_retained_registry_and_presence_messages():
     runtime = _runtime(_FakeStore([]), presence=True)
-    runtime._client = _FakeClient()
+    _mark_directory_ready(runtime)
     ack = _RecordingAck()
     record = RegistryRecord(
         agent_id="wren",
@@ -1070,7 +1158,7 @@ async def test_heartbeat_loop_survives_registry_publish_failure():
         nonlocal calls
         calls += 1
         if calls <= 2:
-            raise RuntimeError("swarmbus MQTT runtime is not connected")
+            raise TransportUnavailable("swarmbus MQTT runtime is not connected")
         recovered.set()
 
     runtime._publish_registry = _flaky_publish
@@ -1083,6 +1171,20 @@ async def test_heartbeat_loop_survives_registry_publish_failure():
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_surfaces_unexpected_publish_failure():
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._client = _FakeClient()
+    runtime.heartbeat_seconds = 0
+    runtime._publish_registry = AsyncMock(
+        side_effect=ValueError("heartbeat exploded")
+    )
+
+    with pytest.raises(ValueError, match="heartbeat exploded"):
+        await runtime._heartbeat_loop()
 
 
 _ACCEPTED_LIFECYCLE_PRESENCE = [
@@ -1337,6 +1439,11 @@ async def test_directory_subscriptions_follow_presence(presence, monkeypatch):
             return False
 
     runtime = _runtime(_FakeStore([]), presence=presence)
+    if presence:
+        runtime.registry.update_presence(
+            runtime.topics.presence("stale-peer"),
+            presence_payload("stale-peer", "online"),
+        )
     clients = []
 
     def _connect(*args, **kwargs):
@@ -1349,20 +1456,45 @@ async def test_directory_subscriptions_follow_presence(presence, monkeypatch):
     await runtime._connection_loop()
 
     assert len(clients) == 1
-    subscribed = [
-        call.args[0] for call in clients[0].subscribe.await_args_list
-    ]
+    subscriptions = {
+        call.args[0]: call.kwargs["qos"]
+        for call in clients[0].subscribe.await_args_list
+    }
     directory_filters = {
         runtime.topics.any_presence_filter(),
         runtime.topics.any_registry_filter(),
     }
-    assert runtime.topics.inbox(runtime.agent_id) in subscribed
-    assert runtime.topics.broadcast in subscribed
+    assert subscriptions[runtime.topics.inbox(runtime.agent_id)] == 1
+    assert subscriptions[runtime.topics.broadcast] == 1
     if presence:
-        assert directory_filters.issubset(subscribed)
+        assert all(subscriptions[topic] == 0 for topic in directory_filters)
+        assert "stale-peer" not in {
+            state["agent_id"]
+            for state in runtime.registry.list_states(include_offline=True)
+        }
+        assert runtime.directory_state.value == "disconnected"
     else:
-        assert directory_filters.isdisjoint(subscribed)
+        assert directory_filters.isdisjoint(subscriptions)
         assert runtime.registry.list_states(include_offline=True) == []
+
+@pytest.mark.asyncio
+async def test_directory_reads_wait_for_bounded_snapshot(monkeypatch):
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._client = _FakeClient()
+    monkeypatch.setattr(
+        "swarmbus.runtime._DIRECTORY_SETTLE_SECONDS",
+        0.01,
+    )
+    runtime._begin_directory_sync()
+
+    read = asyncio.create_task(runtime.list_states())
+    await asyncio.sleep(0)
+
+    assert read.done() is False
+    assert runtime.directory_state.value == "syncing"
+    assert await read == []
+    assert runtime.directory_state.value == "ready"
+
 
 @pytest.mark.asyncio
 async def test_messaging_survives_the_directory_refusal():
@@ -1384,17 +1516,16 @@ async def test_messaging_survives_the_directory_refusal():
     assert store.sender_provenance[0]["lifecycle"] == "unknown"
     assert store.sender_provenance[0]["online"] is None
 
-def test_transient_runtime_uses_explicit_mqtt_client_id():
+def test_transient_runtime_uses_broker_assigned_client_id():
     runtime = _runtime(
         _FakeStore([]),
         lifecycle="transient",
         presence=True,
-        client_id="session-deadbeef",
     )
 
     kwargs = runtime._client_kwargs()
 
-    assert kwargs["identifier"] == "session-deadbeef"
+    assert "identifier" not in kwargs
     assert "clean_session" not in kwargs
 
 @pytest.mark.asyncio

@@ -523,7 +523,7 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
                 async with asyncio_timeout(1.0):
                     async for msg in client.messages:
                         data = json.loads(msg.payload)
-                        seen[data["agent"]] = data["status"]
+                        seen[data["agent_id"]] = data["state"]
                         if "earlybird" in seen:
                             break
             except asyncio.TimeoutError:
@@ -532,7 +532,14 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
         assert seen.get("earlybird") == "online"
     finally:
         await _stop(t)
-        await _clear_retained(host, port, ["agents/earlybird/presence"])
+        await _clear_retained(
+            host,
+            port,
+            [
+                DEFAULT_TOPICS.registry("earlybird"),
+                DEFAULT_TOPICS.presence("earlybird"),
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -553,6 +560,7 @@ async def test_agent_state_mcp_tool_sees_online_agents(
         broker=host,
         port=port,
         presence=True,
+        heartbeat_seconds=0.02,
         state_path=tmp_path / "observer.sqlite3",
     )
     try:
@@ -562,12 +570,29 @@ async def test_agent_state_mcp_tool_sees_online_agents(
         for _ in range(20):
             states = await app._tool_fns["agent_state"](action="list")
             result = {state["agent_id"] for state in states}
-            if {"one", "two"}.issubset(result):
+            if {"one", "two", "observer"}.issubset(result):
                 break
             await asyncio.sleep(0.05)
-        assert {"one", "two"}.issubset(result)
+        assert {"one", "two", "observer"}.issubset(result)
 
-        # Keep the MCP replacement aligned with the runtime projection.
+        observer = await app._tool_fns["agent_state"](
+            action="get",
+            agent_id="observer",
+        )
+        first_heartbeat = observer["last_seen"]
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            observer = await app._tool_fns["agent_state"](
+                action="get",
+                agent_id="observer",
+            )
+            if observer["last_seen"] > first_heartbeat:
+                break
+        assert observer["last_seen"] > first_heartbeat
+        assert observer["online"] is True
+        assert observer["lifecycle"] == "named"
+        assert observer["durability"] == "ephemeral"
+
         states = await app._tool_fns["agent_state"](action="list")
         assert sorted(
             state["agent_id"] for state in states
@@ -769,8 +794,8 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
 
     online_payload = await _read_presence()
     assert online_payload is not None
-    assert online_payload.get("agent") == "presence-tester"
-    assert online_payload.get("status") == "online"
+    assert online_payload.get("agent_id") == "presence-tester"
+    assert online_payload.get("state") == "online"
 
     # Graceful shutdown -- exercises the close path, not LWT.
     await _stop(listen_task)
@@ -778,10 +803,17 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
 
     offline_payload = await _read_presence()
     assert offline_payload is not None
-    assert offline_payload.get("agent") == "presence-tester"
-    assert offline_payload.get("status") == "offline"
+    assert offline_payload.get("agent_id") == "presence-tester"
+    assert offline_payload.get("state") == "offline"
 
-    await _clear_retained(host, port, ["agents/presence-tester/presence"])
+    await _clear_retained(
+        host,
+        port,
+        [
+            DEFAULT_TOPICS.registry("presence-tester"),
+            DEFAULT_TOPICS.presence("presence-tester"),
+        ],
+    )
 
 
 @pytest.mark.asyncio
@@ -860,6 +892,7 @@ async def test_transient_registry_gc_removes_retained_state_on_real_broker(
     registry = RegistryRecord(
         agent_id="expired-worker",
         lifecycle="transient",
+        durability="ephemeral",
         started_at=now - timedelta(hours=1),
         last_seen=now - timedelta(minutes=20),
     )
@@ -1210,12 +1243,7 @@ async def test_transient_nondurable_clean_stop_tombstones_presence(
     tmp_path,
 ):
     """A clean non-durable transient stop() leaves both retained topics
-    empty even though its Last Will stays armed to the end.
-
-    The client id is explicit so the probe below can take it over. A
-    takeover publishes the kicked connection's will, so a silent takeover
-    means the broker had nothing left to kick -- not a will still pending
-    behind a socket it has yet to notice."""
+    empty even though its Last Will stays armed to the end."""
     host, port = mosquitto_broker
     agent_id = "transient-ephemeral-exit"
     presence_topic = DEFAULT_TOPICS.presence(agent_id)
@@ -1228,7 +1256,6 @@ async def test_transient_nondurable_clean_stop_tombstones_presence(
         persistent=False,
         presence=True,
         lifecycle="transient",
-        client_id=agent_id,
         state_path=tmp_path / "transient-ephemeral.sqlite3",
     )
 
@@ -1261,17 +1288,6 @@ async def test_transient_nondurable_clean_stop_tombstones_presence(
             f"{_describe_retained(retained)}"
         )
 
-        async with aiomqtt.Client(host, port=port, identifier=agent_id):
-            pass
-        after_takeover = await _read_retained(
-            host,
-            port,
-            [presence_topic, registry_topic],
-        )
-        assert after_takeover == {}, (
-            "taking over the client id published a will that had outlived "
-            f"stop(): {_describe_retained(after_takeover)}"
-        )
     finally:
         await runtime.stop()
         await _clear_retained(host, port, [presence_topic, registry_topic])

@@ -20,7 +20,7 @@ from .bus import DEFAULT_OUTBOX_KEEP, DEFAULT_OUTBOX_MAX_BYTES, AgentBus
 from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
-from .maintenance import OnlineIdentityError, RegistryMaintenance
+from .maintenance import RegistryMaintenance
 from .message import (
     DEFAULT_HOP_LIMIT,
     DEFAULT_RATE_COOLDOWN,
@@ -1579,17 +1579,14 @@ def registry_forget(
         client_key=client_key,
         snapshot_seconds=snapshot_seconds,
     )
-    try:
-        result = asyncio.run(
-            maintenance.forget(
-                agent_id,
-                dry_run=dry_run,
-                force_online=force_online,
-                stale_after_seconds=stale_after_seconds,
-            )
+    result = asyncio.run(
+        maintenance.forget(
+            agent_id,
+            dry_run=dry_run,
+            force_online=force_online,
+            stale_after_seconds=stale_after_seconds,
         )
-    except OnlineIdentityError as exc:
-        raise click.ClickException(str(exc)) from exc
+    )
     click.echo(result.model_dump_json(indent=2))
     if result.refused:
         # Refusals are reported without raising; preserve a non-zero status.
@@ -1641,11 +1638,6 @@ def registry_forget(
          "session rather than the directory record.",
 )
 @click.option(
-    "--client-id",
-    default=None,
-    help="Explicit MQTT client identifier (required for unique concurrent sessions).",
-)
-@click.option(
     "--capability",
     "capabilities",
     multiple=True,
@@ -1687,7 +1679,6 @@ def mcp_server(
     persistent: bool,
     presence: bool,
     lifecycle: str,
-    client_id: str | None,
     capabilities: tuple[str, ...],
     registry_heartbeat_seconds: float,
     registry_stale_after_seconds: float,
@@ -1732,7 +1723,6 @@ def mcp_server(
         persistent=persistent,
         presence=presence,
         lifecycle=lifecycle,
-        client_id=client_id,
         capabilities=capabilities,
         state_dir=state_dir,
         hop_limit=hop_limit,

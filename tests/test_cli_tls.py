@@ -245,8 +245,6 @@ def test_mcp_server_threads_registry_lifecycle_options():
                 "--lifecycle",
                 "transient",
                 "--presence",
-                "--client-id",
-                "sb-session-7",
                 "--capability",
                 "development.files.write",
                 "--capability",
@@ -261,7 +259,7 @@ def test_mcp_server_threads_registry_lifecycle_options():
     assert result.exit_code == 0, result.output
     assert mock_run.call_args.kwargs["lifecycle"] == "transient"
     assert mock_run.call_args.kwargs["presence"] is True
-    assert mock_run.call_args.kwargs["client_id"] == "sb-session-7"
+    assert "client_id" not in mock_run.call_args.kwargs
     assert mock_run.call_args.kwargs["capabilities"] == (
         "development.files.write",
         "web.read",

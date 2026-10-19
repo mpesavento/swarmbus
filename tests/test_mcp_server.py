@@ -9,6 +9,7 @@ from swarmbus.mcp_server import create_mcp_app
 from swarmbus.message import AgentMessage
 from swarmbus.registry import presence_payload
 from swarmbus.runtime import (
+    DirectoryState,
     ManagedMCPRuntime,
     PresenceRequiredError,
     RuntimeFatalError,
@@ -37,6 +38,7 @@ def _directory_runtime(tmp_path) -> ManagedMCPRuntime:
         state_path=tmp_path / "foo.sqlite3",
     )
     runtime._client = MagicMock()
+    runtime._directory_state = DirectoryState.READY
     runtime.registry.update_presence(
         runtime.topics.presence("wren"),
         presence_payload("wren", "online"),
@@ -301,7 +303,7 @@ class _RuntimeAck:
 
 
 @pytest.mark.asyncio
-async def test_managed_runtime_ingestion_survives_restart_and_is_queryable(tmp_path):
+async def test_managed_runtime_message_stays_queryable_until_ack(tmp_path):
     state_path = tmp_path / "foo.sqlite3"
     receiver = ManagedMCPRuntime(agent_id="foo", state_path=state_path)
     await receiver.store.open()
@@ -321,7 +323,7 @@ async def test_managed_runtime_ingestion_survives_restart_and_is_queryable(tmp_p
     restarted._client = MagicMock()
     app = create_mcp_app(restarted)
     first = await app._tool_fns["read_inbox"]()
-    second = await app._tool_fns["read_inbox"]()
+    second = await app._tool_fns["read_inbox"](wait_seconds=0.01)
     third = await app._tool_fns["read_inbox"](
         ack_ids=[message.id],
         max_messages=0,

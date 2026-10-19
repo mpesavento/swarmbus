@@ -14,9 +14,11 @@ from .bus import _build_tls_context
 from .message import _validate_registered_agent_id
 from .registry import (
     OrphanPresenceAction,
+    PresenceEvidence,
     PresenceRecord,
     RegistryRecord,
     orphan_presence_action,
+    presence_evidence,
     stamp_presence_payload,
     transient_gc_decision,
 )
@@ -32,14 +34,6 @@ ORPHAN_WRITE_ERRORS = (
     OSError,
     asyncio.TimeoutError,
 )
-
-
-class OnlineIdentityError(RuntimeError):
-    """An explicit retirement targeted an identity that is still online."""
-
-
-class UnconfirmedOfflineError(OnlineIdentityError):
-    """Raised when retirement cannot confirm the identity is offline."""
 
 
 class RegistryGCReport(BaseModel):
@@ -93,6 +87,9 @@ class RegistryListEntry(RegistryRecord):
     """One registry record joined with its retained presence evidence."""
 
     presence_state: Literal["online", "offline", "unknown"] = "unknown"
+    presence_evidence: Literal["online", "offline", "unconfirmed"] = (
+        "unconfirmed"
+    )
     online: bool | None = None
     offline_reason: str | None = None
 
@@ -132,8 +129,11 @@ class RegistryForgetReport(BaseModel):
     agent_id: str
     dry_run: bool
     lifecycle: str = "unknown"
-    # True=online, False=offline, None=no presence evidence.
+    # True=online, False=offline, None=unconfirmed presence evidence.
     online: bool | None = None
+    presence_evidence: Literal["online", "offline", "unconfirmed"] = (
+        "unconfirmed"
+    )
     rechecked: bool = False
     # A refusal leaves retained state unchanged.
     refused: bool = False
@@ -314,43 +314,42 @@ class RegistryMaintenance:
             return await self._snapshot_with_client(client, filters)
 
     @staticmethod
+    def _presence_evidence(
+        record: RegistryRecord | None,
+        presence: PresenceRecord | None,
+        *,
+        now: datetime,
+        stale_after_seconds: float,
+    ) -> PresenceEvidence:
+        return presence_evidence(
+            record=record,
+            presence=presence,
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        )
+
+    @classmethod
     def _observed_online(
+        cls,
         record: RegistryRecord | None,
         presence: PresenceRecord | None,
         *,
         now: datetime,
         stale_after_seconds: float,
     ) -> bool | None:
-        """Return True, False, or None when presence was not observed."""
+        """Map presence evidence onto the legacy three-way online field."""
 
-        if presence is None:
-            return None
-        if presence.state != "online":
-            return False
-        if record is None:
+        evidence = cls._presence_evidence(
+            record,
+            presence,
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if evidence is PresenceEvidence.ONLINE:
             return True
-        return (now - record.last_seen).total_seconds() <= stale_after_seconds
-
-    @staticmethod
-    def _enforce_offline_interlock(
-        agent_id: str,
-        online: bool | None,
-    ) -> None:
-        """Raise unless the identity was positively observed offline."""
-
-        if online is True:
-            raise OnlineIdentityError(
-                f"refusing to forget online identity {agent_id!r}; "
-                "use force_online only for emergency recovery"
-            )
-        if online is None:
-            raise UnconfirmedOfflineError(
-                f"could not confirm identity {agent_id!r} is offline: no "
-                "retained presence message was observed, which is also "
-                "what a live agent looks like when its presence misses "
-                "the snapshot window. Retry or widen snapshot_seconds; "
-                "use force_online only for emergency recovery"
-            )
+        if evidence is PresenceEvidence.OFFLINE:
+            return False
+        return None
 
     @staticmethod
     def _audit_event(
@@ -363,9 +362,10 @@ class RegistryMaintenance:
         outcome: str,
         retention_seconds: float | None,
         online: bool | None = None,
+        presence_evidence_value: PresenceEvidence = PresenceEvidence.UNCONFIRMED,
         force_online: bool = False,
     ) -> dict[str, Any]:
-        # Preserve unknown presence rather than coercing it to offline.
+        # Preserve unconfirmed presence rather than coercing it to offline.
         return {
             "operation": operation,
             "agent_id": agent_id,
@@ -373,6 +373,7 @@ class RegistryMaintenance:
             "started_at": record.started_at.isoformat() if record else None,
             "last_seen": record.last_seen.isoformat() if record else None,
             "presence_state": presence.state if presence else "unknown",
+            "presence_evidence": presence_evidence_value.value,
             "online": online,
             "offline_reason": presence.reason if presence else None,
             "first_seen_offline": (
@@ -412,10 +413,17 @@ class RegistryMaintenance:
         identities = []
         for agent_id, record in snapshot.records.items():
             presence = snapshot.presence.get(agent_id)
+            evidence = self._presence_evidence(
+                record,
+                presence,
+                now=current,
+                stale_after_seconds=stale_after_seconds,
+            )
             identities.append(
                 RegistryListEntry(
                     **record.model_dump(),
                     presence_state=(presence.state if presence else "unknown"),
+                    presence_evidence=evidence.value,
                     online=self._observed_online(
                         record,
                         presence,
@@ -572,6 +580,12 @@ class RegistryMaintenance:
                             now=current,
                             stale_after_seconds=stale_after_seconds,
                         ),
+                        presence_evidence_value=self._presence_evidence(
+                            record,
+                            presence,
+                            now=current,
+                            stale_after_seconds=stale_after_seconds,
+                        ),
                     )
                     try:
                         self._audit_sink(event)
@@ -610,7 +624,7 @@ class RegistryMaintenance:
                         if destroy_session:
                             # A stable session is destroyed only with positive offline evidence.
                             async with self._new_client(
-                                identifier=f"swarmbus-{original.agent_id}",
+                                identifier=f"swarmbus-{record.agent_id}",
                                 clean_session=True,
                             ) as agent_client:
                                 await agent_client.publish(
@@ -894,14 +908,36 @@ class RegistryMaintenance:
             and presence is None
             and snapshot.invalid_messages == 0
         )
+        evidence = self._presence_evidence(
+            record,
+            presence,
+            now=current,
+            stale_after_seconds=stale_after_seconds,
+        )
         online = self._observed_online(
             record,
             presence,
             now=current,
             stale_after_seconds=stale_after_seconds,
         )
-        if not force_online and not initial_absent:
-            self._enforce_offline_interlock(agent_id, online)
+        if (
+            not force_online
+            and not initial_absent
+            and evidence is not PresenceEvidence.OFFLINE
+        ):
+            return RegistryForgetReport(
+                agent_id=agent_id,
+                dry_run=dry_run,
+                lifecycle=record.lifecycle if record else "unknown",
+                online=online,
+                presence_evidence=evidence.value,
+                refused=True,
+                refused_reason=(
+                    "online"
+                    if evidence is PresenceEvidence.ONLINE
+                    else "unconfirmed-offline"
+                ),
+            )
 
         # Two bounded reads distinguish absence from delayed retained state.
         async with self._new_client() as reader:
@@ -912,6 +948,12 @@ class RegistryMaintenance:
             record is None
             and presence is None
             and fresh.invalid_messages == 0
+        )
+        evidence = self._presence_evidence(
+            record,
+            presence,
+            now=current,
+            stale_after_seconds=stale_after_seconds,
         )
         online = self._observed_online(
             record,
@@ -925,6 +967,7 @@ class RegistryMaintenance:
             dry_run=dry_run,
             lifecycle=record.lifecycle if record else "unknown",
             online=online,
+            presence_evidence=evidence.value,
             rechecked=True,
             already_absent=confirmed_absent,
         )
@@ -938,10 +981,12 @@ class RegistryMaintenance:
                     "online" if online is True else "unconfirmed-offline"
                 )
                 return report
-            if online is not False:
+            if evidence is not PresenceEvidence.OFFLINE:
                 report.refused = True
                 report.refused_reason = (
-                    "online" if online else "unconfirmed-offline"
+                    "online"
+                    if evidence is PresenceEvidence.ONLINE
+                    else "unconfirmed-offline"
                 )
                 return report
 
@@ -959,6 +1004,7 @@ class RegistryMaintenance:
             outcome="authorized",
             retention_seconds=None,
             online=online,
+            presence_evidence_value=evidence,
             force_online=force_online,
         )
         try:

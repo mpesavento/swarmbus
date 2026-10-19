@@ -20,14 +20,17 @@ import socket
 import ssl
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+import aiomqtt
 import pytest
 
 from swarmbus.bus import AgentBus
 from swarmbus.handlers.base import BaseHandler
 from swarmbus.message import AgentMessage
+from swarmbus.registry import RegistryRecord
 
 
 def _free_port() -> int:
@@ -55,6 +58,16 @@ def _have(*cmds: str) -> bool:
     return all(shutil.which(c) is not None for c in cmds)
 
 
+async def _next_message_for(messages, topic: str, timeout: float = 2):
+    async def find():
+        while True:
+            message = await anext(messages)
+            if str(message.topic) == topic:
+                return message
+
+    return await asyncio.wait_for(find(), timeout=timeout)
+
+
 @pytest.fixture(scope="module")
 def mosquitto_tls_broker(tmp_path_factory) -> Iterator[dict]:
     """Yield ``{host, port, ca_cert, username, password}`` for a TLS broker
@@ -71,6 +84,7 @@ def mosquitto_tls_broker(tmp_path_factory) -> Iterator[dict]:
     srv_csr = tmp / "srv.csr"
     srv_cert = tmp / "srv.crt"
     pwfile = tmp / "passwd"
+    aclfile = tmp / "acl"
     conf = tmp / "mosquitto.conf"
 
     # CA
@@ -110,6 +124,39 @@ def mosquitto_tls_broker(tmp_path_factory) -> Iterator[dict]:
     subprocess.run([
         "mosquitto_passwd", "-c", "-b", str(pwfile), "alice", "secret",
     ], check=True, capture_output=True)
+    for username in ("rx", "tx", "ready", "observer", "maintenance"):
+        subprocess.run([
+            "mosquitto_passwd", "-b", str(pwfile), username, "secret",
+        ], check=True, capture_output=True)
+
+    aclfile.write_text(
+        "pattern read agents/%u/inbox\n"
+        "pattern readwrite agents/%u/presence\n"
+        "pattern write swarmbus/registry/%u\n"
+        "user rx\n"
+        "topic write agents/+/inbox\n"
+        "topic read agents/+/presence\n"
+        "topic read swarmbus/registry/+\n"
+        "topic readwrite agents/broadcast\n"
+        "user tx\n"
+        "topic write agents/+/inbox\n"
+        "topic read agents/+/presence\n"
+        "topic read swarmbus/registry/+\n"
+        "topic readwrite agents/broadcast\n"
+        "user ready\n"
+        "topic write agents/+/inbox\n"
+        "topic read agents/+/presence\n"
+        "topic read swarmbus/registry/+\n"
+        "topic readwrite agents/broadcast\n"
+        "user observer\n"
+        "topic write agents/+/inbox\n"
+        "topic read agents/+/presence\n"
+        "topic read swarmbus/registry/+\n"
+        "topic readwrite agents/broadcast\n"
+        "user maintenance\n"
+        "topic readwrite agents/+/presence\n"
+        "topic readwrite swarmbus/registry/+\n"
+    )
 
     port = _free_port()
     conf.write_text(
@@ -122,6 +169,7 @@ def mosquitto_tls_broker(tmp_path_factory) -> Iterator[dict]:
         f"listener {port} 0.0.0.0\n"
         "allow_anonymous false\n"
         f"password_file {pwfile}\n"
+        f"acl_file {aclfile}\n"
         f"cafile {ca_cert}\n"
         f"certfile {srv_cert}\n"
         f"keyfile {srv_key}\n"
@@ -176,19 +224,19 @@ async def test_tls_with_password_roundtrip(mosquitto_tls_broker):
     handler = _Recorder()
     receiver = AgentBus(
         agent_id="rx", broker=cfg["host"], port=cfg["port"],
-        username=cfg["username"], password=cfg["password"],
+        username="rx", password=cfg["password"],
         ca_cert=cfg["ca_cert"],
     )
     receiver.register_handler(handler)
     sender = AgentBus(
         agent_id="tx", broker=cfg["host"], port=cfg["port"],
-        username=cfg["username"], password=cfg["password"],
+        username="tx", password=cfg["password"],
         ca_cert=cfg["ca_cert"],
     )
     readiness_sender = AgentBus(
         agent_id="ready", broker=cfg["host"], port=cfg["port"],
         retain=True,
-        username=cfg["username"], password=cfg["password"],
+        username="ready", password=cfg["password"],
         ca_cert=cfg["ca_cert"],
     )
 
@@ -211,10 +259,98 @@ async def test_tls_with_password_roundtrip(mosquitto_tls_broker):
 
 
 @pytest.mark.asyncio
+async def test_authenticated_acl_allows_registry_directory_and_maintenance(
+    mosquitto_tls_broker,
+):
+    cfg = mosquitto_tls_broker
+    tls_context = ssl.create_default_context(cafile=cfg["ca_cert"])
+    now = datetime.now(timezone.utc)
+    record = RegistryRecord(
+        agent_id="observer",
+        lifecycle="named",
+        durability="ephemeral",
+        started_at=now,
+        last_seen=now,
+    )
+
+    async with aiomqtt.Client(
+        hostname=cfg["host"],
+        port=cfg["port"],
+        username="observer",
+        password=cfg["password"],
+        tls_context=tls_context,
+    ) as observer:
+        await observer.subscribe("swarmbus/registry/+", qos=0)
+        messages = observer.messages.__aiter__()
+        await observer.publish(
+            "swarmbus/registry/observer",
+            record.to_json(),
+            qos=1,
+            retain=True,
+        )
+        published = await _next_message_for(
+            messages, "swarmbus/registry/observer"
+        )
+        assert RegistryRecord.from_mqtt(
+            str(published.topic), published.payload
+        ).agent_id == "observer"
+
+        async with aiomqtt.Client(
+            hostname=cfg["host"],
+            port=cfg["port"],
+            username="maintenance",
+            password=cfg["password"],
+            tls_context=tls_context,
+        ) as maintenance:
+            peer = record.model_copy(update={"agent_id": "peer"})
+            await maintenance.publish(
+                "swarmbus/registry/peer",
+                peer.to_json(),
+                qos=1,
+                retain=True,
+            )
+            await maintenance.publish(
+                "swarmbus/registry/observer",
+                b"",
+                qos=1,
+                retain=True,
+            )
+            await maintenance.publish(
+                "swarmbus/registry/peer",
+                b"",
+                qos=1,
+                retain=True,
+            )
+        fleet_record = await _next_message_for(
+            messages, "swarmbus/registry/peer"
+        )
+        assert RegistryRecord.from_mqtt(
+            str(fleet_record.topic), fleet_record.payload
+        ).agent_id == "peer"
+        tombstone = await _next_message_for(
+            messages, "swarmbus/registry/observer"
+        )
+        assert tombstone.payload == b""
+
+        foreign = record.model_copy(update={"agent_id": "forbidden"})
+        await observer.publish(
+            "swarmbus/registry/forbidden",
+            foreign.to_json(),
+            qos=1,
+            retain=True,
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await _next_message_for(
+                messages,
+                "swarmbus/registry/forbidden",
+                timeout=0.2,
+            )
+
+
+@pytest.mark.asyncio
 async def test_tls_wrong_password_fails(mosquitto_tls_broker):
     """Wrong password must fail at MQTT auth, not silently succeed.
     Catches a regression where credentials would be quietly dropped."""
-    import aiomqtt
     cfg = mosquitto_tls_broker
     bus = AgentBus(
         agent_id="probe", broker=cfg["host"], port=cfg["port"],
@@ -230,7 +366,6 @@ async def test_tls_anonymous_fails(mosquitto_tls_broker):
     """Anonymous connect to a hardened broker must fail. If this passes,
     the broker fixture is misconfigured (allow_anonymous true) and every
     other test in this module is suspect."""
-    import aiomqtt
     cfg = mosquitto_tls_broker
     bus = AgentBus(
         agent_id="probe", broker=cfg["host"], port=cfg["port"],

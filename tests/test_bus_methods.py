@@ -699,8 +699,80 @@ async def test_persistent_watch_publishes_named_registry_and_presence():
     registry = json.loads(publishes[0][2])
     assert registry["lifecycle"] == "named"
     assert registry["durability"] == "durable"
+    assert "mqtt_client_id" not in registry
     assert json.loads(publishes[1][2])["state"] == "online"
     assert json.loads(publishes[2][2])["state"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_persistent_watch_heartbeats_until_timeout():
+    class _BlockingClient(_FakeClient):
+        @property
+        def messages(self):
+            async def _gen():
+                await asyncio.Event().wait()
+                yield
+
+            return _gen()
+
+    fake = _BlockingClient([])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        result = await AgentBus(
+            agent_id="sparrow",
+            persistent=True,
+            registry_heartbeat_seconds=0.001,
+        ).watch_inbox(timeout=0.02)
+
+    assert result is None
+    registry_payloads = [
+        json.loads(event[2])
+        for event in fake.events
+        if event[0] == "publish"
+        and event[1] == DEFAULT_TOPICS.registry("sparrow")
+    ]
+    assert len(registry_payloads) >= 2
+    assert registry_payloads[-1]["last_seen"] > registry_payloads[0]["last_seen"]
+    assert all("mqtt_client_id" not in record for record in registry_payloads)
+
+
+@pytest.mark.asyncio
+async def test_persistent_watch_cleanup_preserves_cancellation():
+    class _OfflineFailureClient(_FakeClient):
+        @property
+        def messages(self):
+            async def _gen():
+                await asyncio.Event().wait()
+                yield
+
+            return _gen()
+
+        async def publish(self, topic, payload, **kwargs):
+            self.events.append(("publish", str(topic), payload, kwargs))
+            if str(topic) != DEFAULT_TOPICS.presence("sparrow"):
+                return
+            if json.loads(payload)["state"] == "offline":
+                raise RuntimeError("offline publish failed")
+
+    fake = _OfflineFailureClient([])
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=fake):
+        task = asyncio.create_task(
+            AgentBus(
+                agent_id="sparrow",
+                persistent=True,
+            ).watch_inbox(timeout=60)
+        )
+        for _ in range(100):
+            if any(
+                event[0] == "publish"
+                and event[1] == DEFAULT_TOPICS.presence("sparrow")
+                and json.loads(event[2])["state"] == "online"
+                for event in fake.events
+            ):
+                break
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 def _topic_client(payloads):

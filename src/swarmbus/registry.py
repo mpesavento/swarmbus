@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from .message import _validate_agent_id
+from .message import _validate_agent_id, sanitize_field
 from .topics import DEFAULT_TOPICS, TopicMap
 
 MAX_STATUS_LENGTH = 280
@@ -31,7 +31,7 @@ def _normalize_string_list(
     for item in value:
         if not isinstance(item, str):
             raise ValueError(f"{field_name} must contain only strings")
-        item = item.strip()
+        item = sanitize_field(item).strip()
         if not item:
             raise ValueError(f"{field_name} entries cannot be empty")
         if max_item_length is not None and len(item) > max_item_length:
@@ -52,7 +52,7 @@ class RegistryRecord(BaseModel):
     working_set: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     lifecycle: AgentLifecycle = "named"
-    durability: str = "unknown"
+    durability: Literal["durable", "ephemeral", "unknown"] = "unknown"
     started_at: datetime
     last_seen: datetime
 
@@ -68,12 +68,15 @@ class RegistryRecord(BaseModel):
             raise ValueError("registry timestamps must be timezone-aware")
         return value
 
-    @field_validator("status")
+    @field_validator("status", mode="before")
     @classmethod
-    def validate_status(cls, value: str) -> str:
-        if len(value) > MAX_STATUS_LENGTH:
+    def validate_status(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("status must be a string")
+        sanitized = sanitize_field(value)
+        if len(sanitized) > MAX_STATUS_LENGTH:
             raise ValueError(f"status exceeds {MAX_STATUS_LENGTH} characters")
-        return value
+        return sanitized
 
     @field_validator("working_set", mode="before")
     @classmethod
@@ -125,6 +128,15 @@ class PresenceRecord(BaseModel):
     @classmethod
     def validate_agent_id(cls, value: str) -> str:
         return _validate_agent_id(value)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def validate_reason(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("reason must be a string")
+        return sanitize_field(value)
 
     @field_validator("first_seen_offline")
     @classmethod
@@ -267,12 +279,45 @@ def orphan_presence_action(
     return OrphanPresenceAction.WAIT
 
 
+class PresenceEvidence(str, Enum):
+    """Strength of the retained evidence about an identity's presence."""
+
+    ONLINE = "online"
+    OFFLINE = "offline"
+    UNCONFIRMED = "unconfirmed"
+
+
+def presence_evidence(
+    *,
+    record: RegistryRecord | None,
+    presence: PresenceRecord | None,
+    now: datetime,
+    stale_after_seconds: float,
+) -> PresenceEvidence:
+    if stale_after_seconds <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if presence is None:
+        return PresenceEvidence.UNCONFIRMED
+    if presence.state == "offline":
+        return PresenceEvidence.OFFLINE
+    if record is None:
+        return PresenceEvidence.ONLINE
+    age_seconds = (now - record.last_seen).total_seconds()
+    if age_seconds < 0 or age_seconds <= stale_after_seconds:
+        return PresenceEvidence.ONLINE
+    return PresenceEvidence.UNCONFIRMED
+
+
 class GCDecisionReason(str, Enum):
     """Why a registry record was preserved or selected for transient GC."""
 
     ELIGIBLE = "eligible"
     NAMED = "named"
+    UNKNOWN_DURABILITY = "unknown-durability"
     ONLINE = "online"
+    UNCONFIRMED = "unconfirmed"
     WITHIN_RETENTION = "within-retention"
     CLOCK_SKEW = "clock-skew"
 
@@ -316,6 +361,12 @@ def transient_gc_decision(
         "age_seconds": age_seconds,
     }
 
+    if record.durability == "unknown":
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.UNKNOWN_DURABILITY,
+        )
     if record.lifecycle == "named":
         return TransientGCDecision(
             **decision,
@@ -328,15 +379,23 @@ def transient_gc_decision(
             eligible=False,
             reason=GCDecisionReason.CLOCK_SKEW,
         )
-    if (
-        presence is not None
-        and presence.state == "online"
-        and age_seconds <= stale_after_seconds
-    ):
+    evidence = presence_evidence(
+        record=record,
+        presence=presence,
+        now=now,
+        stale_after_seconds=stale_after_seconds,
+    )
+    if evidence is PresenceEvidence.ONLINE:
         return TransientGCDecision(
             **decision,
             eligible=False,
             reason=GCDecisionReason.ONLINE,
+        )
+    if evidence is PresenceEvidence.UNCONFIRMED:
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.UNCONFIRMED,
         )
     if age_seconds <= retention_seconds:
         return TransientGCDecision(
@@ -367,6 +426,10 @@ class RegistryCache:
         self._registry: dict[str, RegistryRecord] = {}
         self._presence: dict[str, PresenceRecord] = {}
 
+    def clear(self) -> None:
+        self._registry.clear()
+        self._presence.clear()
+
     def update_registry(self, topic: str, payload: str | bytes) -> RegistryRecord:
         record = RegistryRecord.from_mqtt(topic, payload, topics=self.topics)
         self._registry[record.agent_id] = record
@@ -383,16 +446,24 @@ class RegistryCache:
     def remove_presence(self, topic: str) -> None:
         self._presence.pop(self.topics.presence_agent(topic), None)
 
+    def _presence_evidence(
+        self,
+        agent_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> PresenceEvidence:
+        return presence_evidence(
+            record=self._registry.get(agent_id),
+            presence=self._presence.get(agent_id),
+            now=now or datetime.now(timezone.utc),
+            stale_after_seconds=self.stale_after_seconds,
+        )
+
     def _is_online(self, agent_id: str, *, now: datetime | None = None) -> bool:
-        presence = self._presence.get(agent_id)
-        if presence is None or presence.state != "online":
-            return False
-        record = self._registry.get(agent_id)
-        if record is None:
-            return True
-        current = now or datetime.now(timezone.utc)
-        age = (current - record.last_seen).total_seconds()
-        return age <= self.stale_after_seconds
+        return (
+            self._presence_evidence(agent_id, now=now)
+            is PresenceEvidence.ONLINE
+        )
 
     def online_agent_ids(self) -> list[str]:
         agent_ids = set(self._presence) | set(self._registry)
@@ -403,9 +474,12 @@ class RegistryCache:
             raise KeyError(agent_id)
         record = self._registry.get(agent_id)
         presence = self._presence.get(agent_id)
+        evidence = self._presence_evidence(agent_id)
         state = {
             "agent_id": agent_id,
-            "online": self._is_online(agent_id),
+            "online": evidence is PresenceEvidence.ONLINE,
+            "presence_evidence": evidence.value,
+            "untrusted": True,
             "status": record.status if record else "",
             "working_set": list(record.working_set) if record else [],
             "capabilities": list(record.capabilities) if record else [],

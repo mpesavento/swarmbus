@@ -109,32 +109,41 @@ Use `mosquitto_passwd`. The username is exactly the agent id. `-c` creates the f
 ```bash
 sudo mosquitto_passwd -c /etc/mosquitto/swarmbus.passwd planner   # first agent only: -c overwrites
 sudo mosquitto_passwd /etc/mosquitto/swarmbus.passwd coder        # each further agent
+sudo mosquitto_passwd /etc/mosquitto/swarmbus.passwd maintenance  # registry maintenance
 ```
 
 ### ACL file
 
 ```
 # /etc/mosquitto/swarmbus.acl
-# Every login: read its own inbox; publish and read its own presence.
-# %u is the MQTT username, which must equal the agent id.
+# Every agent login: read its own inbox; publish/read its own presence
+# and registry record. %u must equal the agent id.
 pattern read agents/%u/inbox
 pattern readwrite agents/%u/presence
+pattern write swarmbus/registry/%u
 
 # One block per agent id: send to any inbox, see every agent's
-# presence, send and receive broadcasts.
+# presence and registry record, and send/receive broadcasts.
 user planner
 topic write agents/+/inbox
 topic read agents/+/presence
+topic read swarmbus/registry/+
 topic readwrite agents/broadcast
 
 user coder
 topic write agents/+/inbox
 topic read agents/+/presence
+topic read swarmbus/registry/+
 topic readwrite agents/broadcast
+
+# Dedicated operator identity: no inbox or broadcast access.
+user maintenance
+topic readwrite agents/+/presence
+topic readwrite swarmbus/registry/+
 ```
 
 - **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
-- **Shared rules sit under `user`.** In an acl_file, `topic` lines before the first `user` line apply only to anonymous clients. mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`. So the rules every agent shares are repeated in one `user` block per agent id. Add a block when you add an agent.
+- **Literal shared rules sit under `user`.** The `%u` `pattern` lines apply to every authenticated user. Literal `topic` lines before the first `user` line apply only to anonymous clients, so the remaining shared permissions are repeated in one `user` block per agent id. Add a block when you add an agent. Mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`.
 
 ### Broker config
 
@@ -167,6 +176,7 @@ mosquitto 2.x warns about a password or ACL file it does not own or that others 
 | `swarmbus send`, `read`, `watch` | `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`, or `--username` / `--password`. The username must equal `--agent-id`. Prefer the env vars, because flags show in `ps`. |
 | `swarmbus mcp-server` | The same two env vars in the MCP host's `env` block for the server, or the flags in its `args`. |
 | `swarmbus list`, `swarmbus doctor` | Any agent's login. They only read presence. |
+| `swarmbus registry-list`, `registry-gc`, `registry-forget` | The dedicated `maintenance` login. It can read and tombstone registry/presence records, so do not reuse it for an agent runtime. |
 
 ### What this does not stop
 
