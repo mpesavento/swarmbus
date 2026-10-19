@@ -3,12 +3,12 @@
 `mosquitto_broker` session fixture in conftest.py).
 
 These tests exercise the wire protocol, retained-message semantics, and
-handler side-effects — things mocks cannot verify. Each test spins up
+handler side-effects -- things mocks cannot verify. Each test spins up
 agents, drives a scenario, then cancels listeners cleanly.
 
-Scenarios not yet covered (deliberately — see README or issues):
-  * Reconnect after unclean broker restart — unit-tested in test_bus.py
-  * LWT on unclean TCP abort — cannot reliably force from test code
+Scenarios not yet covered (deliberately -- see README or issues):
+  * Reconnect after unclean broker restart -- unit-tested in test_bus.py
+  * LWT on unclean TCP abort -- cannot reliably force from test code
 """
 import asyncio
 import inspect
@@ -17,6 +17,7 @@ import os
 import sqlite3
 import stat
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiomqtt
@@ -28,9 +29,12 @@ from swarmbus.handlers.base import BaseHandler
 from swarmbus._compat import asyncio_timeout
 from swarmbus.handlers.direct_invoke import DirectInvocationHandler
 from swarmbus.handlers.file_bridge import FileBridgeHandler
+from swarmbus.maintenance import RegistryMaintenance
 from swarmbus.mcp_server import create_mcp_app
 from swarmbus.message import AgentMessage
-from swarmbus.runtime import ManagedMCPRuntime
+from swarmbus.registry import PresenceRecord, RegistryRecord
+from swarmbus.runtime import ManagedMCPRuntime, PresenceRequiredError
+from swarmbus.topics import DEFAULT_TOPICS, TopicMap
 
 
 class CollectingHandler(BaseHandler):
@@ -67,27 +71,117 @@ async def _clear_retained(host: str, port: int, topics: list[str]) -> None:
             await client.publish(topic, payload=b"", qos=1, retain=True)
 
 
+async def _read_retained(
+    host: str,
+    port: int,
+    topics: list[str],
+    *,
+    settle: float = 0.5,
+    window: float = 1.0,
+) -> dict[str, bytes]:
+    """Snapshot retained payloads for the given topics.
+
+    A cleared topic delivers nothing, so a missing key means tombstoned.
+    The collection window outlasts the settle delay so a broker-side
+    publish that lands late (a Last Will) still registers.
+    """
+    await asyncio.sleep(settle)
+    seen: dict[str, bytes] = {}
+    async with aiomqtt.Client(host, port=port) as client:
+        for topic in topics:
+            await client.subscribe(topic, qos=1)
+        try:
+            async with asyncio_timeout(window):
+                async for msg in client.messages:
+                    seen[str(msg.topic)] = msg.payload
+        except asyncio.TimeoutError:
+            pass
+    return seen
+
+
+def _describe_retained(retained: dict[str, bytes]) -> str:
+    return json.dumps(
+        {topic: payload.decode() for topic, payload in retained.items()},
+        indent=2,
+        sort_keys=True,
+    )
+
+
+async def _start_listener(bus: AgentBus) -> asyncio.Task:
+    """Start a listener after proving its subscriptions are active."""
+    handlers = bus._handlers
+    ready = CollectingHandler()
+    bus._handlers = [ready]
+
+    async def listen_and_clear_probe() -> None:
+        try:
+            await bus.listen()
+        finally:
+            await _clear_retained(
+                bus.broker,
+                bus.port,
+                [bus.topics.inbox(bus.agent_id)],
+            )
+
+    task = asyncio.create_task(listen_and_clear_probe())
+    probe = AgentBus(
+        agent_id="readiness",
+        broker=bus.broker,
+        port=bus.port,
+        retain=True,
+    )
+    try:
+        await probe.send(to=bus.agent_id, subject="ready", body="ready")
+        await ready.wait_for_message()
+    except BaseException:
+        await _stop(task)
+        raise
+    finally:
+        bus._handlers = handlers
+    return task
+
+
+@pytest.fixture
+async def listening_agent(mosquitto_broker):
+    """Start listeners and clean up their retained presence."""
+    host, port = mosquitto_broker
+    started: list[tuple[str, asyncio.Task]] = []
+
+    async def start(agent_id, *handlers, **kwargs):
+        bus = AgentBus(agent_id=agent_id, broker=host, port=port, **kwargs)
+        task = await _start_listener(bus)
+        for handler in handlers:
+            bus.register_handler(handler)
+        started.append((agent_id, task))
+        return bus
+
+    yield start
+
+    for _, task in reversed(started):
+        await _stop(task)
+    await _clear_retained(
+        host,
+        port,
+        [
+            topic
+            for agent_id, _ in started
+            for topic in (
+                DEFAULT_TOPICS.inbox(agent_id),
+                DEFAULT_TOPICS.presence(agent_id),
+            )
+        ],
+    )
+
+
 @pytest.mark.asyncio
-async def test_send_receive_roundtrip(mosquitto_broker):
+async def test_send_receive_roundtrip(mosquitto_broker, listening_agent):
     host, port = mosquitto_broker
     handler = CollectingHandler()
-
-    receiver = AgentBus(agent_id="sparrow", broker=host, port=port, retain=False)
-    receiver.register_handler(handler)
+    await listening_agent("sparrow", handler)
 
     sender = AgentBus(agent_id="wren", broker=host, port=port, retain=False)
-
-    listen_task = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.2)  # let subscription establish
-
     await sender.send(to="sparrow", subject="ping", body="hello from wren")
     await handler.wait_for_message(timeout=3.0)
-
-    listen_task.cancel()
-    try:
-        await listen_task
-    except (asyncio.CancelledError, Exception):
-        pass
 
     assert len(handler.received) == 1
     msg = handler.received[0]
@@ -97,30 +191,19 @@ async def test_send_receive_roundtrip(mosquitto_broker):
 
 
 @pytest.mark.asyncio
-async def test_markdown_body_preserved(mosquitto_broker):
+async def test_markdown_body_preserved(mosquitto_broker, listening_agent):
     host, port = mosquitto_broker
     handler = CollectingHandler()
+    await listening_agent("sparrow", handler)
 
-    receiver = AgentBus(agent_id="sparrow", broker=host, port=port, retain=False)
-    receiver.register_handler(handler)
     sender = AgentBus(agent_id="wren", broker=host, port=port, retain=False)
-
     body = "# Report\n```python\nprint('hi')\n```\n> Note: tested."
-
-    listen_task = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.2)
 
     await sender.send(
         to="sparrow", subject="report",
         body=body, content_type="text/markdown",
     )
     await handler.wait_for_message(timeout=3.0)
-
-    listen_task.cancel()
-    try:
-        await listen_task
-    except (asyncio.CancelledError, Exception):
-        pass
 
     assert handler.received[0].body == body
     assert handler.received[0].content_type == "text/markdown"
@@ -143,9 +226,8 @@ async def test_broadcast_delivered_to_all_subscribers(mosquitto_broker):
 
     sender = AgentBus(agent_id="gamma", broker=host, port=port, retain=False)
 
-    t_a = asyncio.create_task(agent_a.listen())
-    t_b = asyncio.create_task(agent_b.listen())
-    await asyncio.sleep(0.3)  # allow both subscriptions to establish
+    t_a = await _start_listener(agent_a)
+    t_b = await _start_listener(agent_b)
 
     try:
         await sender.send(to="broadcast", subject="all-hands", body="everyone read this")
@@ -175,9 +257,8 @@ async def test_reply_to_roundtrip(mosquitto_broker):
     agent_b = AgentBus(agent_id="bee", broker=host, port=port, retain=False)
     agent_b.register_handler(h_b)
 
-    t_a = asyncio.create_task(agent_a.listen())
-    t_b = asyncio.create_task(agent_b.listen())
-    await asyncio.sleep(0.3)
+    t_a = await _start_listener(agent_a)
+    t_b = await _start_listener(agent_b)
 
     try:
         # A asks B a question, stamped with reply_to
@@ -225,8 +306,7 @@ async def test_persistent_client_multiple_sends(mosquitto_broker):
     receiver = AgentBus(agent_id="rx", broker=host, port=port, retain=False)
     receiver.register_handler(_AllMessages())
 
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         async with AgentBus(agent_id="tx", broker=host, port=port) as sender:
@@ -245,7 +325,7 @@ async def test_persistent_client_multiple_sends(mosquitto_broker):
 
 
 @pytest.mark.asyncio
-async def test_persistent_runtime_replays_offline_delivery_across_restarts(
+async def test_durable_runtime_replays_offline_delivery_across_restarts(
     mosquitto_broker,
     tmp_path,
 ):
@@ -260,6 +340,7 @@ async def test_persistent_runtime_replays_offline_delivery_across_restarts(
             broker=host,
             port=port,
             persistent=True,
+            presence=True,
             state_path=state_path,
         )
         runtimes.append(runtime)
@@ -323,14 +404,22 @@ async def test_persistent_runtime_replays_offline_delivery_across_restarts(
             clean_session=True,
         ):
             pass
+        await _clear_retained(
+            host,
+            port,
+            [
+                DEFAULT_TOPICS.registry("consumer"),
+                DEFAULT_TOPICS.presence("consumer"),
+            ],
+        )
 
 
 @pytest.mark.asyncio
-async def test_persistent_runtime_redelivers_after_first_store_failure(
+async def test_durable_runtime_redelivers_after_first_store_failure(
     mosquitto_broker,
     tmp_path,
 ):
-    """A failed durable write must remain unacked and redeliver exactly once."""
+    """A failed persistent write must remain unacked and redeliver exactly once."""
     host, port = mosquitto_broker
     state_path = tmp_path / "receiver.sqlite3"
 
@@ -339,7 +428,14 @@ async def test_persistent_runtime_redelivers_after_first_store_failure(
             super().__init__(path)
             self.attempts = 0
 
-        async def store(self, msg, *, source_topic, received_at=None):
+        async def store(
+            self,
+            msg,
+            *,
+            source_topic,
+            received_at=None,
+            sender_provenance=None,
+        ):
             self.attempts += 1
             if self.attempts == 1:
                 raise sqlite3.OperationalError("injected first-write failure")
@@ -347,6 +443,7 @@ async def test_persistent_runtime_redelivers_after_first_store_failure(
                 msg,
                 source_topic=source_topic,
                 received_at=received_at,
+                sender_provenance=sender_provenance,
             )
 
     store = _FailOnceStore(state_path)
@@ -355,6 +452,7 @@ async def test_persistent_runtime_redelivers_after_first_store_failure(
         broker=host,
         port=port,
         persistent=True,
+        presence=True,
         state_path=state_path,
         store=store,
     )
@@ -398,6 +496,14 @@ async def test_persistent_runtime_redelivers_after_first_store_failure(
             clean_session=True,
         ):
             pass
+        await _clear_retained(
+            host,
+            port,
+            [
+                DEFAULT_TOPICS.registry("receiver"),
+                DEFAULT_TOPICS.presence("receiver"),
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -406,8 +512,7 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
     host, port = mosquitto_broker
 
     agent = AgentBus(agent_id="earlybird", broker=host, port=port, retain=False)
-    t = asyncio.create_task(agent.listen())
-    await asyncio.sleep(0.3)  # let it publish retained "online"
+    t = await _start_listener(agent)
 
     try:
         # A separate client subscribes *after* agent is online.
@@ -418,7 +523,7 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
                 async with asyncio_timeout(1.0):
                     async for msg in client.messages:
                         data = json.loads(msg.payload)
-                        seen[data["agent"]] = data["status"]
+                        seen[data["agent_id"]] = data["state"]
                         if "earlybird" in seen:
                             break
             except asyncio.TimeoutError:
@@ -427,11 +532,18 @@ async def test_retained_presence_late_subscriber(mosquitto_broker):
         assert seen.get("earlybird") == "online"
     finally:
         await _stop(t)
-        await _clear_retained(host, port, ["agents/earlybird/presence"])
+        await _clear_retained(
+            host,
+            port,
+            [
+                DEFAULT_TOPICS.registry("earlybird"),
+                DEFAULT_TOPICS.presence("earlybird"),
+            ],
+        )
 
 
 @pytest.mark.asyncio
-async def test_list_agents_mcp_tool_sees_online_agents(
+async def test_agent_state_mcp_tool_sees_online_agents(
     mosquitto_broker,
     tmp_path,
 ):
@@ -440,14 +552,15 @@ async def test_list_agents_mcp_tool_sees_online_agents(
 
     a = AgentBus(agent_id="one", broker=host, port=port, retain=False)
     b = AgentBus(agent_id="two", broker=host, port=port, retain=False)
-    t_a = asyncio.create_task(a.listen())
-    t_b = asyncio.create_task(b.listen())
-    await asyncio.sleep(0.4)
+    t_a = await _start_listener(a)
+    t_b = await _start_listener(b)
 
     runtime = ManagedMCPRuntime(
         agent_id="observer",
         broker=host,
         port=port,
+        presence=True,
+        heartbeat_seconds=0.02,
         state_path=tmp_path / "observer.sqlite3",
     )
     try:
@@ -455,22 +568,101 @@ async def test_list_agents_mcp_tool_sees_online_agents(
         await runtime.wait_until_ready()
         app = create_mcp_app(runtime)
         for _ in range(20):
-            result = await app._tool_fns["list_agents"]()
-            if {"one", "two"}.issubset(result):
+            states = await app._tool_fns["agent_state"](action="list")
+            result = {state["agent_id"] for state in states}
+            if {"one", "two", "observer"}.issubset(result):
                 break
             await asyncio.sleep(0.05)
-        assert {"one", "two"}.issubset(result)
+        assert {"one", "two", "observer"}.issubset(result)
+
+        observer = await app._tool_fns["agent_state"](
+            action="get",
+            agent_id="observer",
+        )
+        first_heartbeat = observer["last_seen"]
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            observer = await app._tool_fns["agent_state"](
+                action="get",
+                agent_id="observer",
+            )
+            if observer["last_seen"] > first_heartbeat:
+                break
+        assert observer["last_seen"] > first_heartbeat
+        assert observer["online"] is True
+        assert observer["lifecycle"] == "named"
+        assert observer["durability"] == "ephemeral"
+
+        states = await app._tool_fns["agent_state"](action="list")
+        assert sorted(
+            state["agent_id"] for state in states
+        ) == await runtime.list_agents()
     finally:
         await runtime.stop()
         await _stop(t_a)
         await _stop(t_b)
         await _clear_retained(host, port, [
             "agents/one/presence", "agents/two/presence",
+            DEFAULT_TOPICS.registry("observer"),
+            DEFAULT_TOPICS.presence("observer"),
+        ])
+
+
+@pytest.mark.asyncio
+async def test_messaging_only_runtime_gets_no_directory_on_real_broker(
+    mosquitto_broker,
+    tmp_path,
+):
+    """Messaging-only runtimes exchange mail without directory state."""
+    host, port = mosquitto_broker
+
+    collected = CollectingHandler()
+    peer = AgentBus(
+        agent_id="visible-peer",
+        broker=host,
+        port=port,
+        retain=False,
+    )
+    peer.register_handler(collected)
+    listener = await _start_listener(peer)
+
+    runtime = ManagedMCPRuntime(
+        agent_id="quiet-peer",
+        broker=host,
+        port=port,
+        state_path=tmp_path / "quiet-peer.sqlite3",
+    )
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+        app = create_mcp_app(runtime)
+
+        await app._tool_fns["send_message"](
+            to="visible-peer",
+            subject="still routable",
+            body="messaging survives the directory refusal",
+        )
+        await collected.wait_for_message(timeout=5.0)
+
+        with pytest.raises(PresenceRequiredError):
+            await runtime.list_agents()
+        with pytest.raises(PresenceRequiredError):
+            await app._tool_fns["agent_state"](action="list")
+
+        assert collected.received[0].subject == "still routable"
+        assert runtime.registry.list_states(include_offline=True) == []
+    finally:
+        await runtime.stop()
+        await _stop(listener)
+        await _clear_retained(host, port, [
+            DEFAULT_TOPICS.presence("visible-peer"),
+            DEFAULT_TOPICS.registry("quiet-peer"),
+            DEFAULT_TOPICS.presence("quiet-peer"),
         ])
 
 
 # ---------------------------------------------------------------------------
-# Handler e2e — side effects on disk / DB / subprocess
+# Handler e2e -- side effects on disk / DB / subprocess
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -481,13 +673,12 @@ async def test_file_bridge_handler_writes_to_disk(mosquitto_broker, tmp_path):
 
     receiver = AgentBus(agent_id="fb-rx", broker=host, port=port, retain=False)
     receiver.register_handler(FileBridgeHandler(str(inbox)))
-    # Need a way to know the write landed — add a barrier handler.
+    # Need a way to know the write landed -- add a barrier handler.
     barrier = CollectingHandler()
     receiver.register_handler(barrier)
 
     sender = AgentBus(agent_id="fb-tx", broker=host, port=port, retain=False)
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         await sender.send(to="fb-rx", subject="hello", body="written to disk")
@@ -516,15 +707,11 @@ async def test_sqlite_archive_handler_persists_message(mosquitto_broker, tmp_pat
     receiver.register_handler(barrier)
 
     sender = AgentBus(agent_id="sql-tx", broker=host, port=port, retain=False)
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         await sender.send(to="sql-rx", subject="archived", body="row in sqlite")
         await barrier.wait_for_message(timeout=3.0)
-
-        # Small grace for async archive commit
-        await asyncio.sleep(0.1)
 
         with sqlite3.connect(db_path) as con:
             rows = con.execute(
@@ -565,13 +752,11 @@ async def test_direct_invocation_handler_fires_subprocess(mosquitto_broker, tmp_
     receiver.register_handler(barrier)
 
     sender = AgentBus(agent_id="di-tx", broker=host, port=port, retain=False)
-    t = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.3)
+    t = await _start_listener(receiver)
 
     try:
         await sender.send(to="di-rx", subject="trigger", body="payload-on-stdin")
         await barrier.wait_for_message(timeout=3.0)
-        await asyncio.sleep(0.2)  # give subprocess time to flush
 
         text = out_file.read_text()
         assert "FROM=di-tx SUBJECT=trigger" in text
@@ -593,8 +778,7 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
     host, port = mosquitto_broker
 
     agent = AgentBus(agent_id="presence-tester", broker=host, port=port)
-    listen_task = asyncio.create_task(agent.listen())
-    await asyncio.sleep(0.3)  # let presence announce
+    listen_task = await _start_listener(agent)
 
     # Probe: subscribe to the presence topic and read the retained payload.
     async def _read_presence():
@@ -610,55 +794,61 @@ async def test_presence_lifecycle_online_then_offline(mosquitto_broker):
 
     online_payload = await _read_presence()
     assert online_payload is not None
-    assert online_payload.get("agent") == "presence-tester"
-    assert online_payload.get("status") == "online"
+    assert online_payload.get("agent_id") == "presence-tester"
+    assert online_payload.get("state") == "online"
 
-    # Graceful shutdown — exercises the close path, not LWT.
+    # Graceful shutdown -- exercises the close path, not LWT.
     await _stop(listen_task)
     await agent.disconnect()
-    await asyncio.sleep(0.2)
 
     offline_payload = await _read_presence()
     assert offline_payload is not None
-    assert offline_payload.get("agent") == "presence-tester"
-    assert offline_payload.get("status") == "offline"
+    assert offline_payload.get("agent_id") == "presence-tester"
+    assert offline_payload.get("state") == "offline"
 
-    await _clear_retained(host, port, ["agents/presence-tester/presence"])
+    await _clear_retained(
+        host,
+        port,
+        [
+            DEFAULT_TOPICS.registry("presence-tester"),
+            DEFAULT_TOPICS.presence("presence-tester"),
+        ],
+    )
 
 
 @pytest.mark.asyncio
-async def test_non_retained_message_lost_when_no_subscriber(mosquitto_broker):
+async def test_non_retained_message_lost_when_no_subscriber(
+    mosquitto_broker,
+    listening_agent,
+):
     """Documented invariant: directed messages default to retain=False,
     so sends that arrive while no subscriber is connected are dropped.
     This is the entire reason we recommend running a listener daemon.
 
-    If someone accidentally flips the default or the topic scheme, this
-    test catches it."""
+    The second send is the control. Zero received is also what a listener
+    that never subscribed, a send that silently failed, or a sender and
+    receiver disagreeing about the topic produce, so the absence above
+    only means anything once the same bus and the same handler have been
+    shown to deliver."""
     host, port = mosquitto_broker
 
     # Send to an agent with no listener running.
     sender = AgentBus(agent_id="lost-sender", broker=host, port=port, retain=False)
     await sender.send(to="lost-receiver", subject="lost", body="never seen")
-    await asyncio.sleep(0.2)  # let the publish complete
 
-    # Now start a listener — it must NOT see the prior message, because
-    # retain=False + no subscriber at send time = lost.
     handler = CollectingHandler()
-    receiver = AgentBus(agent_id="lost-receiver", broker=host, port=port, retain=False)
-    receiver.register_handler(handler)
+    await listening_agent("lost-receiver", handler)
 
-    listen_task = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.5)  # listen long enough for any late delivery
+    assert len(handler.received) == 0, (
+        f"Expected 0 messages for non-retained lost send, got "
+        f"{len(handler.received)}. This would mean the default retain "
+        f"semantics have changed, which is a breaking wire protocol change."
+    )
 
-    try:
-        assert len(handler.received) == 0, (
-            f"Expected 0 messages for non-retained lost send, got "
-            f"{len(handler.received)}. This would mean the default retain "
-            f"semantics have changed, which is a breaking wire protocol change."
-        )
-    finally:
-        await _stop(listen_task)
-        await _clear_retained(host, port, ["agents/lost-receiver/presence"])
+    await sender.send(to="lost-receiver", subject="live", body="arrives now")
+    await handler.wait_for_message(timeout=3.0)
+
+    assert [msg.subject for msg in handler.received] == ["live"]
 
 
 @pytest.mark.asyncio
@@ -676,10 +866,9 @@ async def test_send_receive_large_body_at_limit(mosquitto_broker):
 
     sender = AgentBus(agent_id="big-tx", broker=host, port=port, retain=False)
 
-    listen_task = asyncio.create_task(receiver.listen())
-    await asyncio.sleep(0.2)
+    listen_task = await _start_listener(receiver)
 
-    # Leave room for envelope overhead — body alone can be the full 64KB.
+    # Leave room for envelope overhead -- body alone can be the full 64KB.
     body = "x" * (64 * 1024)
 
     try:
@@ -694,8 +883,601 @@ async def test_send_receive_large_body_at_limit(mosquitto_broker):
 
 
 @pytest.mark.asyncio
+async def test_transient_registry_gc_removes_retained_state_on_real_broker(
+    mosquitto_broker,
+):
+    host, port = mosquitto_broker
+    topics = TopicMap(root="gc-acceptance")
+    now = datetime.now(timezone.utc)
+    registry = RegistryRecord(
+        agent_id="expired-worker",
+        lifecycle="transient",
+        durability="ephemeral",
+        started_at=now - timedelta(hours=1),
+        last_seen=now - timedelta(minutes=20),
+    )
+    presence = PresenceRecord(
+        agent_id="expired-worker",
+        state="offline",
+        reason="shutdown",
+    )
+    retained_topics = [
+        topics.registry("expired-worker"),
+        topics.presence("expired-worker"),
+    ]
+    await _clear_retained(host, port, retained_topics)
+
+    try:
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(
+                retained_topics[0],
+                registry.to_json(),
+                qos=1,
+                retain=True,
+            )
+            await client.publish(
+                retained_topics[1],
+                presence.to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            topics=topics,
+            snapshot_seconds=0.2,
+        )
+        report = await maintenance.gc_transient(
+            now=now,
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert report.deleted_agent_ids == ["expired-worker"]
+
+        async with aiomqtt.Client(host, port=port) as client:
+            for topic in retained_topics:
+                await client.subscribe(topic, qos=1)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    anext(client.messages),
+                    timeout=0.2,
+                )
+    finally:
+        await _clear_retained(host, port, retained_topics)
+
+
+@pytest.mark.asyncio
+async def test_transient_gc_stamps_then_collects_orphan_presence_on_real_broker(
+    mosquitto_broker,
+):
+    """A retained presence record with no registry record is collectable
+    only because GC stamps its first sighting: run one stamps, a run past
+    retention collects, and the run in between leaves the stamp alone."""
+    host, port = mosquitto_broker
+    topics = TopicMap(root="gc-orphan-acceptance")
+    agent_id = "orphan-worker"
+    presence_topic = topics.presence(agent_id)
+    now = datetime.now(timezone.utc)
+    presence = PresenceRecord(
+        agent_id=agent_id,
+        state="offline",
+        reason="shutdown",
+    )
+    await _clear_retained(host, port, [presence_topic])
+
+    try:
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(
+                presence_topic,
+                presence.to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            topics=topics,
+            snapshot_seconds=0.2,
+        )
+        first = await maintenance.gc_transient(
+            now=now,
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert first.orphan_stamped_agent_ids == [agent_id]
+        assert first.orphan_collected == 0
+        retained = await _read_retained(host, port, [presence_topic])
+        assert presence_topic in retained, _describe_retained(retained)
+        stamped = PresenceRecord.from_mqtt(
+            presence_topic,
+            retained[presence_topic],
+            topics=topics,
+        )
+        assert stamped.first_seen_offline is not None
+        assert stamped.reason == "shutdown"
+
+        second = await maintenance.gc_transient(
+            now=now + timedelta(seconds=60),
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert second.orphan_waiting == 1
+        assert second.orphan_stamped == 0
+        assert second.orphan_collected == 0
+        unchanged = await _read_retained(host, port, [presence_topic])
+        assert presence_topic in unchanged, _describe_retained(unchanged)
+        assert (
+            PresenceRecord.from_mqtt(
+                presence_topic,
+                unchanged[presence_topic],
+                topics=topics,
+            ).first_seen_offline
+            == stamped.first_seen_offline
+        )
+
+        third = await maintenance.gc_transient(
+            now=stamped.first_seen_offline + timedelta(seconds=301),
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert third.orphan_collected_agent_ids == [agent_id]
+        assert third.orphan_stamped == 0
+        collected = await _read_retained(host, port, [presence_topic])
+        assert presence_topic not in collected, _describe_retained(collected)
+    finally:
+        await _clear_retained(host, port, [presence_topic])
+
+
+@pytest.mark.asyncio
+async def test_registry_list_reports_orphan_wait_after_a_real_gc_stamp(
+    mosquitto_broker,
+):
+    """The stamp GC leaves on the broker is the only record of how long an
+    orphan has been waiting, so the listing has to read it back."""
+    host, port = mosquitto_broker
+    topics = TopicMap(root="orphan-list-acceptance")
+    agent_id = "listed-orphan"
+    presence_topic = topics.presence(agent_id)
+    now = datetime.now(timezone.utc)
+    await _clear_retained(host, port, [presence_topic])
+
+    try:
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(
+                presence_topic,
+                PresenceRecord(agent_id=agent_id, state="offline").to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            topics=topics,
+            snapshot_seconds=0.2,
+        )
+
+        before = await maintenance.list_registry(
+            now=now,
+            stale_after_seconds=60,
+        )
+
+        assert [orphan.agent_id for orphan in before.orphans] == [agent_id]
+        assert before.orphans[0].first_seen_offline is None
+        assert before.orphans[0].offline_age_seconds is None
+
+        stamped = await maintenance.gc_transient(
+            now=now,
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert stamped.orphan_stamped_agent_ids == [agent_id]
+
+        later = now + timedelta(seconds=120)
+        after = await maintenance.list_registry(
+            now=later,
+            stale_after_seconds=60,
+        )
+
+        assert [orphan.agent_id for orphan in after.orphans] == [agent_id]
+        orphan = after.orphans[0]
+        assert orphan.first_seen_offline is not None
+        assert orphan.offline_age_seconds > 0
+        assert orphan.offline_age_seconds == (
+            later - orphan.first_seen_offline
+        ).total_seconds()
+        # An orphan has no registry record, so it must not show up as one.
+        assert after.identities == []
+    finally:
+        await _clear_retained(host, port, [presence_topic])
+
+
+@pytest.mark.asyncio
+async def test_durable_session_queues_message_until_reconnect(
+    mosquitto_broker,
+):
+    """Confirm persistent persistent identities receive queued mail."""
+    host, port = mosquitto_broker
+    agent_id = "queued-session-control"
+    client_id = f"swarmbus-{agent_id}"
+    inbox_topic = DEFAULT_TOPICS.inbox(agent_id)
+
+    async with aiomqtt.Client(
+        host,
+        port=port,
+        identifier=client_id,
+        clean_session=True,
+    ):
+        pass
+
+    try:
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=False,
+        ) as client:
+            await client.subscribe(inbox_topic, qos=1)
+
+        async with aiomqtt.Client(host, port=port) as publisher:
+            await publisher.publish(
+                inbox_topic,
+                AgentMessage.create(
+                    from_="sender",
+                    to=agent_id,
+                    subject="queued",
+                    body="must survive the disconnect",
+                ).to_json(),
+                qos=1,
+                retain=False,
+            )
+
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=False,
+        ) as client:
+            delivered = await asyncio.wait_for(
+                anext(client.messages),
+                timeout=3.0,
+            )
+
+        replayed = AgentMessage.from_json(delivered.payload)
+        assert str(delivered.topic) == inbox_topic
+        assert replayed.subject == "queued"
+        assert replayed.body == "must survive the disconnect"
+    finally:
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=True,
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_transient_durable_shutdown_destroys_queued_session(
+    mosquitto_broker,
+    tmp_path,
+):
+    """Clean transient shutdown destroys queued persistent-session mail."""
+    host, port = mosquitto_broker
+    agent_id = "transient-persistent-exit"
+    client_id = f"swarmbus-{agent_id}"
+    inbox_topic = DEFAULT_TOPICS.inbox(agent_id)
+    runtime = ManagedMCPRuntime(
+        agent_id=agent_id,
+        broker=host,
+        port=port,
+        persistent=True,
+        presence=True,
+        lifecycle="transient",
+        state_path=tmp_path / "transient.sqlite3",
+    )
+
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+        await runtime.stop()
+
+        async with aiomqtt.Client(host, port=port) as publisher:
+            await publisher.publish(
+                inbox_topic,
+                AgentMessage.create(
+                    from_="sender",
+                    to=agent_id,
+                    subject="queued",
+                    body="must not outlive the erased identity",
+                ).to_json(),
+                qos=1,
+                retain=False,
+            )
+
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=False,
+        ) as client:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    anext(client.messages),
+                    timeout=0.5,
+                )
+    finally:
+        await runtime.stop()
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=True,
+        ):
+            pass
+        await _clear_retained(
+            host,
+            port,
+            [
+                DEFAULT_TOPICS.registry(agent_id),
+                DEFAULT_TOPICS.presence(agent_id),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_transient_nondurable_clean_stop_tombstones_presence(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A clean non-durable transient stop() leaves both retained topics
+    empty even though its Last Will stays armed to the end."""
+    host, port = mosquitto_broker
+    agent_id = "transient-ephemeral-exit"
+    presence_topic = DEFAULT_TOPICS.presence(agent_id)
+    registry_topic = DEFAULT_TOPICS.registry(agent_id)
+    await _clear_retained(host, port, [presence_topic, registry_topic])
+    runtime = ManagedMCPRuntime(
+        agent_id=agent_id,
+        broker=host,
+        port=port,
+        persistent=False,
+        presence=True,
+        lifecycle="transient",
+        state_path=tmp_path / "transient-ephemeral.sqlite3",
+    )
+
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+
+        online = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert json.loads(online[presence_topic])["state"] == "online"
+        assert json.loads(online[registry_topic])["lifecycle"] == "transient"
+
+        # Absence after shutdown only means something if a will was armed.
+        will = runtime._client_kwargs()["will"]
+        assert will.topic == presence_topic
+        assert json.loads(will.payload)["reason"] == "connection-lost"
+
+        await runtime.stop()
+
+        retained = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert retained == {}, (
+            "non-durable transient shutdown left retained state: "
+            f"{_describe_retained(retained)}"
+        )
+
+    finally:
+        await runtime.stop()
+        await _clear_retained(host, port, [presence_topic, registry_topic])
+
+
+@pytest.mark.asyncio
+async def test_transient_durable_clean_stop_tombstones_presence(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A clean durable transient stop() leaves no retained state.
+
+    Destroying the session reclaims the client id, which kicks the live
+    connection and makes the broker publish its will onto the presence
+    topic. Deferring the destroy until after that connection closes is
+    what keeps the tombstone; stripping the will from the reclaiming
+    client does not, because the will that fires belongs to the kicked
+    one.
+    """
+    host, port = mosquitto_broker
+    agent_id = "transient-durable-presence"
+    client_id = f"swarmbus-{agent_id}"
+    presence_topic = DEFAULT_TOPICS.presence(agent_id)
+    registry_topic = DEFAULT_TOPICS.registry(agent_id)
+    await _clear_retained(host, port, [presence_topic, registry_topic])
+    runtime = ManagedMCPRuntime(
+        agent_id=agent_id,
+        broker=host,
+        port=port,
+        persistent=True,
+        presence=True,
+        lifecycle="transient",
+        state_path=tmp_path / "transient-durable.sqlite3",
+    )
+
+    try:
+        await runtime.start()
+        await runtime.wait_until_ready()
+
+        online = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+        assert json.loads(online[presence_topic])["state"] == "online"
+        assert json.loads(online[registry_topic])["durability"] == "durable"
+
+        await runtime.stop()
+
+        retained = await _read_retained(
+            host,
+            port,
+            [presence_topic, registry_topic],
+        )
+
+        assert retained == {}, (
+            "transient durable shutdown left retained state instead of "
+            f"tombstones: {_describe_retained(retained)}"
+        )
+    finally:
+        await runtime.stop()
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=True,
+        ):
+            pass
+        await _clear_retained(host, port, [presence_topic, registry_topic])
+
+
+@pytest.mark.asyncio
+async def test_registry_forget_destroys_queued_durable_session(
+    mosquitto_broker,
+):
+    """The absence here is only meaningful against the control above,
+    which proves this broker queues QoS1 mail for an offline session."""
+    host, port = mosquitto_broker
+    agent_id = "retired-session-acceptance"
+    client_id = f"swarmbus-{agent_id}"
+    inbox_topic = DEFAULT_TOPICS.inbox(agent_id)
+
+    async with aiomqtt.Client(
+        host,
+        port=port,
+        identifier=client_id,
+        clean_session=True,
+    ):
+        pass
+
+    try:
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=False,
+        ) as client:
+            await client.subscribe(inbox_topic, qos=1)
+
+        async with aiomqtt.Client(host, port=port) as publisher:
+            await publisher.publish(
+                inbox_topic,
+                AgentMessage.create(
+                    from_="sender",
+                    to=agent_id,
+                    subject="queued",
+                    body="must be destroyed with retired session",
+                ).to_json(),
+                qos=1,
+                retain=False,
+            )
+            # Supply offline evidence so forget uses the normal interlock path.
+            await publisher.publish(
+                DEFAULT_TOPICS.presence(agent_id),
+                PresenceRecord(agent_id=agent_id, state="offline").to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            snapshot_seconds=0.2,
+        )
+        report = await maintenance.forget(agent_id)
+
+        assert report.session_destroyed is True
+        assert report.deleted is True
+
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=False,
+        ) as client:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    anext(client.messages),
+                    timeout=0.2,
+                )
+    finally:
+        async with aiomqtt.Client(
+            host,
+            port=port,
+            identifier=client_id,
+            clean_session=True,
+        ):
+            pass
+        await _clear_retained(
+            host,
+            port,
+            [
+                DEFAULT_TOPICS.registry(agent_id),
+                DEFAULT_TOPICS.presence(agent_id),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_forget_is_idempotent_for_absent_identity(
+    mosquitto_broker,
+):
+    host, port = mosquitto_broker
+    agent_id = "already-retired-session"
+    await _clear_retained(
+        host,
+        port,
+        [
+            DEFAULT_TOPICS.registry(agent_id),
+            DEFAULT_TOPICS.presence(agent_id),
+        ],
+    )
+    maintenance = RegistryMaintenance(
+        broker=host,
+        port=port,
+        snapshot_seconds=0.05,
+    )
+
+    report = await maintenance.forget(agent_id)
+
+    assert report.already_absent is True
+    assert report.rechecked is True
+    assert report.refused is False
+    assert report.deleted is False
+    assert report.session_destroyed is False
+
+
+@pytest.mark.asyncio
 async def test_mcp_tools_expose_expected_signatures(tmp_path):
-    """MCP tool signatures are a public contract — anything consuming
+    """MCP tool signatures are a public contract -- anything consuming
     swarmbus via MCP (Claude Code sidecar, Cursor, custom clients) breaks
     if a tool name or parameter name changes. Assert the full tool shape."""
     assert list(inspect.signature(create_mcp_app).parameters) == ["runtime"]
@@ -709,7 +1491,7 @@ async def test_mcp_tools_expose_expected_signatures(tmp_path):
     expected = {
         "send_message",
         "read_inbox",
-        "list_agents",
+        "agent_state",
     }
     assert set(app._tool_fns.keys()) == expected
 
@@ -727,8 +1509,16 @@ async def test_mcp_tools_expose_expected_signatures(tmp_path):
     assert read_sig.parameters["max_messages"].default == 10
     assert read_sig.parameters["wait_seconds"].default == 0.0
 
-    list_sig = inspect.signature(app._tool_fns["list_agents"])
-    assert len(list_sig.parameters) == 0
+    state_sig = inspect.signature(app._tool_fns["agent_state"])
+    assert list(state_sig.parameters) == [
+        "action",
+        "agent_id",
+        "status",
+        "working_set",
+        "capabilities",
+        "include_offline",
+        "lifecycle",
+    ]
 
 
 def _watch_persistent(host, port, agent_id, *extra):
@@ -921,10 +1711,12 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
     store = SQLiteMessageStore(tmp_path / "state" / "pd-hold.sqlite3", hop_limit=4)
     real_admit = store.admit
     failures = []
+    failure_seen = asyncio.Event()
 
     async def fail_once(msg, *, source_topic):
         if not failures:
             failures.append(msg.id)
+            failure_seen.set()
             raise OSError("disk I/O error")
         return await real_admit(msg, source_topic=source_topic)
 
@@ -934,11 +1726,20 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
         agent_id="pd-hold", broker=host, port=port, persistent=True, hold_store=store,
     )
     receiver.register_handler(handler)
+
+    async with aiomqtt.Client(
+        host,
+        port=port,
+        identifier="swarmbus-pd-hold",
+        clean_session=False,
+    ) as client:
+        await client.subscribe(receiver.topics.inbox(receiver.agent_id), qos=1)
+
+    sender = AgentBus(agent_id="pd-sender", broker=host, port=port)
+    await sender.send(to="pd-hold", subject="survives", body="b")
     task = asyncio.create_task(receiver.listen(reconnect_initial=0.05))
     try:
-        await asyncio.sleep(0.3)
-        sender = AgentBus(agent_id="pd-sender", broker=host, port=port)
-        await sender.send(to="pd-hold", subject="survives", body="b")
+        await asyncio.wait_for(failure_seen.wait(), timeout=5.0)
         await handler.wait_for_message(timeout=5.0)
         assert [m.subject for m in handler.received] == ["survives"]
         assert failures == [handler.received[0].id]
@@ -950,6 +1751,16 @@ async def test_persistent_daemon_redelivers_after_hold_check_failure(mosquitto_b
             pass
         await _clear_retained(host, port, ["agents/pd-hold/presence"])
 
+def test_list_agents_tool_is_gone(tmp_path):
+    """The MCP surface exposes agent_state instead of list_agents."""
+    runtime = ManagedMCPRuntime(
+        agent_id="gone-check",
+        state_path=tmp_path / "gone-check.sqlite3",
+    )
+
+    assert "list_agents" not in create_mcp_app(runtime)._tool_fns
+    assert inspect.iscoroutinefunction(runtime.list_agents)
+    assert inspect.iscoroutinefunction(AgentBus.probe().list_agents)
 
 def test_read_holds_retained_message_past_hop_limit_and_records_admitted_one(
     mosquitto_broker, tmp_path,

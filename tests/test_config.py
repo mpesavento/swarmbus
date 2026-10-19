@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 from click.testing import CliRunner
 
 from swarmbus.cli import main
+from swarmbus.maintenance import RegistryListReport
 
 SEND = ["send", "--to", "wren", "--subject", "x", "--body", "y"]
 
@@ -61,6 +62,36 @@ id = sparrow
     result, bus = _send(SEND, env={"SWARMBUS_CONFIG": str(cfg)})
     assert result.exit_code == 0, result.output
     assert bus.call_args.kwargs["broker"] == "cfg.example"
+
+
+def test_config_reaches_registry_commands(tmp_path):
+    cfg = _write(tmp_path / "registry.ini", """
+[broker]
+host = maintenance.example
+port = 2883
+username = maintenance
+password = secret
+tls = yes
+""")
+    report = RegistryListReport(scanned=0)
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
+        maintenance.return_value.list_registry = AsyncMock(return_value=report)
+        result = CliRunner().invoke(
+            main, ["--config", str(cfg), "registry-list"]
+        )
+
+    assert result.exit_code == 0, result.output
+    assert maintenance.call_args.kwargs == {
+        "broker": "maintenance.example",
+        "port": 2883,
+        "username": "maintenance",
+        "password": "secret",
+        "tls": True,
+        "ca_cert": None,
+        "client_cert": None,
+        "client_key": None,
+        "snapshot_seconds": 0.5,
+    }
 
 
 def test_config_values_convert_by_type(tmp_path):

@@ -84,16 +84,39 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - **Explicit application acknowledgement without extra tools** — `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` first acknowledges the prior handled batch, then reads or waits for pending rows. `max_messages=0` is acknowledgement-only. Unacknowledged reads lost to a crash or transcript timeout redeliver the same stable IDs.
 - Managed inbox state uses private `0700` directories and `0600` database files, rejects unsafe existing permissions, quarantines malformed stored rows, and reports fatal runtime/schema failures through MCP.
 - Inbox schema versions are component-scoped. Existing `SQLiteArchive.messages` schemas and `INSERT OR REPLACE` behavior remain unchanged, and archive history is not imported or replayed automatically.
-- `swarmbus watch` gains `--persistent / --no-persistent` (default off). When on, the broker queues QoS1 messages for the agent id while no watch is connected and each run prints the oldest queued one. The first run only registers the session. `AgentBus.watch_inbox` acknowledges by hand in persistent mode, so messages delivered beyond the one returned are redelivered to the next run instead of being dropped.
+- `swarmbus watch` gains `--persistent / --no-persistent` (default off). When on, the broker queues QoS1 messages for the agent id while no watch is connected and each run prints the oldest queued one. The first run registers the session. Persistent watches publish a retained named registry record plus online/offline presence. `AgentBus.watch_inbox` acknowledges by hand in persistent mode, so messages delivered beyond the one returned are redelivered to the next run instead of being dropped.
+- **Retained agent registry** — presence-enabled MCP sidecars and persistent watches publish lifecycle, durability, status, capabilities, and heartbeat state. `agent_state` reads or updates the directory.
+- **Registry maintenance commands** — `registry-list` inspects retained identities and reports presence-only orphans; `registry-gc` collects expired transient identities in bounded batches; `registry-forget` explicitly retires one identity. The destructive commands support dry runs, recheck online state before deletion, and audit their operations. `registry-forget` also accepts `--snapshot-seconds`.
+
+### Changed
+- **Messaging-only without `--presence`** — presence-free sidecars no longer subscribe to directory topics. `agent_state` raises `PresenceRequiredError`; send and inbox tools are unaffected.
+- `--persistent` on the MCP sidecar requires `--presence`; defaults are unchanged.
+- Registry lifecycle values are `named` and `transient`. `--lifecycle transient` requires `--presence`. Clean transient shutdown tombstones presence before registry state and destroys any persistent MQTT session.
+- A refused `registry-forget` now exits non-zero after printing its report. Interactive use prompts for confirmation; `--yes` bypasses the prompt.
+- Persistent receivers publish the same registry/presence lease and renew `last_seen`; persistent sessions always use the canonical `swarmbus-<agent-id>` MQTT client ID, which maintenance derives from validated identity.
 
 ### Fixed
 - Docs and the MCP missing-extra hint name the PyPI distribution `swarmbus-py[mcp]`; the `using-swarmbus` skill no longer passes `reply_to=` to the MCP `send_message` tool (which has no such parameter) and replies to `from` when `reply_to` is null; the README says `swarmbus read` returns retained messages only and states which MCP errors return an empty list. (#23)
+- `agent_state(action="list"|"get")` now raises `TransportUnavailable` while disconnected instead of serving stale or empty directory results.
+- Registry GC preserves partial reports across broker failures, accounts for skipped and malformed records consistently, and destroys persistent sessions only with positive offline evidence. A stale online heartbeat is unconfirmed, not offline, and neither GC nor `registry-forget` mutates it.
+- Registry state updates commit locally only after the broker accepts the candidate record. Cleanup failures no longer replace an active connection error or external cancellation; the Python 3.10 timeout backport now distinguishes its own deadline from caller cancellation.
+- **Presence-only orphans are collectable.** A retained presence record with no registry record has no `last_seen` to age against, so `registry-gc` now stamps `first_seen_offline` onto the payload as retained the first time it sees one offline, ages from that stamp on later runs, and tombstones it past retention. The stamp is written once and never rewritten — rewriting it would reset the clock every run and the record could never age out. Records that say `online` are never written to, every write is decided on a re-read to avoid clobbering an agent that just reconnected, and the report breaks the old single `orphan_presence` count out into `orphan_stamped`, `orphan_waiting`, `orphan_collected`, `orphan_online`, `orphan_would_stamp`, `orphan_would_collect`, `orphan_skipped`, `orphan_failed`, and `orphan_deferred` (which sum to `orphan_presence`).
+- **`registry-list` shows how long an orphan has been waiting.** A new `orphans` list reports each presence-only record's `agent_id`, `presence_state`, `first_seen_offline` stamp (null until GC writes one) and the derived `offline_age_seconds`, so the wait no longer has to be read off the MQTT topic by hand. Orphans stay out of `identities` because they have no registry record to describe. `orphan_presence_agent_ids` is unchanged.
+- Orphan presence writes catch transport faults by name (`aiomqtt.MqttError`, `OSError` subclasses for socket/DNS/TLS, and `asyncio.TimeoutError`, which is not an `OSError` on 3.10) instead of every exception. A failed write is still reported as `orphan_failed`/`orphan_skipped` and the sweep continues to the next orphan; cancellation propagates.
+- `AgentBus.list_agents` derives identity from the broker-authorized presence topic rather than trusting the payload claim.
+
+### Removed
+- **The `list_agents` MCP tool.** Use `agent_state(action="list")` and read each record's `agent_id`. The `swarmbus list` CLI and internal `AgentBus.list_agents` remain.
+
+### Security
+- Presence payload identity claims no longer carry authority; mismatches are logged and attributed to the topic owner.
+- Registry-owned status, working-set, and capability text is sanitized at ingestion, and registry-derived `agent_state` rows are explicitly marked `untrusted`.
 
 ### Wire-compat
-1. **Envelope shape — no change.**
+1. **Envelope shape — no change.** Retained presence payloads gain one optional key, `first_seen_offline`, written only by `registry-gc`. Registry readers continue to ignore unknown keys.
 2. **Topic layout — no change.**
-3. **Retain/QoS defaults — no change.** The MCP server remains non-persistent by default; the managed runtime changes acknowledgement timing, not publish or subscribe defaults. `swarmbus watch` is still ephemeral by default; `--persistent` opts in to the `swarmbus-<id>` session with `clean_session=False`; subscription QoS stays 1; in that mode `watch` acknowledges only the message it prints (and any malformed payload it skips).
-4. **MCP tool contract — breaking consolidation.** The separate `watch_inbox` tool is replaced by `read_inbox(wait_seconds=...)`; `read_inbox` also gains optional `ack_ids` and `max_messages` parameters while preserving its no-argument behavior and list response. Acknowledge handled IDs on the next read, or use `max_messages=0` for an acknowledgement-only call. Restart the MCP sidecar and update its behavioral skill together. Existing archive rows remain archive-only.
+3. **Retain/QoS defaults.** The MCP server remains non-persistent by default. Inbox and broadcast subscriptions stay at QoS 1; presence-enabled MCP directory subscriptions use QoS 0, clear their cache on reconnect, and wait for a bounded retained snapshot before reads. `swarmbus watch` is still ephemeral by default; `--persistent` opts in to the `swarmbus-<id>` session with `clean_session=False`; its inbox subscription stays QoS 1, and it acknowledges only the message it prints (and any malformed payload it skips).
+4. **MCP tool contract — breaking consolidation.** The separate `watch_inbox` tool is replaced by `read_inbox(wait_seconds=...)`; `read_inbox` also gains optional `ack_ids` and `max_messages` parameters while preserving its no-argument behavior and list response. `list_agents` is replaced by `agent_state(action="list")`, which requires a presence-enabled, connected sidecar; registry-derived rows add `untrusted` and presence-evidence fields. Acknowledge handled IDs on the next read, or use `max_messages=0` for an acknowledgement-only call. Restart the MCP sidecar and update its behavioral skill together. Existing archive rows remain archive-only.
 
 ---
 
@@ -117,7 +140,6 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 - `scripts/setup-openclaw-plugin.sh` — install the `using-swarmbus` skill into `~/.openclaw/skills/` and print byobu/systemd-user startup hints.
 - `docs/cross-machine-tailscale.md` — full walkthrough for Tailscale-based multi-host deployments (topology, verification, security model, failure modes, 7-item preflight).
 - `docs/notification-patterns.md` — 4-tier notification protocol (archive always, narrate when mid-chat, push on priority=high, silent otherwise) with per-agent-system recipes.
-- `docs/post-ship-backlog.md` — living ledger of gaps / drift / follow-ups found after initial deployment. (Removed 2026-10-16; its open items live in GitHub issues.)
 
 ### Changed
 - **[breaking for pre-this-release daemons]** `AgentMessage.priority` is now a bare `str`, not `Literal["normal", "urgent"]`. Unknown values pass through rather than raising a pydantic `ValidationError`. See Wire-compat below.
