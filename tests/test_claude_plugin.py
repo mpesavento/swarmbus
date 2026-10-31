@@ -21,8 +21,18 @@ def test_marketplace_lists_the_plugin_under_its_manifest_name():
     manifest = _json(MANIFEST)
     [entry] = market["plugins"]
     assert entry["name"] == manifest["name"] == "swarmbus"
-    assert (ROOT / entry["source"]).resolve() == PLUGIN_DIR
     assert "version" not in entry  # plugin.json carries it; both would conflict
+
+
+def test_marketplace_serves_the_plugin_from_main():
+    # The catalog is read from the default branch (dev, the working branch);
+    # the ref keeps users on released code.
+    [entry] = _json(MARKETPLACE)["plugins"]
+    source = entry["source"]
+    assert source["source"] == "git-subdir"
+    assert source["url"] == "https://github.com/mpesavento/swarmbus.git"
+    assert source["ref"] == "main"
+    assert (ROOT / source["path"]).resolve() == PLUGIN_DIR
 
 
 def test_plugin_version_matches_the_package():

@@ -8,7 +8,12 @@
   "plugins": [
     {
       "name": "swarmbus",
-      "source": "./plugins/swarmbus",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mpesavento/swarmbus.git",
+        "path": "plugins/swarmbus",
+        "ref": "main"
+      },
       "description": "Message other agents over swarmbus: the MCP sidecar (send_message, read_inbox, list_agents) and the using-swarmbus skill"
     }
   ]
