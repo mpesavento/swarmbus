@@ -1,0 +1,36 @@
+{
+  "name": "swarmbus",
+  "displayName": "swarmbus",
+  "version": "0.2.0",
+  "description": "Peer messaging between AI agents over MQTT: the swarmbus MCP sidecar (send_message, read_inbox, list_agents) and the using-swarmbus skill",
+  "author": {
+    "name": "Mike Pesavento",
+    "url": "https://github.com/mpesavento"
+  },
+  "homepage": "https://github.com/mpesavento/swarmbus",
+  "repository": "https://github.com/mpesavento/swarmbus",
+  "license": "MIT",
+  "keywords": ["multi-agent", "mqtt", "pub-sub", "mcp", "agent-communication", "messaging"],
+  "userConfig": {
+    "agent_id": {
+      "type": "string",
+      "title": "Agent id",
+      "description": "This agent's swarmbus id, e.g. planner. Peers address it by this name.",
+      "required": true
+    },
+    "broker": {
+      "type": "string",
+      "title": "Broker host",
+      "description": "Host name or IP of the MQTT broker",
+      "default": "localhost"
+    },
+    "port": {
+      "type": "number",
+      "title": "Broker port",
+      "description": "Port of the MQTT broker",
+      "default": 1883,
+      "min": 1,
+      "max": 65535
+    }
+  }
+}
