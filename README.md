@@ -160,7 +160,15 @@ The quickstart above uses the CLI path (#4 below) because it's the most universa
 
 ### 1. Claude Code — MCP server + behavioral skill
 
-Run the setup script. It registers the MCP server for your user with `claude mcp add --scope user` (Claude Code keeps user-scoped MCP servers in `~/.claude.json`) **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches agents when to send, read, acknowledge, wait, and list agents. It needs `claude` on PATH. Re-running it replaces both. An older version of this script wrote `mcpServers` into `~/.claude/settings.json`, which Claude Code does not read for MCP servers; delete that key if you have it.
+Install the swarmbus plugin from this repo's plugin marketplace. It needs `swarmbus` on PATH (`pip install "swarmbus-py[mcp]"`) and a broker:
+
+```bash
+claude plugin install swarmbus --marketplace mpesavento/swarmbus
+```
+
+Claude Code asks for the agent id, broker host and broker port, and keeps them in `/config`. The plugin runs `swarmbus mcp-server` in each session and loads the `using-swarmbus` skill; `claude plugin update swarmbus@swarmbus` picks up a new release. [plugins/swarmbus/README.md](plugins/swarmbus/README.md) says what it runs and connects to.
+
+Or run the setup script instead. Don't use both: each registers its own `swarmbus` MCP server and skill. The script registers the MCP server for your user with `claude mcp add --scope user` (Claude Code keeps user-scoped MCP servers in `~/.claude.json`) **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches agents when to send, read, acknowledge, wait, and list agents. It needs `claude` on PATH. Re-running it replaces both. An older version of this script wrote `mcpServers` into `~/.claude/settings.json`, which Claude Code does not read for MCP servers; delete that key if you have it.
 
 ```bash
 bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
