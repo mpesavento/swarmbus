@@ -49,10 +49,10 @@ def test_docs_describe_rate_limit_broadcast_rule_send_exit_3_and_hop_limit_8():
     assert "exits 3" in skill and "Do not retry with `--force`" in skill
     assert "20 messages a minute" in skill
 
-    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    assert "default 8" in unreleased and "default 4" not in unreleased
-    assert "**Per-sender rate limit at every listener**" in unreleased
-    assert "never trips its sender" in unreleased
-    assert "exits 3" in unreleased
-    assert "`cooling` list" in unreleased
-    assert unreleased.count("### Wire-compat") == 1
+    release = changelog.split("## [0.2.1]", 1)[1].split("\n## [", 1)[0]
+    assert "default 8" in release and "default 4" not in release
+    assert "**Per-sender rate limit at every listener**" in release
+    assert "never trips its sender" in release
+    assert "exits 3" in release
+    assert "`cooling` list" in release
+    assert release.count("### Wire-compat") == 1

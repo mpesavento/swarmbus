@@ -49,6 +49,6 @@ def test_readme_and_skill_link_the_memetic_safety_doc():
     assert "blob/main/docs/memetic-safety.md" in skill
     assert "source: agent:" in skill
 
-    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    assert "`docs/memetic-safety.md`" in unreleased
-    assert unreleased.count("### Wire-compat") == 1
+    release = changelog.split("## [0.2.1]", 1)[1].split("\n## [", 1)[0]
+    assert "`docs/memetic-safety.md`" in release
+    assert release.count("### Wire-compat") == 1

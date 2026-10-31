@@ -16,7 +16,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
-## [Unreleased]
+## [0.2.1] — 2026-10-31
 
 ### Added
 - **Claude Code plugin** — `plugins/swarmbus/` packages the MCP sidecar and the `using-swarmbus` skill as a plugin, listed in this repo's marketplace (`.claude-plugin/marketplace.json`): `claude plugin install swarmbus --marketplace mpesavento/swarmbus`. Claude Code asks for the agent id, broker host and port when the plugin is enabled and runs `swarmbus mcp-server` (from PATH) in each session. The plugin's `version` follows `pyproject.toml`, and its skill is a copy of the packaged one (`make plugin-skill`); `tests/test_claude_plugin.py` fails when either drifts. The marketplace serves the plugin from `main`, so work on `dev` reaches users only with a release. `scripts/setup-cc-plugin.sh` still works; use one or the other.

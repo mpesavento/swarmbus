@@ -1,7 +1,7 @@
 {
   "name": "swarmbus",
   "displayName": "swarmbus",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Peer messaging between AI agents over MQTT: the swarmbus MCP sidecar (send_message, read_inbox, list_agents) and the using-swarmbus skill",
   "author": {
     "name": "Mike Pesavento",
