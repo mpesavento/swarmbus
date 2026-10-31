@@ -98,6 +98,87 @@ Re-running `init` without auth flags **does not** delete an existing drop-in —
 
 ---
 
+## One login per agent on a single box
+
+On one host every agent talks to the same broker on `127.0.0.1`. With anonymous access, any local process can read every agent's inbox and publish as any agent. Give each agent id its own mosquitto login and let the broker limit what that login can do.
+
+### Password file
+
+Use `mosquitto_passwd`. The username is exactly the agent id. `-c` creates the file and overwrites any existing one, so use it for the first agent only.
+
+```bash
+sudo mosquitto_passwd -c /etc/mosquitto/swarmbus.passwd planner   # first agent only: -c overwrites
+sudo mosquitto_passwd /etc/mosquitto/swarmbus.passwd coder        # each further agent
+```
+
+### ACL file
+
+```
+# /etc/mosquitto/swarmbus.acl
+# Every login: read its own inbox; publish and read its own presence.
+# %u is the MQTT username, which must equal the agent id.
+pattern read agents/%u/inbox
+pattern readwrite agents/%u/presence
+
+# One block per agent id: send to any inbox, see every agent's
+# presence, send and receive broadcasts.
+user planner
+topic write agents/+/inbox
+topic read agents/+/presence
+topic readwrite agents/broadcast
+
+user coder
+topic write agents/+/inbox
+topic read agents/+/presence
+topic readwrite agents/broadcast
+```
+
+- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
+- **Shared rules sit under `user`.** In an acl_file, `topic` lines before the first `user` line apply only to anonymous clients. mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`. So the rules every agent shares are repeated in one `user` block per agent id. Add a block when you add an agent.
+
+### Broker config
+
+```
+# /etc/mosquitto/conf.d/swarmbus-auth.conf
+listener 1883 127.0.0.1
+allow_anonymous false
+password_file /etc/mosquitto/swarmbus.passwd
+acl_file /etc/mosquitto/swarmbus.acl
+```
+
+```bash
+sudo chown mosquitto:mosquitto /etc/mosquitto/swarmbus.passwd /etc/mosquitto/swarmbus.acl
+sudo chmod 0700 /etc/mosquitto/swarmbus.passwd /etc/mosquitto/swarmbus.acl
+sudo systemctl restart mosquitto
+```
+
+mosquitto 2.x warns about a password or ACL file it does not own or that others can read, and says future versions will refuse such files.
+
+- Omit the `listener` line if the config already declares `listener 1883 127.0.0.1`; a duplicate fails.
+- `allow_anonymous` is one global setting. If `scripts/setup-mosquitto.sh --tailscale` or `--tailscale-only` was run, `/etc/mosquitto/conf.d/tailscale.conf` sets `allow_anonymous true`. Delete that line, or the result depends on which file mosquitto reads last. Agents on other machines that connect over the tailnet then need a login too.
+- On macOS with Homebrew the files live under `/opt/homebrew/etc/mosquitto/`, and mosquitto runs as your user.
+
+### Giving each swarmbus surface its login
+
+| Surface | How it gets the login |
+|---|---|
+| `swarmbus start` (the daemon) | `Environment=SWARMBUS_BROKER_USERNAME=<id>` and `SWARMBUS_BROKER_PASSWORD=…` in the unit (see "systemd unit example" above), or `swarmbus init --username <id> --password …`, which writes the `auth.conf` drop-in. |
+| the `--invoke` wake command | `DirectInvocationHandler.handle` (`src/swarmbus/handlers/direct_invoke.py`) runs the command with the daemon's environment. With `examples/claude-code-wake.sh` the woken `claude` session inherits it, so a `swarmbus send` from that session uses the daemon's login with no extra setup. With `examples/openclaw-wake.sh` on its default bridge path, the agent turn runs inside the OpenClaw gateway, which does not inherit the wake's environment: a `swarmbus send` from the OpenClaw agent uses the gateway's environment, so set `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD` there. |
+| `swarmbus send`, `read`, `watch` | `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`, or `--username` / `--password`. The username must equal `--agent-id`. Prefer the env vars, because flags show in `ps`. |
+| `swarmbus mcp-server` | The same two env vars in the MCP host's `env` block for the server, or the flags in its `args`. |
+| `swarmbus list`, `swarmbus doctor` | Any agent's login. They only read presence. |
+| any `swarmbus` command, from the config file | The config file (`~/.swarmbus/config.ini`, `--config`, `SWARMBUS_CONFIG`) can hold `[broker] username` and `[broker] password`, below the flags and env vars. `[broker] password` is accepted only in a file with mode 0600 (or 0400): the CLI exits 2 when group or others can read the file. Prefer `SWARMBUS_BROKER_PASSWORD`. See [configuration.md](configuration.md). |
+
+### What this does not stop
+
+- **Writing into another agent's inbox.** Every login may publish to `agents/+/inbox`, because that is how `send` works. What the ACL stops is a process with no login connecting at all, an agent reading another agent's inbox, and an agent publishing another agent's presence.
+- **Lying in `from`.** The broker checks topics, not message bodies. A process holding the `coder` login can still send an envelope with `"from": "planner"` and it is delivered. A swarmbus-side check that `from` matches the login is planned separately. A spoofed `from` on a receiver's inbox topic can trip that sender there or start its cool-down; `--on-trip` tells a person when it happens, and alerts are capped (one per trip, 64 queued).
+- **Floods.** Any login can publish as fast as it likes, including to `agents/broadcast`. See "Broker limits" in the README and [#26](https://github.com/mpesavento/swarmbus/issues/26).
+- **Anyone who can read the credentials.** That means the unit file, the drop-in, the MCP host config, or root on the box. Passwords cross loopback in plain text; add TLS (above) if the broker listens anywhere but `127.0.0.1`.
+- **Silent denials.** mosquitto drops a denied publish without telling the client, so `swarmbus send` still prints `Sent to …`. A login that does not match `--agent-id` connects without error but never receives anything, and its presence never shows in `swarmbus list`.
+
+---
+
 ## Common failure modes
 
 | Symptom                                        | Probable cause                                                                                              |
@@ -106,5 +187,6 @@ Re-running `init` without auth flags **does not** delete an existing drop-in —
 | `ssl.SSLCertVerificationError: …unable to get local issuer certificate` | `--ca-cert` not set and the broker cert isn't in the system trust store. Pass `--ca-cert` or install the CA. |
 | `ssl.SSLCertVerificationError: …Hostname mismatch`  | Broker cert's CN/SAN doesn't match the hostname you're connecting to. Re-issue with the right SAN.           |
 | Connect succeeds, all SUBSCRIBE return SUBACK, no messages arrive | Mosquitto 2.1+ grants SUBACK at the protocol level; ACLs filter at message **delivery**. Check the broker ACL file. |
+| Connects without error, but `read`/`watch` never receive anything, or the agent is missing from `swarmbus list` | The broker login is not the agent id, so the ACL drops its deliveries and its presence publishes without telling the client. Use the agent id as the username. |
 | `swarmbus start` exits immediately with `ValueError: client_cert and client_key must be set together` | mTLS half-configured. Either set both or set neither.                                                       |
-| Broker rate-limits / drops your connection     | Out of scope of swarmbus today. Tracked separately from issue #7. Configure broker-side limits.             |
+| Broker rate-limits / drops your connection     | Out of scope of swarmbus today; tracked in #26. See "Broker limits" in the README for the queue and size caps mosquitto does have. |

@@ -2,11 +2,12 @@ import asyncio
 import json
 import logging
 import sqlite3
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import aiomqtt
 import pytest
 
+from swarmbus.archive import MessageConflictError
 from swarmbus.message import AgentMessage
 from swarmbus.runtime import (
     AcknowledgementError,
@@ -143,8 +144,15 @@ async def test_inbox_commit_happens_before_qos1_ack():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [OSError("disk full"), sqlite3.OperationalError("locked")])
-async def test_store_failure_leaves_message_unacked(error):
+@pytest.mark.parametrize(
+    ("error_type", "text"), [(OSError, "disk full"), (sqlite3.OperationalError, "locked")]
+)
+async def test_store_failure_leaves_message_unacked(error_type, text):
+    # Build the error here, not in parametrize: a collection-time instance keeps its
+    # __traceback__ (frames, AgentMessage, pydantic TzInfo) alive until interpreter
+    # shutdown, and pydantic_core segfaults freeing it then on 3.12.
+    error = error_type(text)
+
     class _BrokenStore(_FakeStore):
         async def store(self, msg, *, source_topic):
             raise error
@@ -625,3 +633,286 @@ def test_presence_controls_last_will():
     will = with_presence._client_kwargs()["will"]
     assert str(will.topic) == "agents/foo/presence"
     assert json.loads(will.payload)["status"] == "offline"
+
+
+@pytest.mark.asyncio
+async def test_runtime_holds_message_past_hop_limit_and_acks_it(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", hop_limit=2,
+    )
+    assert runtime.store.hop_limit == 2
+    await runtime.store.open()
+    ack = _RecordingAck()
+    over = AgentMessage.create(from_="wren", to="foo", subject="over", body="b", hops=3)
+
+    await runtime._handle_message(_FakeMqttMessage(over), ack)
+
+    assert len(ack.messages) == 1
+    assert await runtime.store.read() == []
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert default.store.hop_limit == 8
+
+
+def _conflicting_pair():
+    original = _message()
+    reused = original.model_copy(update={"subject": "not the same envelope"})
+    return original, reused
+
+
+@pytest.mark.asyncio
+async def test_reused_message_id_is_recorded_acked_and_not_fatal(tmp_path, caplog):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    await runtime.store.open()
+    ack = _RecordingAck()
+    original, reused = _conflicting_pair()
+
+    await runtime._handle_message(_FakeMqttMessage(original), ack)
+    with caplog.at_level(logging.WARNING, logger="swarmbus.runtime"):
+        await runtime._handle_message(_FakeMqttMessage(reused), ack)
+
+    assert len(ack.messages) == 2
+    assert runtime.state is RuntimeState.CONNECTED
+    assert runtime.last_fatal_error is None
+    assert runtime.last_store_error is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert original.id in warnings[0].getMessage()
+    assert "different envelope" in warnings[0].getMessage()
+    assert [m["subject"] for m in await runtime.store.read()] == [original.subject]
+    conflicts = await runtime.store.list_conflicts()
+    assert [(c["id"], c["from"], c["subject"]) for c in conflicts] == [
+        (original.id, "wren", reused.subject),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reused_message_id_does_not_stop_persistent_receiver(tmp_path, monkeypatch):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", persistent=True,
+    )
+    await runtime.store.open()
+    original, reused = _conflicting_pair()
+    observed_states = []
+
+    class _Messages:
+        def __init__(self, messages):
+            self._messages = iter(messages)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._messages)
+            except StopIteration:
+                observed_states.append(runtime.state)
+                runtime._stopping.set()
+                raise StopAsyncIteration
+
+    class _LoopClient:
+        def __init__(self):
+            self._client = _FakePaho()
+            self.messages = _Messages(
+                [_FakeMqttMessage(original), _FakeMqttMessage(reused)]
+            )
+            self.subscribe = AsyncMock()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    client = _LoopClient()
+    monkeypatch.setattr(
+        "swarmbus.runtime.aiomqtt.Client",
+        lambda *args, **kwargs: client,
+    )
+    monkeypatch.setattr("swarmbus.runtime.asyncio.sleep", AsyncMock())
+
+    await runtime._connection_loop()
+
+    assert client._client.acks == [(42, 1), (42, 1)]
+    assert observed_states == [RuntimeState.CONNECTED]
+    assert runtime.last_fatal_error is None
+    assert runtime.state is not RuntimeState.FATAL
+    assert len(await runtime.store.list_conflicts()) == 1
+
+
+@pytest.mark.asyncio
+async def test_conflict_record_failure_leaves_message_unacked():
+    class _ConflictStore(_FakeStore):
+        async def store(self, msg, *, source_topic):
+            raise MessageConflictError("message ID reused")
+
+        async def record_conflict(self, msg, *, source_topic):
+            raise sqlite3.OperationalError("locked")
+
+    ack = _RecordingAck()
+    runtime = _runtime(_ConflictStore([]), persistent=True)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        await runtime._handle_message(_FakeMqttMessage(_message()), ack)
+
+    assert ack.messages == []
+    assert runtime.state is RuntimeState.STORE_DEGRADED
+    assert runtime.last_fatal_error is None
+
+
+@pytest.mark.asyncio
+async def test_identical_redelivery_is_acked_without_conflict_record():
+    class _SeenStore(_FakeStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.conflicts = []
+
+        async def store(self, msg, *, source_topic):
+            self.events.append("seen")
+            return False
+
+        async def record_conflict(self, msg, *, source_topic):
+            self.conflicts.append(msg)
+
+    events = []
+    store = _SeenStore(events)
+    runtime = _runtime(store)
+    ack = _RecordingAck(events)
+
+    await runtime._handle_message(_FakeMqttMessage(_message()), ack)
+
+    assert events == ["seen", "ack"]
+    assert store.conflicts == []
+    assert runtime.state is RuntimeState.CONNECTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    {"body": 5},
+    {"subject": "x\u202e" * 600},
+    {"id": "m\x00-1"},
+])
+async def test_invalid_field_is_acked_not_stored_with_one_line_warning(override, caplog):
+    store = _FakeStore([])
+    runtime = _runtime(store)
+    ack = _RecordingAck()
+    message = _FakeMqttMessage(_message())
+    message.payload = json.dumps({
+        "id": "m-1", "from": "wren", "to": "foo", "subject": "s", "body": "b",
+        **override,
+    }).encode()
+
+    with caplog.at_level(logging.WARNING, logger="swarmbus.runtime"):
+        await runtime._handle_message(message, ack)
+
+    assert store.messages == []
+    assert ack.messages == [message]
+    warnings = [r.getMessage() for r in caplog.records if r.name == "swarmbus.runtime"]
+    assert len(warnings) == 1
+    assert "\n" not in warnings[0] and "\u202e" not in warnings[0]
+
+
+def test_runtime_caps_the_incoming_queue(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+    )
+    assert runtime._client_kwargs()["max_queued_incoming_messages"] == 1000
+
+
+def _inbox_delivery(msg, agent):
+    delivery = MagicMock()
+    delivery.topic = f"agents/{agent}/inbox"
+    delivery.payload = msg.to_json().encode()
+    return delivery
+
+
+@pytest.mark.asyncio
+async def test_mcp_send_in_reply_to_takes_the_parent_chain_from_the_state_db(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "foo" / "foo.sqlite3", hop_limit=4,
+    )
+    await runtime.store.open()
+    other = ManagedMCPRuntime(
+        agent_id="bar", broker="localhost",
+        state_path=tmp_path / "bar" / "bar.sqlite3",
+    )
+    await other.store.open()
+
+    parent = AgentMessage.create(
+        from_="wren", to="foo", subject="p", body="b", hops=2, origin="planner",
+    )
+    held = AgentMessage.create(from_="robin", to="foo", subject="h", body="b", hops=5)
+    old_peer = AgentMessage.from_json(json.dumps({
+        "id": "old-1", "from": "kite", "to": "foo",
+        "ts": "2026-10-01T00:00:00+00:00", "subject": "s", "body": "b",
+    }))
+    elsewhere = AgentMessage.create(from_="wren", to="bar", subject="x", body="b", hops=3)
+    for msg in (parent, held, old_peer):
+        await runtime._handle_message(_inbox_delivery(msg, "foo"), _RecordingAck())
+    await other._handle_message(_inbox_delivery(elsewhere, "bar"), _RecordingAck())
+    assert [r["id"] for r in await runtime.store.read()] == [parent.id, "old-1"]
+
+    runtime._client = AsyncMock()
+
+    async def chain(**kwargs):
+        await runtime.send_message(to="wren", subject="re", body="ok", **kwargs)
+        sent = AgentMessage.from_json(runtime._client.publish.await_args.args[1])
+        return (sent.in_reply_to, sent.hops, sent.origin)
+
+    assert await chain() == (None, 0, "foo")
+    assert await chain(in_reply_to=parent.id) == (parent.id, 3, "planner")
+    assert await chain(in_reply_to=held.id) == (held.id, 6, "robin")
+    assert await chain(in_reply_to="old-1") == ("old-1", 1, "kite")
+    assert await chain(in_reply_to="unknown-id") == ("unknown-id", 1, "foo")
+    assert await chain(in_reply_to=elsewhere.id) == (elsewhere.id, 1, "foo")
+
+
+@pytest.mark.asyncio
+async def test_runtime_rate_limits_a_sender_and_acks_the_held_message(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3",
+        rate_limit=1, rate_cooldown=30,
+    )
+    assert (runtime.store.rate_limit, runtime.store.rate_cooldown) == (1, 30)
+    await runtime.store.open()
+    ack = _RecordingAck()
+    for subject in ("first", "second"):
+        msg = AgentMessage.create(from_="wren", to="foo", subject=subject, body="b")
+        await runtime._handle_message(_FakeMqttMessage(msg), ack)
+
+    assert len(ack.messages) == 2
+    assert [r["subject"] for r in await runtime.store.read()] == ["first"]
+    default = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert (default.store.hop_limit, default.store.rate_limit, default.store.rate_cooldown) == (8, 20, 600)
+
+
+@pytest.mark.asyncio
+async def test_sidecar_alerts_once_when_a_sender_trips(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo", broker="localhost",
+        state_path=tmp_path / "state" / "foo.sqlite3", hop_limit=1,
+        on_trip=["notify-me", "--now"],
+    )
+    assert runtime._trip_alerter.command == ["notify-me", "--now"]
+    assert runtime._trip_alerter.listener == "mcp-server"
+    trips = []
+    runtime._trip_alerter.submit = trips.append
+    await runtime.store.open()
+    ack = _RecordingAck()
+    over = AgentMessage.create(from_="wren", to="foo", subject="over", body="b", hops=2)
+    later = AgentMessage.create(from_="wren", to="foo", subject="later", body="b", hops=0)
+
+    await runtime._handle_message(_FakeMqttMessage(over), ack)
+    await runtime._handle_message(_FakeMqttMessage(later), ack)
+
+    assert [(t.sender, t.message_id) for t in trips] == [("wren", over.id)]
+    assert len(ack.messages) == 2
+    plain = ManagedMCPRuntime(agent_id="foo", state_path=tmp_path / "other" / "foo.sqlite3")
+    assert plain._trip_alerter is None

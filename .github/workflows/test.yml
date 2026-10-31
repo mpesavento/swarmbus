@@ -19,17 +19,29 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
 
+      # Ubuntu 26.04's apparmor package confines /usr/sbin/mosquitto to files
+      # under /etc/mosquitto, so the TLS fixture's config and certs in the
+      # pytest temp dir are denied and the broker exits. Unload that profile.
       - name: Install mosquitto
-        run: sudo apt-get install -y mosquitto
+        run: |
+          sudo apt-get install -y mosquitto
+          if [ -f /etc/apparmor.d/mosquitto ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/mosquitto || true
+          fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "${{ matrix.python-version }}"
 
-      - name: Install package + dev extras
-        run: pip install -e ".[mcp,dev]"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          version: "0.12.13"
+          python-version: "${{ matrix.python-version }}"
+
+      - name: Install package + all extras from uv.lock
+        run: uv sync --frozen --all-extras
 
       - name: Run tests
-        run: pytest -v --tb=short
+        run: uv run --frozen pytest -v --tb=short

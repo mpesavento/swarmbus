@@ -4,17 +4,38 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import ssl
-from typing import Any, List
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, List
 
 import aiomqtt
 
-from .message import AgentMessage, _validate_registered_agent_id
+try:
+    import fcntl
+except ImportError:  # swarmbus runs on Linux and macOS; this only keeps the import safe
+    fcntl = None  # type: ignore[assignment]
+
+from .message import AgentMessage, _validate_registered_agent_id, sanitize_field
 from .handlers.base import BaseHandler
+from .handlers.file_bridge import FileBridgeHandler
 from .topics import DEFAULT_TOPICS, TopicMap
 from ._compat import asyncio_timeout
 
+if TYPE_CHECKING:
+    from .archive import SQLiteMessageStore
+    from .trip_alert import TripAlerter
+
 logger = logging.getLogger(__name__)
+
+# aiomqtt discards (with a WARNING) once its incoming queue is this full.
+MAX_QUEUED_INCOMING_MESSAGES = 1000
+
+DEFAULT_OUTBOX_MAX_BYTES = 10 * 1024 * 1024  # rotate before an append would pass this; 0 never rotates
+DEFAULT_OUTBOX_KEEP = 10                     # rotated files kept; 0 keeps every one
+_OUTBOX_OPEN_TRIES = 100
 
 
 def _build_tls_context(
@@ -49,25 +70,111 @@ def _build_tls_context(
     return context
 
 
-def _append_outbox_entry(path: str, msg: AgentMessage) -> None:
+def _open_outbox_locked(p: Path):
+    """Open `p` for append and hold an exclusive lock on it, or return None.
+
+    A sender that waited on the lock may find the file renamed away by the
+    one that held it, so the handle is only good if its inode is still the
+    one at `p`; otherwise it is dropped and the file is opened again.
+    """
+    for _ in range(_OUTBOX_OPEN_TRIES):
+        f = p.open("ab")
+        try:
+            if fcntl is None:
+                return f
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                current = os.stat(p).st_ino
+            except FileNotFoundError:
+                current = None
+            if os.fstat(f.fileno()).st_ino == current:
+                return f
+        except BaseException:
+            f.close()
+            raise
+        f.close()
+    return None
+
+
+def _rotated_outbox_path(p: Path) -> Path:
+    dt = datetime.now(timezone.utc)
+
+    def candidate() -> Path:
+        return p.parent / f"{p.stem}.{dt.strftime('%Y%m%dT%H%M%S%f')}Z{p.suffix}"
+
+    path = candidate()
+    while path.exists():
+        dt += timedelta(microseconds=1)
+        path = candidate()
+    return path
+
+
+def _prune_rotated_outboxes(p: Path, keep: int) -> None:
+    """Delete all but the newest `keep` rotated files of `p`. Never raises."""
+    pat = re.compile(re.escape(p.stem) + r"\.\d{8}T\d{12}Z" + re.escape(p.suffix))
+    try:
+        names = sorted(n for n in os.listdir(p.parent) if pat.fullmatch(n))
+    except OSError as exc:
+        logger.warning("outbox prune of %s failed: %s", p, exc)
+        return
+    for name in names[:-keep]:
+        try:
+            os.unlink(p.parent / name)
+        except OSError as exc:
+            logger.warning("outbox prune of %s failed: %s", p, exc)
+
+
+def _append_outbox_entry(
+    path: str,
+    msg: AgentMessage,
+    max_bytes: int = DEFAULT_OUTBOX_MAX_BYTES,
+    keep: int = DEFAULT_OUTBOX_KEEP,
+) -> None:
     """Append a sent message to the sender's outbox log.
 
     Mirrors FileBridgeHandler's inbox format so an agent's outbound and
     inbound logs are structurally identical (same heading shape, swapped
-    direction). Failures to write are logged but never raise — archive
+    direction). The file is rotated to `<stem>.<UTC time>Z<suffix>` before
+    an append would take it past `max_bytes` (0 never rotates), and all but
+    the newest `keep` rotated files are deleted (0 keeps every one). The
+    rotation runs under an exclusive `flock`, so concurrent senders rotate
+    one at a time. Failures to write are logged but never raise — archive
     loss should not break message delivery.
     """
-    from pathlib import Path
     p = Path(path).expanduser()
     entry = (
         f"\n## [{msg.ts.strftime('%Y-%m-%d %H:%M')}] "
         f"To: {msg.to} | {msg.subject}\n"
         f"{msg.body}\n"
     )
+    data = entry.encode("utf-8")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(entry)
+        f = _open_outbox_locked(p)
+        if f is None:
+            logger.warning("outbox append to %s skipped: file kept rotating", p)
+            return
+        try:
+            size = os.fstat(f.fileno()).st_size
+            if max_bytes > 0 and size > 0 and size + len(data) > max_bytes:
+                try:
+                    os.rename(p, _rotated_outbox_path(p))
+                except OSError as exc:
+                    logger.warning("outbox rotate of %s failed: %s", p, exc)
+                else:
+                    if keep > 0:
+                        _prune_rotated_outboxes(p, keep)
+                    f.close()
+                    f = _open_outbox_locked(p)
+                    if f is None:
+                        logger.warning(
+                            "outbox append to %s skipped: file kept rotating", p
+                        )
+                        return
+            f.write(data)
+        finally:
+            if f is not None:
+                f.close()
     except OSError as exc:
         logger.warning("outbox append to %s failed: %s", p, exc)
 
@@ -79,6 +186,9 @@ class AgentBus:
     # topic. Root-less by default, which keeps the wire format unchanged;
     # a rooted deployment overrides this with TopicMap(root=...).
     topics: TopicMap = DEFAULT_TOPICS
+    # Same reasoning: a probe bus never runs __init__ and holds nothing.
+    hold_store: "SQLiteMessageStore | None" = None
+    trip_alerter: "TripAlerter | None" = None
 
     def __init__(
         self,
@@ -94,6 +204,8 @@ class AgentBus:
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        hold_store: "SQLiteMessageStore | None" = None,
+        trip_alerter: "TripAlerter | None" = None,
     ) -> None:
         """Construct an AgentBus.
 
@@ -129,6 +241,13 @@ class AgentBus:
         TLS engages when ``tls=True`` or any of ``ca_cert`` / ``client_cert``
         / ``client_key`` is set; otherwise the broker connection is
         plaintext.
+
+        hold_store: when set, ``listen()``, ``read_inbox()`` and ``watch_inbox()`` refuse
+        messages the store holds (past its hop limit, or from a tripped
+        sender). When None they behave exactly as before.
+
+        trip_alerter: runs once per sender newly tripped by ``hold_store``;
+        closed when ``listen()`` or ``watch_inbox()`` returns.
         """
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -151,6 +270,8 @@ class AgentBus:
             client_cert=client_cert,
             client_key=client_key,
         )
+        self.hold_store = hold_store
+        self.trip_alerter = trip_alerter
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -217,6 +338,8 @@ class AgentBus:
             client_key=client_key,
         )
         self._handlers = []
+        self.hold_store = None
+        self.trip_alerter = None
         self._client = None
         self._client_cm = None
         return self
@@ -278,8 +401,17 @@ class AgentBus:
         priority: str = "normal",
         reply_to: str | None = None,
         outbox_path: str | None = None,
+        in_reply_to: str | None = None,
+        hops: int = 0,
+        origin: str | None = None,
+        *,
+        outbox_max_bytes: int = DEFAULT_OUTBOX_MAX_BYTES,
+        outbox_keep: int = DEFAULT_OUTBOX_KEEP,
     ) -> None:
         """Publish a message.
+
+        `in_reply_to`, `hops` and `origin` stamp the reply chain on the
+        envelope; `origin=None` means this agent starts the chain.
 
         If a persistent client is open (via connect() or `async with`), it is
         reused — no per-call connection churn. Otherwise a one-shot client is
@@ -292,8 +424,14 @@ class AgentBus:
         The path may contain `{agent_id}` as a placeholder — it expands to
         `self.agent_id` at call time. This lets multiple agents in the same
         process space safely share one outbox-path template:
-        `outbox_path="~/sync/{agent_id}-outbox.md"`.
+        `outbox_path="~/sync/{agent_id}-outbox.md"`. Before an append would
+        take the file past `outbox_max_bytes` (0 never rotates) it is renamed
+        to `<name>.<UTC time>Z<suffix>` next to it and a new one is started;
+        all but the newest `outbox_keep` rotated files are deleted (0 keeps
+        every one).
         """
+        if outbox_max_bytes < 0 or outbox_keep < 0:
+            raise ValueError("outbox_max_bytes and outbox_keep must be >= 0")
         msg = AgentMessage.create(
             from_=self.agent_id,
             to=to,
@@ -302,6 +440,9 @@ class AgentBus:
             content_type=content_type,
             priority=priority,  # type: ignore[arg-type]
             reply_to=reply_to,
+            in_reply_to=in_reply_to,
+            hops=hops,
+            origin=origin,
         )
         # Broadcast uses agents/broadcast; directed messages use agents/{to}/inbox
         topic = self.topics.route(to)
@@ -317,8 +458,18 @@ class AgentBus:
         if outbox_path:
             resolved = outbox_path.replace("{agent_id}", self.agent_id)
             await asyncio.get_running_loop().run_in_executor(
-                None, _append_outbox_entry, resolved, msg
+                None,
+                _append_outbox_entry,
+                resolved,
+                msg,
+                outbox_max_bytes,
+                outbox_keep,
             )
+
+    def _alert_new_trips(self) -> None:
+        if self.trip_alerter is not None and self.hold_store is not None:
+            for trip in self.hold_store.pop_trips():
+                self.trip_alerter.submit(trip)
 
     async def listen(
         self,
@@ -336,6 +487,13 @@ class AgentBus:
         qos=1, retain=True so late subscribers see current state and stale
         "online" is overwritten when an agent crashes unexpectedly.
         """
+        try:
+            await self._listen(reconnect_initial, reconnect_max)
+        finally:
+            if self.trip_alerter is not None:
+                await self.trip_alerter.aclose()
+
+    async def _listen(self, reconnect_initial: float, reconnect_max: float) -> None:
         will = aiomqtt.Will(
             topic=self.topics.presence(self.agent_id),
             payload=json.dumps({"agent": self.agent_id, "status": "offline"}),
@@ -345,16 +503,55 @@ class AgentBus:
         # Persistent session: stable client identifier + clean_session=False
         # so the broker queues QoS1 messages for this agent when the listener
         # is offline, and redelivers them on reconnect.
-        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs(), "will": will}
+        client_kwargs: dict[str, Any] = {
+            **self._aiomqtt_kwargs(),
+            "will": will,
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
+        if self.hold_store is not None:
+            # A failure propagates: better to exit than run unprotected.
+            await self.hold_store.open()
+        # Persistent with a hold store: acknowledge by hand, after the hold
+        # check and the handlers, so a delivery whose check failed is
+        # redelivered.
+        manual_ack = self.persistent and self.hold_store is not None
+        if manual_ack:
+            # Function-local: runtime.py imports from this module at top level.
+            from .runtime import AcknowledgementError, _ManualAckAdapter
         backoff = reconnect_initial
+        hold_backoff = reconnect_initial
         while True:
+            client_cm = aiomqtt.Client(
+                self.broker, port=self.port, **client_kwargs
+            )
+            ack_adapter = None
+            if manual_ack:
+                # Built outside the try so an unusable Paho handle exits the
+                # daemon rather than running unprotected. Must precede
+                # connect: the broker replays queued messages right after
+                # CONNACK, before our SUBSCRIBE.
+                ack_adapter = _ManualAckAdapter(client_cm)
+                ack_adapter.enable()
+
+            def ack(mqtt_msg: Any) -> bool:
+                """Acknowledge by hand; False means leave the connection."""
+                if ack_adapter is None:
+                    return True
+                try:
+                    ack_adapter.ack(mqtt_msg)
+                except AcknowledgementError as exc:
+                    logger.warning(
+                        "MQTT acknowledgement failed; reconnecting: %s", exc
+                    )
+                    return False
+                return True
+
+            leave: str | None = None  # "hold" or "ack" when we break out
             try:
-                async with aiomqtt.Client(
-                    self.broker, port=self.port, **client_kwargs
-                ) as client:
+                async with client_cm as client:
                     await client.publish(
                         self.topics.presence(self.agent_id),
                         json.dumps({"agent": self.agent_id, "status": "online"}),
@@ -372,9 +569,41 @@ class AgentBus:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
                         except Exception as exc:
                             logger.warning(
-                                "Discarding invalid message envelope: %s", exc
+                                "Discarding invalid message envelope: %s",
+                                sanitize_field(exc),
                             )
+                            if not ack(mqtt_msg):
+                                leave = "ack"
+                                break
                             continue
+
+                        if self.hold_store is not None:
+                            try:
+                                admitted = await self.hold_store.admit(
+                                    msg, source_topic=str(mqtt_msg.topic)
+                                )
+                            except Exception as exc:
+                                # Fail closed: an unreadable hold store
+                                # must not let a message through.
+                                logger.error(
+                                    "hold check failed for message %s: %s",
+                                    sanitize_field(msg.id), exc,
+                                )
+                                if manual_ack:
+                                    # Left unacknowledged: the broker resends
+                                    # it, and everything queued behind it,
+                                    # when the session resumes.
+                                    leave = "hold"
+                                    break
+                                await self._archive_unchecked(msg)
+                                continue
+                            self._alert_new_trips()
+                            hold_backoff = reconnect_initial
+                            if not admitted:
+                                if not ack(mqtt_msg):
+                                    leave = "ack"
+                                    break
+                                continue
 
                         for handler in self._handlers:
                             try:
@@ -382,9 +611,15 @@ class AgentBus:
                             except Exception as exc:
                                 logger.error(
                                     "Handler %s raised: %s",
-                                    handler.__class__.__name__, exc,
+                                    handler.__class__.__name__, sanitize_field(exc),
                                 )
-                return  # iterator exhausted / clean shutdown
+                        # Even when a handler raised: a message that always
+                        # breaks a handler must not be redelivered forever.
+                        if not ack(mqtt_msg):
+                            leave = "ack"
+                            break
+                if leave is None:
+                    return  # iterator exhausted / clean shutdown
             except aiomqtt.MqttError as exc:
                 logger.warning(
                     "MQTT broker disconnected (%s); reconnecting in %.1fs",
@@ -392,6 +627,33 @@ class AgentBus:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, reconnect_max)
+                continue
+            if leave == "hold":
+                await asyncio.sleep(hold_backoff)
+                hold_backoff = min(hold_backoff * 2, reconnect_max)
+            else:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, reconnect_max)
+
+    async def _archive_unchecked(self, msg: AgentMessage) -> None:
+        """Write a message whose hold check failed to the file bridge only.
+
+        For connections that acknowledge on arrival, where dropping the
+        message would lose it. The subject is marked and no other handler
+        runs: no wake, no persistent-listener count.
+        """
+        marked = msg.model_copy(
+            update={"subject": f"[HOLD CHECK FAILED] {msg.subject}"}
+        )
+        for handler in self._handlers:
+            if not isinstance(handler, FileBridgeHandler):
+                continue
+            try:
+                await handler.handle(marked)
+            except Exception as exc:
+                logger.error(
+                    "Handler %s raised: %s", handler.__class__.__name__, exc,
+                )
 
     async def read_inbox(self, max_messages: int = 10, drain_timeout: float = 1.0) -> list[dict]:
         """Non-blocking drain of queued messages for this agent.
@@ -411,7 +673,16 @@ class AgentBus:
         envelopes are skipped. Raises ``aiomqtt.MqttError`` if the broker is
         unreachable — callers that want graceful empty-on-error behaviour
         (e.g. the MCP tool surface) must catch it themselves.
+
+        With a ``hold_store``, messages the store holds (past its hop
+        limit, or from a tripped sender) are left out and do not count
+        toward ``max_messages``; every message returned is recorded in the
+        store. If the store cannot be read for a message, that message is
+        left out and an ERROR is logged.
         """
+        if self.hold_store is not None:
+            # A failure propagates, before any connection is made.
+            await self.hold_store.open()
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
@@ -426,9 +697,26 @@ class AgentBus:
                     async for mqtt_msg in client.messages:
                         try:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
-                            messages.append(json.loads(msg.to_json()))
                         except Exception as exc:
-                            logger.warning("read_inbox: skipping bad envelope: %s", exc)
+                            logger.warning(
+                                "read_inbox: skipping bad envelope: %s",
+                                sanitize_field(exc),
+                            )
+                        else:
+                            admitted = True
+                            if self.hold_store is not None:
+                                try:
+                                    admitted = await self.hold_store.admit(
+                                        msg, source_topic=str(mqtt_msg.topic)
+                                    )
+                                except Exception as exc:
+                                    logger.error(
+                                        "hold check failed for message %s: %s",
+                                        sanitize_field(msg.id), exc,
+                                    )
+                                    admitted = False
+                            if admitted:
+                                messages.append(json.loads(msg.to_json()))
                         if len(messages) >= max_messages:
                             break
             except asyncio.TimeoutError:
@@ -451,11 +739,29 @@ class AgentBus:
         agent-id can hold the session: do not run a daemon or persistent
         MCP server for the same agent-id.
 
+        With a ``hold_store``, messages the store holds are skipped (and
+        acknowledged in persistent mode) and never returned; they do not
+        extend the timeout. If the store cannot be read, the message is
+        neither returned nor acknowledged.
+
         Returns None on timeout. Raises ``aiomqtt.MqttError`` if the broker
         is unreachable; callers that want graceful None-on-error (e.g. the
         MCP tool surface) must catch it themselves.
         """
-        client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
+        try:
+            return await self._watch_inbox(timeout)
+        finally:
+            if self.trip_alerter is not None:
+                await self.trip_alerter.aclose()
+
+    async def _watch_inbox(self, timeout: float) -> dict | None:
+        if self.hold_store is not None:
+            # A failure propagates, before any connection is made.
+            await self.hold_store.open()
+        client_kwargs: dict[str, Any] = {
+            **self._aiomqtt_kwargs(),
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.persistent:
             client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
             client_kwargs["clean_session"] = False
@@ -478,10 +784,31 @@ class AgentBus:
                             msg = AgentMessage.from_json(mqtt_msg.payload)
                             result = json.loads(msg.to_json())
                         except Exception as exc:
-                            logger.warning("watch_inbox: skipping bad envelope: %s", exc)
+                            logger.warning(
+                                "watch_inbox: skipping bad envelope: %s",
+                                sanitize_field(exc),
+                            )
                             if ack_adapter is not None:
                                 ack_adapter.ack(mqtt_msg)
                             continue
+                        if self.hold_store is not None:
+                            try:
+                                admitted = await self.hold_store.admit(
+                                    msg, source_topic=str(mqtt_msg.topic)
+                                )
+                            except Exception as exc:
+                                # Fail closed and leave it unacknowledged:
+                                # a persistent session redelivers it.
+                                logger.error(
+                                    "hold check failed for message %s: %s",
+                                    sanitize_field(msg.id), exc,
+                                )
+                                continue
+                            self._alert_new_trips()
+                            if not admitted:
+                                if ack_adapter is not None:
+                                    ack_adapter.ack(mqtt_msg)
+                                continue
                         if ack_adapter is not None:
                             ack_adapter.ack(mqtt_msg)
                         return result

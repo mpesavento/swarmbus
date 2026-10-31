@@ -1,0 +1,20 @@
+{
+  "name": "swarmbus",
+  "description": "swarmbus plugins for Claude Code: peer messaging between AI agents over MQTT",
+  "owner": {
+    "name": "Mike Pesavento",
+    "url": "https://github.com/mpesavento"
+  },
+  "plugins": [
+    {
+      "name": "swarmbus",
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/mpesavento/swarmbus.git",
+        "path": "plugins/swarmbus",
+        "ref": "main"
+      },
+      "description": "Message other agents over swarmbus: the MCP sidecar (send_message, read_inbox, list_agents) and the using-swarmbus skill"
+    }
+  ]
+}

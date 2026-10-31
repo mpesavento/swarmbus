@@ -1,4 +1,6 @@
 # tests/conftest.py
+import os
+import shutil
 import socket
 import subprocess
 import time
@@ -13,12 +15,36 @@ def _free_port() -> int:
     return port
 
 
+MOSQUITTO_FALLBACKS = (
+    "/usr/sbin/mosquitto",
+    "/opt/homebrew/sbin/mosquitto",
+    "/usr/local/sbin/mosquitto",
+)
+
+
+def _mosquitto_bin():
+    """Path to a mosquitto binary: PATH first, then the usual sbin locations."""
+    found = shutil.which("mosquitto")
+    if found:
+        return found
+    for path in MOSQUITTO_FALLBACKS:
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
 @pytest.fixture(scope="session")
 def mosquitto_broker():
     """Start a real mosquitto broker on a free port. Yields (host, port)."""
+    mosquitto = _mosquitto_bin()
+    if mosquitto is None:
+        pytest.fail(
+            "mosquitto not found on PATH or in /usr/sbin, /opt/homebrew/sbin, /usr/local/sbin: "
+            "install it (apt install mosquitto / brew install mosquitto) or put it on PATH"
+        )
     port = _free_port()
     proc = subprocess.Popen(
-        ["/usr/sbin/mosquitto", "-p", str(port)],
+        [mosquitto, "-p", str(port)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -27,3 +53,23 @@ def mosquitto_broker():
     yield ("localhost", port)
     proc.terminate()
     proc.wait()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWARMBUS_STATE_DIR", str(tmp_path / "swarmbus-state"))
+    for key in (
+        "SWARMBUS_HOP_LIMIT",
+        "SWARMBUS_RATE_LIMIT",
+        "SWARMBUS_RATE_COOLDOWN",
+        "SWARMBUS_ON_TRIP",
+        "SWARMBUS_MAX_OUTBOX_BYTES",
+        "SWARMBUS_KEEP_OUTBOX_FILES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("SWARMBUS_CONFIG", raising=False)
+    try:
+        from swarmbus import config as sb_config
+    except ImportError:  # a checkout from before the config file (#5)
+        return
+    monkeypatch.setattr(sb_config, "default_config_path", lambda: tmp_path / "no-swarmbus-config.ini")

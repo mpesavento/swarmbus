@@ -105,6 +105,8 @@ $ swarmbus doctor --agent-id my-agent
   [✓] 5. --invoke wired.......... yes (/path/to/wake.sh my-agent)
   [✓] 6. outbox env resolvable... /home/you/sync/my-agent-outbox.md
   [✓] 7. peer discovery.......... I'm visible; N other peer(s): ...
+  [✓] 8. tripped senders......... none; 0 message(s) held
+  [✓] 9. channel traffic......... last 15 min: no messages admitted; deepest hops -; held: none
 
 [doctor] all green.
 ```
@@ -115,5 +117,5 @@ $ swarmbus doctor --agent-id my-agent
 
 - [notification-patterns.md](notification-patterns.md) — the 4-tier protocol (archive/narrate/push/silent) and per-host recipes.
 - [cross-machine-tailscale.md](cross-machine-tailscale.md) — when you extend beyond a single host.
-- [post-ship-backlog.md](post-ship-backlog.md) — known gaps, drift, and open items.
+- [Open issues](https://github.com/mpesavento/swarmbus/issues) — known gaps and planned work.
 - [../CHANGELOG.md](../CHANGELOG.md) — with a "wire-compat" bullet per release so you know when a `pip install -U` requires restarting every daemon on the network.

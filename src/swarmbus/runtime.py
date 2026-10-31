@@ -11,10 +11,18 @@ from typing import Any
 
 import aiomqtt
 
-from .archive import SQLiteMessageStore
-from .bus import _build_tls_context
-from .message import AgentMessage, _validate_registered_agent_id
+from .archive import MessageConflictError, SQLiteMessageStore
+from .bus import MAX_QUEUED_INCOMING_MESSAGES, _build_tls_context
+from .message import (
+    DEFAULT_HOP_LIMIT,
+    DEFAULT_RATE_COOLDOWN,
+    DEFAULT_RATE_LIMIT,
+    AgentMessage,
+    _validate_registered_agent_id,
+    sanitize_field,
+)
 from .topics import DEFAULT_TOPICS
+from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +110,10 @@ class ManagedMCPRuntime:
         client_cert: str | None = None,
         client_key: str | None = None,
         store: SQLiteMessageStore | Any | None = None,
+        hop_limit: int = DEFAULT_HOP_LIMIT,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+        on_trip: list[str] | None = None,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         self.agent_id = agent_id
@@ -117,7 +129,17 @@ class ManagedMCPRuntime:
             client_cert=client_cert,
             client_key=client_key,
         )
-        self.store = store or SQLiteMessageStore(state_path)
+        self.store = store or SQLiteMessageStore(
+            state_path,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+        )
+        self._trip_alerter: TripAlerter | None = (
+            TripAlerter(on_trip, agent_id=agent_id, listener="mcp-server")
+            if on_trip
+            else None
+        )
         self.topics = DEFAULT_TOPICS
         self._online_agents: set[str] = set()
         self._client: aiomqtt.Client | None = None
@@ -134,7 +156,9 @@ class ManagedMCPRuntime:
         self._replay_settled = True
 
     def _client_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {
+            "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
+        }
         if self.presence:
             kwargs["will"] = aiomqtt.Will(
                 topic=self.topics.presence(self.agent_id),
@@ -300,7 +324,11 @@ class ManagedMCPRuntime:
                 self._client = None
                 self._pending_client = None
                 self._pending_ack_adapter = None
-                await self.store.close()
+                try:
+                    await self.store.close()
+                finally:
+                    if self._trip_alerter is not None:
+                        await self._trip_alerter.aclose()
                 if self._state is not RuntimeState.FATAL:
                     self._state = RuntimeState.STOPPED
 
@@ -403,7 +431,7 @@ class ManagedMCPRuntime:
         backoff = 1.0
         while not self._stopping.is_set():
             try:
-                inserted = await self.store.store(
+                inserted = await self._commit_inbox_message(
                     message,
                     source_topic=source_topic,
                 )
@@ -424,8 +452,38 @@ class ManagedMCPRuntime:
             else:
                 self._last_store_error = None
                 self._state = RuntimeState.CONNECTED
+                if self._trip_alerter is not None:
+                    for trip in self.store.pop_trips():
+                        self._trip_alerter.submit(trip)
                 return inserted
         raise asyncio.CancelledError
+
+    async def _commit_inbox_message(
+        self,
+        message: AgentMessage,
+        *,
+        source_topic: str,
+    ) -> bool:
+        """Commit one envelope; a reused id is recorded and dropped, not fatal.
+
+        A peer can send two different envelopes under one ``id``. The first
+        one is already in the inbox and stays there; the second is written to
+        ``inbox_message_conflicts`` and reported as not inserted, so the caller
+        acknowledges it and the broker does not redeliver it. A byte-identical
+        redelivery still returns False from ``store`` without raising.
+        """
+        try:
+            return await self.store.store(message, source_topic=source_topic)
+        except MessageConflictError:
+            await self.store.record_conflict(message, source_topic=source_topic)
+            logger.warning(
+                "discarding message %s from %s: its id is already bound to a "
+                "different envelope; the rejected envelope is recorded in "
+                "inbox_message_conflicts",
+                sanitize_field(message.id),
+                sanitize_field(message.from_agent),
+            )
+            return False
 
     async def _handle_message(
         self,
@@ -437,7 +495,9 @@ class ManagedMCPRuntime:
             try:
                 message = AgentMessage.from_json(mqtt_message.payload)
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
-                logger.warning("discarding invalid message envelope: %s", exc)
+                logger.warning(
+                    "discarding invalid message envelope: %s", sanitize_field(exc)
+                )
                 ack_adapter.ack(mqtt_message)
                 return
             inserted = await self._store_inbox_message(
@@ -471,7 +531,9 @@ class ManagedMCPRuntime:
                 ValueError,
                 UnicodeDecodeError,
             ) as exc:
-                logger.warning("discarding invalid presence record: %s", exc)
+                logger.warning(
+                    "discarding invalid presence record: %s", sanitize_field(exc)
+                )
             ack_adapter.ack(mqtt_message)
             return
 
@@ -484,15 +546,28 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
+        hops = 0
+        origin = None
+        if in_reply_to:
+            parent = await self.store.lookup(in_reply_to)
+            if parent is None:
+                hops = 1
+            else:
+                hops = parent["hops"] + 1
+                origin = parent["origin"] or parent["from"]
         message = AgentMessage.create(
             from_=self.agent_id,
             to=to,
             subject=subject,
             body=body,
             content_type=content_type,
+            in_reply_to=in_reply_to or None,
+            hops=hops,
+            origin=origin,
         )
         await self._client.publish(
             self.topics.route(to),

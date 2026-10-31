@@ -49,13 +49,15 @@ swarmbus send --agent-id planner --to coder ...   # auto-logs
    ```
    Hyphens become underscores (`coder-beta` → `SWARMBUS_OUTBOX_CODER_BETA`).
 
-Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, none.
+Resolution order (highest first): `--outbox` flag, `SWARMBUS_OUTBOX_<ID>`, `SWARMBUS_OUTBOX`, `[outbox] path` in the config file, none. The outbox rotates before an append would take it past 10 MiB (`SWARMBUS_MAX_OUTBOX_BYTES` / `--outbox-max-bytes`, 0 never rotates) and keeps the newest 10 rotated files (`SWARMBUS_KEEP_OUTBOX_FILES` / `--outbox-keep`, 0 keeps all).
 
 Inbox and outbox share format (only `From:` vs `To:` differ) so you can merge-sort them into a single conversation view:
 
 ```bash
-sort -m ~/sync/planner-inbox.md ~/sync/planner-outbox.md
+sort -m ~/sync/planner-inbox.md ~/sync/planner-outbox*.md
 ```
+
+History from before the last rotation is in `planner-outbox.*Z.md`, which the glob takes in.
 
 **Optional ambient pointer.** If your agent maintains a daily journal (Obsidian daily notes, org-mode, a markdown log), also append a one-line summary per message under a per-day `## Agent comms` heading:
 
