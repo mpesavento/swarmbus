@@ -56,6 +56,20 @@ def test_mcp_server_uses_only_declared_user_config():
     assert used == declared
 
 
+def test_plugin_starts_the_sidecar_persistent_with_presence():
+    # agent_state refuses without --presence; only --persistent queues while the session is closed.
+    [server] = _json(MCP_CONFIG)["mcpServers"].values()
+    assert "--persistent" in server["args"]
+    assert "--presence" in server["args"]
+
+
+def test_plugin_advertises_agent_state_not_list_agents():
+    for path in (MANIFEST, MARKETPLACE, PLUGIN_DIR / "README.md"):
+        text = path.read_text()
+        assert "list_agents" not in text, path
+        assert "agent_state" in text, path
+
+
 def test_plugin_folder_holds_only_text_files_and_no_symlinks():
     for path in PLUGIN_DIR.rglob("*"):
         assert not path.is_symlink(), path
