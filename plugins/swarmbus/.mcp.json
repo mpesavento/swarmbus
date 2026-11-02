@@ -6,7 +6,9 @@
         "mcp-server",
         "--agent-id", "${user_config.agent_id}",
         "--broker", "${user_config.broker}",
-        "--port", "${user_config.port}"
+        "--port", "${user_config.port}",
+        "--persistent",
+        "--presence"
       ]
     }
   }
