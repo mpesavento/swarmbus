@@ -16,6 +16,11 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **The Claude Code plugin caught up with `agent_state`** (#83). `plugin.json` and `marketplace.json` no longer advertise the removed `list_agents` tool, and the plugin starts the sidecar with `--persistent --presence`, so `agent_state` answers and the broker queues messages while the session is closed. Two sessions on one agent id now kick each other off the broker, where before each received its own copy of every message; give each session its own id.
+
 ## [0.2.1] — 2026-10-31
 
 ### Added
