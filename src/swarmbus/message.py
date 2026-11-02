@@ -127,7 +127,7 @@ class AgentMessage(BaseModel):
     # strict: "3", 3.0 and True are not integers, so they are invalid, not coerced
     hops: int = Field(default=0, ge=0, strict=True)  # replies since the first message of the chain
     origin: Optional[str] = Field(default=None, max_length=128)  # agent id that sent the first message of the chain
-    envelope_version: int = 1           # absent on the wire = a pre-0.3.0 sender
+    envelope_version: int = 1           # absent on the wire = a pre-0.2.1 sender
 
     @field_validator("from_agent", mode="before")
     @classmethod

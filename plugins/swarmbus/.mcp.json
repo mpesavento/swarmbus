@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "swarmbus": {
+      "command": "swarmbus",
+      "args": [
+        "mcp-server",
+        "--agent-id", "${user_config.agent_id}",
+        "--broker", "${user_config.broker}",
+        "--port", "${user_config.port}"
+      ]
+    }
+  }
+}

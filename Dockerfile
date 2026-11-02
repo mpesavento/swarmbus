@@ -22,5 +22,7 @@ COPY docs/ docs/
 COPY examples/ examples/
 COPY systemd/ systemd/
 COPY .github/ .github/
+COPY .claude-plugin/ .claude-plugin/
+COPY plugins/ plugins/
 
 CMD ["pytest", "-v", "--tb=short"]

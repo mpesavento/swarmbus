@@ -178,15 +178,17 @@ def mosquitto_tls_broker(tmp_path_factory) -> Iterator[dict]:
         "require_certificate false\n"
     )
 
-    proc = subprocess.Popen(
-        ["/usr/sbin/mosquitto", "-c", str(conf)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_broker(proc, port)
-    except (RuntimeError, TimeoutError):
-        pytest.fail(f"mosquitto failed to start; conf={conf.read_text()}")
+    log = tmp / "mosquitto.log"
+    with log.open("w") as log_fh:
+        proc = subprocess.Popen(
+            ["/usr/sbin/mosquitto", "-c", str(conf)],
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+        )
+    time.sleep(0.5)  # broker boot
+    if proc.poll() is not None:
+        # An AppArmor denial (Ubuntu 26.04+) shows here as an unreadable file.
+        pytest.fail(f"mosquitto failed to start; log={log.read_text()}; conf={conf.read_text()}")
 
     try:
         yield {

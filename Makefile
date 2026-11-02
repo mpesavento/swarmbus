@@ -1,4 +1,4 @@
-.PHONY: test test-one test-dev test-matrix build clean
+.PHONY: test test-one test-dev test-matrix build clean plugin-skill
 
 PYTHON_VERSION ?= 3.12
 
@@ -22,3 +22,7 @@ test-matrix:
 
 clean:
 	docker compose down --rmi local --volumes --remove-orphans
+
+# The Claude Code plugin carries a copy of the packaged skill (the plugin directory refuses symlinks).
+plugin-skill:
+	cp src/swarmbus/skills/using-swarmbus/SKILL.md plugins/swarmbus/skills/using-swarmbus/SKILL.md
