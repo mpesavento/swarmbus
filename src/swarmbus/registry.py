@@ -1,0 +1,510 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+from .message import _validate_agent_id, sanitize_field
+from .topics import DEFAULT_TOPICS, TopicMap
+
+MAX_STATUS_LENGTH = 280
+MAX_CAPABILITY_LENGTH = 128
+AgentLifecycle = Literal["named", "transient"]
+#: Payload key holding the first-sighting stamp maintenance writes onto a
+#: presence record that has no registry record to age against.
+PRESENCE_FIRST_SEEN_OFFLINE_KEY = "first_seen_offline"
+
+
+def _normalize_string_list(
+    value: object,
+    *,
+    field_name: str,
+    max_item_length: int | None = None,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be a list of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{field_name} must contain only strings")
+        item = sanitize_field(item).strip()
+        if not item:
+            raise ValueError(f"{field_name} entries cannot be empty")
+        if max_item_length is not None and len(item) > max_item_length:
+            raise ValueError(
+                f"{field_name} entries cannot exceed "
+                f"{max_item_length} characters"
+            )
+        if item not in seen:
+            seen.add(item)
+            normalized.append(item)
+    return normalized
+
+
+class RegistryRecord(BaseModel):
+    schema_version: Literal[1] = 1
+    agent_id: str
+    status: str = ""
+    working_set: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    lifecycle: AgentLifecycle = "named"
+    durability: Literal["durable", "ephemeral", "unknown"] = "unknown"
+    started_at: datetime
+    last_seen: datetime
+
+    @field_validator("agent_id")
+    @classmethod
+    def validate_agent_id(cls, value: str) -> str:
+        return _validate_agent_id(value)
+
+    @field_validator("started_at", "last_seen")
+    @classmethod
+    def validate_aware_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("registry timestamps must be timezone-aware")
+        return value
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def validate_status(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("status must be a string")
+        sanitized = sanitize_field(value)
+        if len(sanitized) > MAX_STATUS_LENGTH:
+            raise ValueError(f"status exceeds {MAX_STATUS_LENGTH} characters")
+        return sanitized
+
+    @field_validator("working_set", mode="before")
+    @classmethod
+    def normalize_working_set(cls, value: object) -> list[str]:
+        return _normalize_string_list(value, field_name="working_set")
+
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def normalize_capabilities(cls, value: object) -> list[str]:
+        return _normalize_string_list(
+            value,
+            field_name="capabilities",
+            max_item_length=MAX_CAPABILITY_LENGTH,
+        )
+
+    def to_json(self) -> str:
+        return self.model_dump_json()
+
+    @classmethod
+    def from_mqtt(
+        cls,
+        topic: str,
+        payload: str | bytes,
+        *,
+        topics: TopicMap = DEFAULT_TOPICS,
+    ) -> "RegistryRecord":
+        # Topic ownership is authoritative; reject conflicting payload identity.
+        topic_agent = topics.registry_agent(topic)
+        record = cls.model_validate_json(payload)
+        if record.agent_id != topic_agent:
+            raise ValueError(
+                f"registry agent_id {record.agent_id!r} does not match "
+                f"topic agent {topic_agent!r}"
+            )
+        return record
+
+
+class PresenceRecord(BaseModel):
+    schema_version: Literal[1] = 1
+    agent_id: str
+    state: Literal["online", "offline"]
+    connected_at: datetime | None = None
+    reason: str | None = None
+    #: When maintenance first observed this record offline with no registry
+    #: record to age against. Written by GC, never by the agent itself.
+    first_seen_offline: datetime | None = None
+
+    @field_validator("agent_id")
+    @classmethod
+    def validate_agent_id(cls, value: str) -> str:
+        return _validate_agent_id(value)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def validate_reason(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("reason must be a string")
+        return sanitize_field(value)
+
+    @field_validator("first_seen_offline")
+    @classmethod
+    def validate_aware_first_seen_offline(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        # Retention is computed from this field, so a naive value would make
+        # the subtraction raise mid-collection. Reject it as malformed here.
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
+            raise ValueError("first_seen_offline must be timezone-aware")
+        return value
+
+    def to_json(self) -> str:
+        return self.model_dump_json(exclude_none=True)
+
+    @classmethod
+    def from_mqtt(
+        cls,
+        topic: str,
+        payload: str | bytes,
+        *,
+        topics: TopicMap = DEFAULT_TOPICS,
+    ) -> "PresenceRecord":
+        # Apply the same topic-identity check as RegistryRecord.
+        topic_agent = topics.presence_agent(topic)
+
+        data = json.loads(payload)
+        if "agent_id" not in data and "agent" in data:
+            # Every key the current schema keeps has to be carried across, or
+            # it is silently dropped on read: a stamp that does not survive
+            # this translation would be rewritten on every maintenance pass.
+            data = {
+                "schema_version": 1,
+                "agent_id": data["agent"],
+                "state": data.get("status"),
+                "connected_at": data.get("connected_at"),
+                "reason": data.get("reason"),
+                PRESENCE_FIRST_SEEN_OFFLINE_KEY: data.get(
+                    PRESENCE_FIRST_SEEN_OFFLINE_KEY
+                ),
+            }
+        record = cls.model_validate(data)
+        if record.agent_id != topic_agent:
+            raise ValueError(
+                f"presence agent_id {record.agent_id!r} does not match "
+                f"topic agent {topic_agent!r}"
+            )
+        return record
+
+
+def presence_payload(
+    agent_id: str,
+    state: Literal["online", "offline"],
+    *,
+    reason: str | None = None,
+) -> str:
+    """Serialize the current presence payload."""
+    return PresenceRecord(
+        agent_id=agent_id,
+        state=state,
+        connected_at=(
+            datetime.now(timezone.utc) if state == "online" else None
+        ),
+        reason=reason,
+    ).to_json()
+
+
+def stamp_presence_payload(
+    payload: str | bytes,
+    *,
+    first_seen_offline: datetime,
+) -> str:
+    """Add the first-seen-offline stamp to an observed presence payload.
+
+    Edits the payload as observed instead of re-serializing a
+    ``PresenceRecord``: older records carry different keys, and rebuilding
+    them from the current schema would rewrite them while claiming only to
+    add a timestamp. Callers decide *whether* to stamp (see
+    :func:`orphan_presence_action`); this only writes it.
+    """
+
+    if first_seen_offline.tzinfo is None or (
+        first_seen_offline.utcoffset() is None
+    ):
+        raise ValueError("first_seen_offline must be timezone-aware")
+    data = json.loads(payload)
+    if not isinstance(data, dict):
+        raise ValueError("presence payload must be a JSON object")
+    return json.dumps(
+        {
+            **data,
+            PRESENCE_FIRST_SEEN_OFFLINE_KEY: first_seen_offline.isoformat(),
+        }
+    )
+
+
+class OrphanPresenceAction(str, Enum):
+    """What maintenance owes one presence record with no registry record."""
+
+    ONLINE = "online"
+    STAMP = "stamp"
+    WAIT = "wait"
+    COLLECT = "collect"
+
+
+def orphan_presence_action(
+    *,
+    presence: PresenceRecord,
+    now: datetime,
+    retention_seconds: float,
+) -> OrphanPresenceAction:
+    """Decide the next action for a presence record with no registry record.
+
+    Such a record has no registry ``last_seen`` to age against, so the first
+    pass that sees one offline stamps ``first_seen_offline`` into the
+    retained payload and later passes age from that stamp.
+
+    A stamped record is only ever aged, never stamped again: re-stamping
+    would reset the clock on every pass, so its age could never exceed one
+    maintenance interval and it would never be collected. That also makes
+    this idempotent, and makes a stamp dated ahead of the clock wait rather
+    than be rewritten.
+    """
+
+    if retention_seconds <= 0:
+        raise ValueError("retention_seconds must be positive")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+
+    if presence.state == "online":
+        return OrphanPresenceAction.ONLINE
+    first_seen = presence.first_seen_offline
+    if first_seen is None:
+        return OrphanPresenceAction.STAMP
+    if (now - first_seen).total_seconds() > retention_seconds:
+        return OrphanPresenceAction.COLLECT
+    return OrphanPresenceAction.WAIT
+
+
+class PresenceEvidence(str, Enum):
+    """Strength of the retained evidence about an identity's presence."""
+
+    ONLINE = "online"
+    OFFLINE = "offline"
+    UNCONFIRMED = "unconfirmed"
+
+
+def presence_evidence(
+    *,
+    record: RegistryRecord | None,
+    presence: PresenceRecord | None,
+    now: datetime,
+    stale_after_seconds: float,
+) -> PresenceEvidence:
+    if stale_after_seconds <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if presence is None:
+        return PresenceEvidence.UNCONFIRMED
+    if presence.state == "offline":
+        return PresenceEvidence.OFFLINE
+    if record is None:
+        return PresenceEvidence.ONLINE
+    age_seconds = (now - record.last_seen).total_seconds()
+    if age_seconds < 0 or age_seconds <= stale_after_seconds:
+        return PresenceEvidence.ONLINE
+    return PresenceEvidence.UNCONFIRMED
+
+
+class GCDecisionReason(str, Enum):
+    """Why a registry record was preserved or selected for transient GC."""
+
+    ELIGIBLE = "eligible"
+    NAMED = "named"
+    UNKNOWN_DURABILITY = "unknown-durability"
+    ONLINE = "online"
+    UNCONFIRMED = "unconfirmed"
+    WITHIN_RETENTION = "within-retention"
+    CLOCK_SKEW = "clock-skew"
+
+
+class TransientGCDecision(BaseModel):
+    agent_id: str
+    eligible: bool
+    reason: GCDecisionReason
+    age_seconds: float
+
+
+def transient_gc_decision(
+    *,
+    record: RegistryRecord,
+    presence: PresenceRecord | None,
+    now: datetime,
+    stale_after_seconds: float,
+    retention_seconds: float,
+) -> TransientGCDecision:
+    """Return the deletion decision for one validated registry snapshot."""
+
+    if stale_after_seconds <= 0:
+        raise ValueError("stale_after_seconds must be positive")
+    if retention_seconds <= stale_after_seconds:
+        raise ValueError(
+            "retention_seconds must be longer than stale_after_seconds"
+        )
+    if presence is not None and presence.agent_id != record.agent_id:
+        raise ValueError(
+            f"presence agent_id {presence.agent_id!r} does not match "
+            f"registry agent_id {record.agent_id!r}"
+        )
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if record.last_seen.tzinfo is None or record.last_seen.utcoffset() is None:
+        raise ValueError("registry last_seen must be timezone-aware")
+
+    age_seconds = (now - record.last_seen).total_seconds()
+    decision = {
+        "agent_id": record.agent_id,
+        "age_seconds": age_seconds,
+    }
+
+    if record.durability == "unknown":
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.UNKNOWN_DURABILITY,
+        )
+    if record.lifecycle == "named":
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.NAMED,
+        )
+    if age_seconds < 0:
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.CLOCK_SKEW,
+        )
+    evidence = presence_evidence(
+        record=record,
+        presence=presence,
+        now=now,
+        stale_after_seconds=stale_after_seconds,
+    )
+    if evidence is PresenceEvidence.ONLINE:
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.ONLINE,
+        )
+    if evidence is PresenceEvidence.UNCONFIRMED:
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.UNCONFIRMED,
+        )
+    if age_seconds <= retention_seconds:
+        return TransientGCDecision(
+            **decision,
+            eligible=False,
+            reason=GCDecisionReason.WITHIN_RETENTION,
+        )
+    return TransientGCDecision(
+        **decision,
+        eligible=True,
+        reason=GCDecisionReason.ELIGIBLE,
+    )
+
+
+class RegistryCache:
+    """In-memory view of retained registry and presence topics."""
+
+    def __init__(
+        self,
+        *,
+        stale_after_seconds: float,
+        topics: TopicMap = DEFAULT_TOPICS,
+    ) -> None:
+        if stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
+        self.stale_after_seconds = stale_after_seconds
+        self.topics = topics
+        self._registry: dict[str, RegistryRecord] = {}
+        self._presence: dict[str, PresenceRecord] = {}
+
+    def clear(self) -> None:
+        self._registry.clear()
+        self._presence.clear()
+
+    def update_registry(self, topic: str, payload: str | bytes) -> RegistryRecord:
+        record = RegistryRecord.from_mqtt(topic, payload, topics=self.topics)
+        self._registry[record.agent_id] = record
+        return record
+
+    def update_presence(self, topic: str, payload: str | bytes) -> PresenceRecord:
+        record = PresenceRecord.from_mqtt(topic, payload, topics=self.topics)
+        self._presence[record.agent_id] = record
+        return record
+
+    def remove_registry(self, topic: str) -> None:
+        self._registry.pop(self.topics.registry_agent(topic), None)
+
+    def remove_presence(self, topic: str) -> None:
+        self._presence.pop(self.topics.presence_agent(topic), None)
+
+    def _presence_evidence(
+        self,
+        agent_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> PresenceEvidence:
+        return presence_evidence(
+            record=self._registry.get(agent_id),
+            presence=self._presence.get(agent_id),
+            now=now or datetime.now(timezone.utc),
+            stale_after_seconds=self.stale_after_seconds,
+        )
+
+    def _is_online(self, agent_id: str, *, now: datetime | None = None) -> bool:
+        return (
+            self._presence_evidence(agent_id, now=now)
+            is PresenceEvidence.ONLINE
+        )
+
+    def online_agent_ids(self) -> list[str]:
+        agent_ids = set(self._presence) | set(self._registry)
+        return sorted(agent_id for agent_id in agent_ids if self._is_online(agent_id))
+
+    def get_state(self, agent_id: str) -> dict:
+        if agent_id not in self._registry and agent_id not in self._presence:
+            raise KeyError(agent_id)
+        record = self._registry.get(agent_id)
+        presence = self._presence.get(agent_id)
+        evidence = self._presence_evidence(agent_id)
+        state = {
+            "agent_id": agent_id,
+            "online": evidence is PresenceEvidence.ONLINE,
+            "presence_evidence": evidence.value,
+            "untrusted": True,
+            "status": record.status if record else "",
+            "working_set": list(record.working_set) if record else [],
+            "capabilities": list(record.capabilities) if record else [],
+            "lifecycle": record.lifecycle if record else "unknown",
+            "durability": record.durability if record else "unknown",
+            "started_at": record.started_at.isoformat() if record else None,
+            "last_seen": record.last_seen.isoformat() if record else None,
+        }
+        if presence and presence.state == "offline" and presence.reason:
+            state["offline_reason"] = presence.reason
+        return state
+
+    def list_states(
+        self,
+        *,
+        include_offline: bool = False,
+        lifecycle: AgentLifecycle | None = None,
+    ) -> list[dict]:
+        agent_ids = sorted(set(self._registry) | set(self._presence))
+        states = [self.get_state(agent_id) for agent_id in agent_ids]
+        if lifecycle is not None:
+            states = [
+                state for state in states
+                if state["lifecycle"] == lifecycle
+            ]
+        if include_offline:
+            return states
+        return [state for state in states if state["online"]]

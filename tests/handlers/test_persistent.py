@@ -32,12 +32,15 @@ async def test_tracks_last_message_ts(msg):
 async def test_heartbeat_calls_publish_fn():
     handler = PersistentListenerHandler(heartbeat_interval=0.05)
     calls = []
+    called_twice = asyncio.Event()
 
     async def fake_publish():
         calls.append(1)
+        if len(calls) >= 2:
+            called_twice.set()
 
     task = asyncio.create_task(handler.start_heartbeat(fake_publish))
-    await asyncio.sleep(0.15)
+    await asyncio.wait_for(called_twice.wait(), timeout=1.0)
     task.cancel()
     try:
         await task
@@ -56,7 +59,7 @@ async def test_heartbeat_sets_started_at():
         pass
 
     task = asyncio.create_task(handler.start_heartbeat(noop))
-    await asyncio.sleep(0.01)
+    await asyncio.sleep(0)
     task.cancel()
     try:
         await task

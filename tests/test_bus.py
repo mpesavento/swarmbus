@@ -154,7 +154,12 @@ async def test_listen_retains_online_presence():
         async def __aexit__(self, *_):
             pass
         async def publish(self, topic, payload, qos=0, retain=False):
-            published.append({"topic": topic, "retain": retain, "qos": qos})
+            published.append({
+                "topic": topic,
+                "payload": payload,
+                "retain": retain,
+                "qos": qos,
+            })
         async def subscribe(self, *args, **kwargs):
             pass
         @property
@@ -172,10 +177,101 @@ async def test_listen_retains_online_presence():
     with patch("swarmbus.bus.aiomqtt.Client", side_effect=_capture_client):
         await bus.listen()
 
-    online = [p for p in published if p["topic"] == "agents/sparrow/presence"]
-    assert online, "expected an online presence publish"
-    assert online[0]["retain"] is True
-    assert will_args["retain"] is True  # LWT also retained
+    assert [item["topic"] for item in published] == [
+        "swarmbus/registry/sparrow",
+        "agents/sparrow/presence",
+        "agents/sparrow/presence",
+    ]
+    registry = json.loads(published[0]["payload"])
+    assert registry["lifecycle"] == "named"
+    assert registry["durability"] == "ephemeral"
+    assert "mqtt_client_id" not in registry
+    assert json.loads(published[1]["payload"])["state"] == "online"
+    assert json.loads(published[2]["payload"])["state"] == "offline"
+    assert all(item["retain"] is True for item in published)
+    assert will_args["retain"] is True
+
+
+@pytest.mark.asyncio
+async def test_listen_refreshes_registry_heartbeat():
+    published = []
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def publish(self, topic, payload, **_kwargs):
+            published.append((str(topic), payload))
+
+        async def subscribe(self, *_args, **_kwargs):
+            pass
+
+        @property
+        def messages(self):
+            async def _gen():
+                await asyncio.Event().wait()
+                yield
+
+            return _gen()
+
+    bus = AgentBus(
+        agent_id="sparrow",
+        registry_heartbeat_seconds=0.001,
+    )
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
+        task = asyncio.create_task(bus.listen())
+        for _ in range(100):
+            registry_payloads = [
+                json.loads(payload)
+                for topic, payload in published
+                if topic == "swarmbus/registry/sparrow"
+            ]
+            if len(registry_payloads) >= 2:
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert len(registry_payloads) >= 2
+    assert registry_payloads[-1]["last_seen"] > registry_payloads[0]["last_seen"]
+
+
+@pytest.mark.asyncio
+async def test_listen_surfaces_unexpected_registry_heartbeat_failure():
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def publish(self, *_args, **_kwargs):
+            pass
+
+        async def subscribe(self, *_args, **_kwargs):
+            pass
+
+        @property
+        def messages(self):
+            async def _gen():
+                await asyncio.Event().wait()
+                yield
+
+            return _gen()
+
+    bus = AgentBus(agent_id="sparrow")
+
+    async def fail_heartbeat(*_args):
+        raise ValueError("heartbeat exploded")
+
+    bus._registry_heartbeat_loop = fail_heartbeat
+    with patch("swarmbus.bus.aiomqtt.Client", return_value=FakeClient()):
+        with pytest.raises(ValueError, match="heartbeat exploded"):
+            await bus.listen()
 
 
 @pytest.mark.asyncio

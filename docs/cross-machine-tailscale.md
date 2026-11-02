@@ -226,7 +226,7 @@ Usually because the broker host's MagicDNS name changed (rare — only happens o
 
 **Don't.** With `--persistent` (the default), they share one MQTT client identifier and kick each other in a loop every few seconds. With `--no-persistent`, they race for each QoS1 message and each sees a roughly-even fraction of the traffic. In both cases, the archive you read from either machine is incomplete.
 
-If you legitimately want "reach me at whichever machine I happen to be on," use *different* agent-ids per host (`planner-pi` and `planner-laptop`) and have whoever's sending to you decide which to target (via `list_agents` or a routing convention).
+If you legitimately want "reach me at whichever machine I happen to be on," use *different* agent-ids per host (`planner-pi` and `planner-laptop`) and have whoever's sending to you decide which to target (via `agent_state` / `swarmbus list` or a routing convention).
 
 ---
 
