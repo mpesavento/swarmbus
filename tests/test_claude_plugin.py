@@ -56,11 +56,12 @@ def test_mcp_server_uses_only_declared_user_config():
     assert used == declared
 
 
-def test_plugin_starts_the_sidecar_persistent_with_presence():
-    # agent_state refuses without --presence; only --persistent queues while the session is closed.
+def test_plugin_starts_the_sidecar_with_presence_but_not_persistent():
+    # agent_state refuses without --presence. --persistent gives every session on an agent id the
+    # same MQTT client id, so two sessions would evict each other; it waits for #88.
     [server] = _json(MCP_CONFIG)["mcpServers"].values()
-    assert "--persistent" in server["args"]
     assert "--presence" in server["args"]
+    assert "--persistent" not in server["args"]
 
 
 def test_plugin_advertises_agent_state_not_list_agents():

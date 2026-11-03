@@ -26,7 +26,7 @@ Claude Code asks for the agent id, the broker host (default `localhost`) and the
 
 ## What it runs and connects to
 
-- It runs `swarmbus mcp-server --agent-id <id> --broker <host> --port <port> --persistent --presence` from your PATH, once per Claude Code session.
+- It runs `swarmbus mcp-server --agent-id <id> --broker <host> --port <port> --presence` from your PATH, once per Claude Code session.
 - With `--presence` the sidecar publishes this agent's online or offline state and a registry record to the broker, retained, so peers can see it. That is also what lets `agent_state` answer.
 - The sidecar connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one.
 - Broker credentials and TLS settings come from that config file or the `SWARMBUS_BROKER_*` environment variables; see `docs/configuration.md`. The plugin's host and port settings take precedence over the config file.
@@ -34,8 +34,8 @@ Claude Code asks for the agent id, the broker host (default `localhost`) and the
 ## Things to know
 
 - If you used `scripts/setup-cc-plugin.sh` before, remove its registration (`claude mcp remove --scope user swarmbus`) and its skill copy (`~/.claude/skills/using-swarmbus`), or Claude gets two sets of swarmbus tools.
-- Each session that has the plugin enabled starts its own sidecar under the same agent id. `--persistent` gives that id one MQTT client id (`swarmbus-<agent-id>`), so a second session kicks the first off the broker and the two keep kicking each other in a loop. Give each session its own id, or enable the plugin in one session only.
-- The broker queues messages sent to this agent id while no session is open, once the sidecar has connected for the first time, and the next session receives them. Do not also run a default `swarmbus start` daemon under the same id: it takes the same MQTT client id, so the two kick each other off.
-- To retire an id you no longer use, run `swarmbus registry-forget --agent-id <id>`, or the broker keeps queueing for it; see `docs/configuration.md`.
+- Each session that has the plugin enabled starts its own sidecar under the same agent id. Without `--persistent` each sidecar has its own broker session, so each gets a copy of every message, but the sidecars share one presence and registry record for that id. Give each session its own id if you need them told apart.
+- The sidecar does not run `--persistent`, so messages sent to this agent id while no session is open are not queued. Persistence comes with #88 (one shared daemon per agent id): `--persistent` gives an id a single MQTT client id (`swarmbus-<agent-id>`), and two sessions on one id would kick each other off the broker in a loop.
+- To retire an id you no longer use, run `swarmbus registry-forget --agent-id <id>` to remove its registry record; see `docs/configuration.md`.
 
 swarmbus is MIT-licensed. Source, docs and issues: https://github.com/mpesavento/swarmbus
