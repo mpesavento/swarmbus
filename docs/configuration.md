@@ -134,6 +134,8 @@ Every `swarmbus` command can read its host settings (broker, agent id, limits, o
 
 **CLI flag > env var > config file > built-in default.**
 
+An empty `--broker` or `--port` counts as unset, so the config file and then the built-in default apply. The Claude Code plugin relies on this, because it passes its host and port settings even when they are empty. An empty `SWARMBUS_BROKER_*` env var counts as unset too.
+
 For the outbox path: `--outbox` > `SWARMBUS_OUTBOX_<ID>` > `SWARMBUS_OUTBOX` > `[outbox] path`.
 
 ### Example
