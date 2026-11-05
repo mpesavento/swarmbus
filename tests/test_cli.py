@@ -1423,6 +1423,21 @@ def test_doctor_flags_a_double_claude_registration(tmp_path, monkeypatch):
     assert "cannot read" in line
 
 
+def test_doctor_quotes_the_skill_path_in_the_removal_hint(tmp_path, monkeypatch):
+    cfg = tmp_path / "my config"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {"swarmbus@swarmbus": []}})
+    )
+    (cfg / "skills" / "using-swarmbus").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    result, _ = _doctor()
+    assert any(
+        l.strip().startswith("fix:") and f"rm -rf '{cfg}/skills/using-swarmbus'" in l
+        for l in result.output.splitlines()
+    ), result.output
+
+
 def test_detect_agent_id_keeps_callers_env_and_defaults_when_unset(monkeypatch):
     from swarmbus.cli import _detect_agent_id
 

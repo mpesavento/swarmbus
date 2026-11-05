@@ -1090,7 +1090,7 @@ def _doctor_claude_registration() -> tuple[str, str, str | None]:
     if mcp_found:
         removals.append("claude mcp remove --scope user swarmbus")
     if skill.exists():
-        removals.append(f"rm -rf {skill}")
+        removals.append(f"rm -rf {shlex.quote(str(skill))}")
     return (
         f"{prefix} registered twice: the swarmbus plugin ({plugin_key}) "
         f"and scripts/setup-cc-plugin.sh ({what})",
