@@ -22,14 +22,16 @@ The plugin starts the sidecar but does not install swarmbus or run a broker. Bef
 claude plugin install swarmbus --marketplace mpesavento/swarmbus
 ```
 
-Claude Code asks for the agent id, the broker host (default `localhost`) and the broker port (default `1883`). Change them later in `/config`.
+Claude Code asks for the agent id. The broker host, port, username and password are optional. An empty host or port is taken from `~/.swarmbus/config.ini` (`[broker] host` / `port`), then `localhost:1883`. The username and password are stored as sensitive values. Change any of them later in `/config`.
 
 ## What it runs and connects to
 
 - It runs `swarmbus mcp-server --agent-id <id> --broker <host> --port <port> --presence` from your PATH, once per Claude Code session.
 - With `--presence` the sidecar publishes this agent's online or offline state and a registry record to the broker, retained, so peers can see it. That is also what lets `agent_state` answer.
 - The sidecar connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one.
-- Broker credentials and TLS settings come from that config file or the `SWARMBUS_BROKER_*` environment variables; see `docs/configuration.md`. The plugin's host and port settings take precedence over the config file.
+- An empty host or port counts as unset, so the config file's value applies, then the built-in default. A host or port set in the plugin beats the config file.
+- The username and password reach the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`. An empty one counts as unset, so the config file's values apply.
+- TLS settings still come from the config file or the `SWARMBUS_BROKER_*` environment variables; see `docs/configuration.md`.
 
 ## Things to know
 

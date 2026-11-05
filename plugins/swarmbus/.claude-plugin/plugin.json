@@ -21,16 +21,28 @@
     "broker": {
       "type": "string",
       "title": "Broker host",
-      "description": "Host name or IP of the MQTT broker",
-      "default": "localhost"
+      "description": "Host name or IP of the MQTT broker. Leave empty to use [broker] host from ~/.swarmbus/config.ini, else localhost.",
+      "default": ""
     },
     "port": {
-      "type": "number",
+      "type": "string",
       "title": "Broker port",
-      "description": "Port of the MQTT broker",
-      "default": 1883,
-      "min": 1,
-      "max": 65535
+      "description": "Port of the MQTT broker. Leave empty to use [broker] port from ~/.swarmbus/config.ini, else 1883.",
+      "default": ""
+    },
+    "broker_username": {
+      "type": "string",
+      "title": "Broker username",
+      "description": "Username for the MQTT broker. Leave empty to use [broker] username from ~/.swarmbus/config.ini, or none.",
+      "sensitive": true,
+      "default": ""
+    },
+    "broker_password": {
+      "type": "string",
+      "title": "Broker password",
+      "description": "Password for the MQTT broker. Leave empty to use [broker] password from ~/.swarmbus/config.ini, or none.",
+      "sensitive": true,
+      "default": ""
     }
   }
 }
