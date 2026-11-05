@@ -16,6 +16,19 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ---
 
+## [Unreleased]
+
+### Added
+- `swarmbus mcp-daemon` owns one managed MQTT runtime behind a private same-uid AF_UNIX RPC socket, and `swarmbus mcp-proxy` gives any number of local stdio MCP clients the existing `send_message`, `read_inbox`, and `agent_state` tools without broker credentials. The daemon uses a sibling lock to enforce one owner, reports broker readiness separately from socket availability, and cleans up the runtime, socket, and lock on signals or an authenticated local shutdown request. Both runtime commands accept `--password-file`; the proxy accepts only `--socket`.
+
+### Wire-compat
+1. **Envelope shape — no change.**
+2. **Topic layout — no change.**
+3. **Retain/QoS defaults — no change.** The shared daemon uses the existing managed-runtime settings selected by its flags.
+4. **MCP tool contract — no change.** The proxy exposes the same three tools and parameter shapes as `mcp-server`; the local RPC transport is private and versioned independently.
+
+---
+
 ## [0.2.1] — 2026-10-31
 
 ### Added

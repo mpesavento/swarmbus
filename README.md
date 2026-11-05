@@ -201,7 +201,18 @@ swarmbus mcp-server --agent-id planner --broker mqtt.example.com \
 
 This replaces the daemon for most MCP-based agents. **Do not run a daemon and a persistent MCP server for the same agent-id** — only one client can hold the persistent session at a time; the broker will kick the first one off when the second connects. When the sidecar has lost its broker connection, `read_inbox` logs the transport error and returns an empty list, while `agent_state` raises `TransportUnavailable` rather than serving stale directory data. Any other failure surfaces as an MCP tool error, including a fatal runtime failure (`RuntimeFatalError`) and a degraded durable inbox (`StoreUnavailable`). An inbox schema newer than this version is rejected when the sidecar starts, before any tool runs.
 
-Without `--persistent`, messages received while the sidecar is running still survive process restarts in SQLite, but the broker does not queue messages sent while the sidecar is offline.
+Several local MCP sessions can instead share one MQTT owner. Start `mcp-daemon` yourself, then configure each client to spawn only the credential-free `mcp-proxy`:
+
+```bash
+swarmbus mcp-daemon --socket ~/.local/state/swarmbus/planner.sock \
+  --agent-id planner --broker mqtt.example.com --password-file ~/.config/swarmbus/mqtt.password \
+  --persistent --presence
+swarmbus mcp-proxy --socket ~/.local/state/swarmbus/planner.sock
+```
+
+The private AF_UNIX socket accepts only the daemon's uid and is mode `0600`; a non-blocking sibling lock prevents two daemons from owning the same socket. `mcp-proxy` carries no broker address or credentials and exposes the same three tools as `mcp-server`. It does not auto-start the daemon or fall back to its own MQTT connection: a missing or unhealthy daemon is an explicit error. The daemon removes its socket and stops the managed runtime on a signal or an authenticated local shutdown request.
+
+Without `--persistent`, messages received while the runtime is running still survive process restarts in SQLite, but the broker does not queue messages sent while it is offline.
 
 **Reactive wake for Claude Code** (optional). Archive gives you a trail but doesn't wake an idle Claude Code session. To wake a real reasoning turn on high-priority inbound, pair the daemon with `examples/claude-code-wake.sh`:
 
@@ -325,23 +336,28 @@ swarmbus list --json
 # Start the listener daemon (long-running; file-bridges to inbox.md)
 swarmbus start --agent-id planner --inbox ~/sync/inbox.md
 
-# Start the MCP sidecar for any stdio MCP client
+# Start one MCP sidecar for one stdio MCP client
 swarmbus mcp-server --agent-id planner
+
+# Or share one runtime among local stdio clients
+swarmbus mcp-daemon --socket ~/.local/state/swarmbus/planner.sock --agent-id planner
+swarmbus mcp-proxy --socket ~/.local/state/swarmbus/planner.sock
 ```
 
 `--body` and `--body-file` are mutually exclusive; exactly one is required.
 
-**Five receive paths — pick one per agent-id.**
+**Six receive paths — pick one per agent-id.**
 
 | Path | Durable? | Use when |
 |---|---|---|
 | `start` (daemon) | Yes (persistent session, default) | Long-running process, file-bridge to inbox, reactive wake |
-| `mcp-server --persistent --presence` | Yes (persistent session) | MCP-based agents (Claude Code, Cursor); no daemon needed |
+| `mcp-daemon --persistent --presence` + local `mcp-proxy` processes | Yes (persistent session) | Several local MCP clients share one runtime and credential boundary |
+| `mcp-server --persistent --presence` | Yes (persistent session) | One MCP client owns its runtime |
 | `watch --persistent` | Yes (persistent session; first run registers) | Agent sessions that wait, handle one message, and wait again |
 | `read` / `watch` (one-shot) | No (ephemeral session) | CI jobs, shell scripts, quick checks |
 | `tail` (file-based) | N/A (reads daemon's file) | Companion to `start`; cursor-tracked |
 
-**Don't combine persistent receive paths for the same id** — `start`, `mcp-server --persistent` and `watch --persistent` all claim the same `swarmbus-<agent-id>` MQTT client identifier. The broker evicts the connected one when another arrives. Use exactly one per id.
+**Don't combine persistent receive paths for the same id** — `start`, `mcp-daemon --persistent`, `mcp-server --persistent` and `watch --persistent` all claim the same `swarmbus-<agent-id>` MQTT client identifier. The broker evicts the connected one when another arrives. Use exactly one per id.
 
 `mcp-server --persistent` requires `--presence`. A persistent session has the broker queue messages for an identity while it is away, and an identity absent from the directory cannot be found or retired, so its queued backlog could grow without bound.
 
@@ -396,7 +412,7 @@ The reset is not access-controlled: any process running as the agent's user, inc
 
 Each listener also limits each sender to `--rate-limit` messages per 60 s per topic (default 20, `SWARMBUS_RATE_LIMIT`). A sender that goes over on its inbox topic has every message held for `--rate-cooldown` seconds (default 600, `SWARMBUS_RATE_COOLDOWN`) and is then admitted again with no reset; a broadcast over the limit is held and starts no cool-down. Held messages are never delivered later. `swarmbus held` shows them and when each cool-down ends, and `swarmbus held --reset <peer>` ends a cool-down early.
 
-`--on-trip <cmd>` (or `SWARMBUS_ON_TRIP`) on `swarmbus start`, `swarmbus watch` and `swarmbus mcp-server` tells a person when a sender is newly tripped. It runs the command once per trip (a hop-limit trip, or the start of a rate-limit cool-down), in the background, killed after 30 s, with no stdin; its stdout goes to the listener's stderr. The command gets these variables: `SWARMBUS_TRIP_AGENT` (this agent's id), `SWARMBUS_TRIP_LISTENER` (`start`, `watch` or `mcp-server`), `SWARMBUS_TRIP_KIND` (`hop-limit` or `rate-limit`), `SWARMBUS_TRIP_SENDER`, `SWARMBUS_TRIP_MESSAGE_ID` (the message that tripped it), `SWARMBUS_TRIP_HOPS`, `SWARMBUS_TRIP_ORIGIN` (empty if none), `SWARMBUS_TRIP_TOPIC` (the topic it arrived on), `SWARMBUS_TRIP_AT` (when it tripped), `SWARMBUS_TRIP_UNTIL` (end of the cool-down; empty for a hop-limit trip), `SWARMBUS_TRIP_RESET` (the `swarmbus held --reset` command to run) and `SWARMBUS_TRIP_SUMMARY` (a one-line description). Every value is sanitized to one line of at most 256 characters, and the held message's subject and body are never passed. For example, `swarmbus start --agent-id me --on-trip "notify-send swarmbus"` pops a desktop notification; `$SWARMBUS_TRIP_SUMMARY` is a ready-to-send line for a wrapper script that pings a chat. `swarmbus doctor` also lists tripped and cooling senders and the held-message count and, for the last `--window` minutes (default 15), each sender's message rate, the deepest `hops` seen and the holds by reason. The rate is per sender at this receiver and counts broadcasts with direct messages.
+`--on-trip <cmd>` (or `SWARMBUS_ON_TRIP`) on `swarmbus start`, `swarmbus watch`, `swarmbus mcp-server` and `swarmbus mcp-daemon` tells a person when a sender is newly tripped. It runs the command once per trip (a hop-limit trip, or the start of a rate-limit cool-down), in the background, killed after 30 s, with no stdin; its stdout goes to the listener's stderr. The command gets these variables: `SWARMBUS_TRIP_AGENT` (this agent's id), `SWARMBUS_TRIP_LISTENER` (`start`, `watch` or `mcp-server`), `SWARMBUS_TRIP_KIND` (`hop-limit` or `rate-limit`), `SWARMBUS_TRIP_SENDER`, `SWARMBUS_TRIP_MESSAGE_ID` (the message that tripped it), `SWARMBUS_TRIP_HOPS`, `SWARMBUS_TRIP_ORIGIN` (empty if none), `SWARMBUS_TRIP_TOPIC` (the topic it arrived on), `SWARMBUS_TRIP_AT` (when it tripped), `SWARMBUS_TRIP_UNTIL` (end of the cool-down; empty for a hop-limit trip), `SWARMBUS_TRIP_RESET` (the `swarmbus held --reset` command to run) and `SWARMBUS_TRIP_SUMMARY` (a one-line description). Every value is sanitized to one line of at most 256 characters, and the held message's subject and body are never passed. For example, `swarmbus start --agent-id me --on-trip "notify-send swarmbus"` pops a desktop notification; `$SWARMBUS_TRIP_SUMMARY` is a ready-to-send line for a wrapper script that pings a chat. `swarmbus doctor` also lists tripped and cooling senders and the held-message count and, for the last `--window` minutes (default 15), each sender's message rate, the deepest `hops` seen and the holds by reason. The rate is per sender at this receiver and counts broadcasts with direct messages.
 
 swarmbus moves messages; it does not decide what an agent keeps. If your agents write what peers tell them into notes, a knowledge base or a startup file, read [docs/memetic-safety.md](docs/memetic-safety.md): record where each claim came from (`source: agent:<id>`), keep agent-only claims out of curated stores, rank startup context by quality rather than recency, and audit the store instead of wiping it.
 
