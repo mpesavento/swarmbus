@@ -481,13 +481,28 @@ For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journ
 swarmbus's listeners hold a sender that goes over `--rate-limit` (see Message envelope), but only after the broker has delivered to them; mosquitto itself has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps. `scripts/setup-mosquitto.sh` installs them in every mode, from `scripts/mosquitto-limits.conf`, as `/etc/mosquitto/conf.d/swarmbus-limits.conf`:
 
 ```
-# 512 KiB: the largest valid envelope is about 384 KiB once json.dumps escapes a 64 KiB body
+# swarmbus per-client broker caps (#66).
+# scripts/setup-mosquitto.sh installs this file as
+# /etc/mosquitto/conf.d/swarmbus-limits.conf. An operator's own copy there is
+# never overwritten.
+
+# 512 KiB. The largest valid envelope is a 64 KiB body (_MAX_BODY_BYTES in
+# src/swarmbus/message.py) serialized by json.dumps, whose ASCII escaping can
+# turn one body byte into six (\u0000). That makes about 384 KiB, plus the
+# envelope's other fields.
 max_packet_size 524288
-# QoS 1/2 messages queued per client beyond those in flight (mosquitto's default)
+
+# QoS 1/2 messages queued per client beyond those in flight; mosquitto's
+# default, written out so it is visible.
 max_queued_messages 1000
-# 32 MiB byte cap on the same queue (mosquitto's default is no cap). Whichever limit is hit first applies.
+
+# 32 MiB byte cap on the same queue (mosquitto's default is 0, no cap), so a
+# long-offline persistent agent can hold a few hundred full-size messages
+# without one client's queue growing without bound. Whichever queue limit is
+# hit first applies.
 max_queued_bytes 33554432
-# QoS 1/2 messages in flight per client (mosquitto's default)
+
+# QoS 1/2 messages in flight per client; mosquitto's default, written out.
 max_inflight_messages 20
 ```
 

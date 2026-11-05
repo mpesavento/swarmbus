@@ -79,6 +79,8 @@ def test_readme_limits_block_matches_limits_file():
 
     assert match, "no fenced block in the Broker limits section"
     assert _settings(match.group(1)) == _settings(LIMITS_FILE.read_text())
+    # an exact copy of the file, comments and spacing included
+    assert match.group(1).strip() == LIMITS_FILE.read_text().strip()
     assert "scripts/mosquitto-limits.conf" in section
     assert LIMITS_DEST in section
 
