@@ -83,11 +83,9 @@ def test_readme_limits_block_matches_limits_file():
     assert LIMITS_DEST in section
 
 
-@pytest.mark.parametrize("mode", [[], ["--tailscale"], ["--tailscale-only"]], ids=["default", "tailscale", "tailscale-only"])
-def test_setup_script_installs_limits_before_restart(tmp_path, mode):
-    if Path(LIMITS_DEST).exists():
-        pytest.skip("host already has the limits file, which the script rightly leaves alone")
-
+def _run_setup(tmp_path, mode):
+    """Run the real setup script with fake sudo and tailscale first on PATH and the conf
+    directory in tmp_path; return the result and the sudo log lines."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     sudo = bin_dir / "sudo"
@@ -102,6 +100,7 @@ def test_setup_script_installs_limits_before_restart(tmp_path, mode):
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "SUDO_LOG": str(log),
+        "SWARMBUS_MOSQUITTO_CONF_D": str(tmp_path / "conf.d"),
     }
     assert shutil.which("sudo", path=env["PATH"]) == str(sudo)
 
@@ -114,8 +113,23 @@ def test_setup_script_installs_limits_before_restart(tmp_path, mode):
         timeout=60,
     )
     assert result.returncode == 0, result.stderr
+    return result, (log.read_text().splitlines() if log.exists() else [])
 
-    lines = log.read_text().splitlines()
-    installs = [i for i, line in enumerate(lines) if "mosquitto-limits.conf" in line and LIMITS_DEST in line]
+
+@pytest.mark.parametrize("mode", [[], ["--tailscale"], ["--tailscale-only"]], ids=["default", "tailscale", "tailscale-only"])
+def test_setup_script_installs_limits_before_restart(tmp_path, mode):
+    _, lines = _run_setup(tmp_path, mode)
+    dest = str(tmp_path / "conf.d" / "swarmbus-limits.conf")
+    installs = [i for i, line in enumerate(lines) if "mosquitto-limits.conf" in line and dest in line]
     assert installs, lines
     assert installs[0] < lines.index("systemctl restart mosquitto")
+
+
+def test_setup_script_leaves_an_existing_limits_file_alone(tmp_path):
+    existing = tmp_path / "conf.d" / "swarmbus-limits.conf"
+    existing.parent.mkdir()
+    existing.write_text("# mine\n")
+    result, lines = _run_setup(tmp_path, [])
+    assert not [line for line in lines if "mosquitto-limits.conf" in line], lines
+    assert "already exists" in result.stdout
+    assert existing.read_text() == "# mine\n"

@@ -76,8 +76,9 @@ allow_anonymous true"
 esac
 
 # Per-client broker caps (#66). An operator's own copy wins: never overwrite it.
+# SWARMBUS_MOSQUITTO_CONF_D overrides the conf directory (the tests use it).
 LIMITS_SRC="$(cd "$(dirname "$0")" && pwd)/mosquitto-limits.conf"
-LIMITS_DEST="/etc/mosquitto/conf.d/swarmbus-limits.conf"
+LIMITS_DEST="${SWARMBUS_MOSQUITTO_CONF_D:-/etc/mosquitto/conf.d}/swarmbus-limits.conf"
 if [ -e "$LIMITS_DEST" ]; then
   echo "[swarmbus] $LIMITS_DEST already exists; leaving it as it is (your edits win)."
 else
