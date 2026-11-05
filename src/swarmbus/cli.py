@@ -1038,6 +1038,68 @@ def _doctor_channel(db: Path, agent_id: str, window_minutes: int) -> tuple[str, 
     return (text, "ok", None)
 
 
+def _doctor_claude_registration() -> tuple[str, str, str | None]:
+    """The doctor's double-registration probe: the Claude Code plugin and scripts/setup-cc-plugin.sh each register swarmbus (#85)."""
+    prefix = "claude registration....."
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        claude_dir = Path(config_dir).expanduser()
+        claude_json = claude_dir / ".claude.json"
+    else:
+        claude_dir = Path.home() / ".claude"
+        claude_json = Path.home() / ".claude.json"
+    registry = claude_dir / "plugins" / "installed_plugins.json"
+    skill = claude_dir / "skills" / "using-swarmbus"
+
+    def read_json(path: Path) -> object | None:
+        try:
+            return json.loads(path.read_text())
+        except FileNotFoundError:
+            return None
+
+    plugin_key = None
+    found: list[str] = []
+    mcp_found = False
+    path = registry
+    try:
+        data = read_json(registry)
+        plugins = data.get("plugins") if isinstance(data, dict) else None
+        if isinstance(plugins, dict):
+            plugin_key = next(
+                (k for k in plugins if str(k).split("@", 1)[0] == "swarmbus"), None
+            )
+        path = claude_json
+        data = read_json(claude_json)
+        servers = data.get("mcpServers") if isinstance(data, dict) else None
+        if isinstance(servers, dict) and "swarmbus" in servers:
+            mcp_found = True
+            found.append(f"MCP server swarmbus in {claude_json}")
+    except (OSError, ValueError) as exc:
+        return (f"{prefix} cannot read {path}: {sanitize_field(exc)}", "warn", None)
+    if skill.exists():
+        found.append(f"skill at {skill}")
+    what = "; ".join(found)
+
+    if plugin_key is None and not found:
+        return (f"{prefix} (no swarmbus plugin or setup-cc-plugin.sh registration)", "skip", None)
+    if not found:
+        return (f"{prefix} the swarmbus plugin ({plugin_key})", "ok", None)
+    if plugin_key is None:
+        return (f"{prefix} scripts/setup-cc-plugin.sh ({what})", "ok", None)
+    removals = []
+    if mcp_found:
+        removals.append("claude mcp remove --scope user swarmbus")
+    if skill.exists():
+        removals.append(f"rm -rf {skill}")
+    return (
+        f"{prefix} registered twice: the swarmbus plugin ({plugin_key}) "
+        f"and scripts/setup-cc-plugin.sh ({what})",
+        "warn",
+        "keep the plugin (the preferred route) and remove the script's copy: "
+        + "; ".join(removals),
+    )
+
+
 @main.command()
 @click.option("--agent-id", default=None, help="Agent id to audit. Defaults to auto-detect from systemd unit or env.")
 @_broker_address_options
@@ -1062,12 +1124,14 @@ def doctor(
 ) -> None:
     """Run a self-diagnosis of the local swarmbus install + daemon state.
 
-    Prints a checklist of 9 probes: CLI version, broker reachability, my
+    Prints a checklist of 10 probes: CLI version, broker reachability, my
     systemd unit state, daemon library freshness (catches stale in-memory
     Python — the root cause of the 2026-04-14 priority-field incident),
     --invoke wired, outbox env resolvable, peer discovery, tripped senders
     and held messages from the state db, channel traffic (per-sender rate,
-    deepest hops, holds by reason over the last --window minutes). Each failure
+    deepest hops, holds by reason over the last --window minutes), and the
+    Claude Code registration (warns when both the swarmbus plugin and
+    scripts/setup-cc-plugin.sh registered swarmbus). Each failure
     prints a one-line fix hint. Exits 0 if every check is green, 1 if
     any is red, 2 if the doctor itself couldn't run.
 
@@ -1333,6 +1397,9 @@ def doctor(
         results.append(_doctor_channel(
             _state_db_path(state_dir, agent_id_resolved), agent_id_resolved, window,
         ))
+
+    # 10. Claude Code registration
+    results.append(_doctor_claude_registration())
 
     # Render
     click.echo(f"\n[doctor] swarmbus health check for agent-id={agent_id_resolved}\n")

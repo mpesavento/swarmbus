@@ -1,0 +1,1 @@
+{"version": 2, "plugins": {"swarmbus@swarmbus": [{"scope": "user", "installPath": "/nonexistent/swarmbus", "version": "0.2.1"}]}}
