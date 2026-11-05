@@ -478,20 +478,29 @@ For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journ
 
 ### Broker limits
 
-swarmbus's listeners hold a sender that goes over `--rate-limit` (see Message envelope), but only after the broker has delivered to them; mosquitto itself has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps, set in `mosquitto.conf` or a file in `/etc/mosquitto/conf.d/`:
+swarmbus's listeners hold a sender that goes over `--rate-limit` (see Message envelope), but only after the broker has delivered to them; mosquitto itself has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps. `scripts/setup-mosquitto.sh` installs them in every mode, from `scripts/mosquitto-limits.conf`, as `/etc/mosquitto/conf.d/swarmbus-limits.conf`:
 
 ```
-# QoS 1/2 messages queued per client beyond those in flight (default 1000; 0 = no cap)
+# 512 KiB: the largest valid envelope is about 384 KiB once json.dumps escapes a 64 KiB body
+max_packet_size 524288
+# QoS 1/2 messages queued per client beyond those in flight (mosquitto's default)
 max_queued_messages 1000
-# Byte cap on the same queue (default 0 = no cap). Whichever limit is hit first applies.
-max_queued_bytes 0
-# QoS 1/2 messages in flight per client (default 20)
+# 32 MiB byte cap on the same queue (mosquitto's default is no cap). Whichever limit is hit first applies.
+max_queued_bytes 33554432
+# QoS 1/2 messages in flight per client (mosquitto's default)
 max_inflight_messages 20
-# Largest packet the broker accepts, in bytes (default 2000000 since mosquitto 2.1)
-max_packet_size 2000000
 ```
 
-Messages over a queue cap are dropped by the broker. Restart mosquitto after changing: `sudo systemctl restart mosquitto`. A per-client publish-rate limit needs a mosquitto plugin or a broker that supports it natively; [#26](https://github.com/mpesavento/swarmbus/issues/26) tracks that.
+The script leaves an existing `/etc/mosquitto/conf.d/swarmbus-limits.conf` alone, so your edits win. A broker set up earlier does not change until the file is added. To add it by hand, from a checkout of this repository:
+
+```
+sudo cp scripts/mosquitto-limits.conf /etc/mosquitto/conf.d/swarmbus-limits.conf
+sudo systemctl restart mosquitto
+```
+
+Debian's `mosquitto.conf` reads every file in `/etc/mosquitto/conf.d/`; on another layout, paste the four settings into `mosquitto.conf` instead.
+
+Messages over a queue cap are dropped by the broker. A per-client publish-rate limit needs a mosquitto plugin or a broker that supports it natively; [#26](https://github.com/mpesavento/swarmbus/issues/26) tracks that.
 
 ## Onboarding a new agent
 
