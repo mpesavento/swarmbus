@@ -71,7 +71,9 @@ def test_plugin_skill_is_a_copy_of_the_packaged_skill():
 def test_mcp_server_uses_only_declared_user_config():
     declared = set(_json(MANIFEST)["userConfig"])
     [server] = _json(MCP_CONFIG)["mcpServers"].values()
-    assert _sidecar_argv(server)[:2] == ["swarmbus", "mcp-server"]
+    argv = _sidecar_argv(server)
+    assert argv[0] == "swarmbus"
+    assert argv[1] == "mcp-server"
     used = set(re.findall(r"\$\{user_config\.(\w+)\}", json.dumps(server)))
     assert used <= declared
     # .mcp.json is an operator hand edit (the build agent cannot write it), so the credential settings may be declared before it passes them (#84)
