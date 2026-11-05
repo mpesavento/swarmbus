@@ -287,3 +287,77 @@ def test_broker_password_needs_a_private_file_and_is_read_verbatim(tmp_path):
     no_pw = _write(tmp_path / "no-pw.ini", "[agent]\nid = sparrow\n", mode=0o644)
     result, _ = _send(["--config", str(no_pw), *SEND])
     assert result.exit_code == 0, result.output
+
+
+def test_empty_broker_and_port_flags_count_as_unset(tmp_path, monkeypatch):
+    from swarmbus import config as sb_config
+
+    monkeypatch.setattr(sb_config, "default_config_path",
+                        lambda: tmp_path / "home" / ".swarmbus" / "config.ini")
+    cfg = _write(tmp_path / "c.ini", """
+[agent]
+id = sparrow
+
+[broker]
+host = cfg.example
+port = 1884
+""")
+
+    result, bus = _send(["--config", str(cfg), *SEND, "--broker", "", "--port", ""])
+    assert result.exit_code == 0, result.output
+    kw = bus.call_args.kwargs
+    assert (kw["broker"], kw["port"]) == ("cfg.example", 1884)
+
+    result, bus = _send([*SEND, "--agent-id", "sparrow", "--broker", "", "--port", ""])
+    assert result.exit_code == 0, result.output
+    kw = bus.call_args.kwargs
+    assert (kw["broker"], kw["port"]) == ("localhost", 1883)
+
+    result, bus = _send(["--config", str(cfg), *SEND, "--broker", "flag.example", "--port", "1999"])
+    assert result.exit_code == 0, result.output
+    kw = bus.call_args.kwargs
+    assert (kw["broker"], kw["port"]) == ("flag.example", 1999)
+
+    result, bus = _send(["--config", str(cfg), *SEND, "--port", "abc"])
+    assert result.exit_code == 2, result.output
+    bus.assert_not_called()
+
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = CliRunner().invoke(
+            main, ["--config", str(cfg), "mcp-server", "--broker", "", "--port", "", "--presence"])
+    assert result.exit_code == 0, result.output
+    kw = run_server.call_args.kwargs
+    assert (kw["broker"], kw["port"]) == ("cfg.example", 1884)
+
+
+def test_empty_credential_env_vars_count_as_unset(tmp_path, monkeypatch):
+    from swarmbus import config as sb_config
+
+    monkeypatch.setattr(sb_config, "default_config_path",
+                        lambda: tmp_path / "home" / ".swarmbus" / "config.ini")
+    cfg = _write(tmp_path / "c.ini", """
+[agent]
+id = sparrow
+
+[broker]
+username = sparrow
+password = file-pw
+""")
+    env = {"SWARMBUS_BROKER_USERNAME": "", "SWARMBUS_BROKER_PASSWORD": ""}
+
+    result, bus = _send(["--config", str(cfg), *SEND], env=env)
+    assert result.exit_code == 0, result.output
+    kw = bus.call_args.kwargs
+    assert (kw["username"], kw["password"]) == ("sparrow", "file-pw")
+
+    result, bus = _send([*SEND, "--agent-id", "sparrow"], env=env)
+    assert result.exit_code == 0, result.output
+    kw = bus.call_args.kwargs
+    assert (kw["username"], kw["password"]) == (None, None)
+
+    with patch("swarmbus.mcp_server.run_mcp_server") as run_server:
+        result = CliRunner().invoke(
+            main, ["--config", str(cfg), "mcp-server", "--presence"], env=env)
+    assert result.exit_code == 0, result.output
+    kw = run_server.call_args.kwargs
+    assert (kw["username"], kw["password"]) == ("sparrow", "file-pw")

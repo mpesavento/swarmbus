@@ -18,6 +18,9 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ## [Unreleased]
 
+### Changed
+- **The Claude Code plugin takes the broker from the config file, and optional broker credentials** (#84). An empty `--broker` or `--port` now counts as unset on every command, so `[broker] host` / `port` from the config file, then `localhost:1883`, applies. The plugin's host and port settings default to empty, and port is now a text setting. New optional, sensitive `broker_username` / `broker_password` settings are passed to the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`.
+
 ### Fixed
 - **The Claude Code plugin caught up with `agent_state`** (#83). `plugin.json` and `marketplace.json` no longer advertise the removed `list_agents` tool, and the plugin starts the sidecar with `--presence`, so `agent_state` answers. The plugin does not pass `--persistent`: with it, two sessions on one agent id would kick each other off the broker in a loop. Queuing messages while the session is closed comes with #88 (one shared daemon per agent id).
 
