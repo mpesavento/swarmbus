@@ -1364,6 +1364,65 @@ def test_doctor_keeps_callers_systemd_user_env(monkeypatch):
     }
 
 
+def test_doctor_flags_a_double_claude_registration(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    def probe():
+        result, _ = _doctor()
+        line = next(
+            (l for l in result.output.splitlines() if "10. claude registration" in l), None
+        )
+        assert line is not None, result.output
+        return line, result.output
+
+    line, _ = probe()
+    assert "[·]" in line
+    assert "(no swarmbus plugin or setup-cc-plugin.sh registration)" in line
+
+    registry = tmp_path / ".claude" / "plugins" / "installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text(json.dumps({"version": 2, "plugins": {"swarmbus@swarmbus": []}}))
+    line, _ = probe()
+    assert "[✓]" in line
+    assert "the swarmbus plugin (swarmbus@swarmbus)" in line
+
+    claude_json = tmp_path / ".claude.json"
+    claude_json.write_text(json.dumps({"mcpServers": {"swarmbus": {"command": "swarmbus"}}}))
+    line, output = probe()
+    assert "[⚠]" in line
+    assert "registered twice" in line
+    assert f"MCP server swarmbus in {tmp_path}/.claude.json" in line
+    fix = next(l for l in output.splitlines() if l.strip().startswith("fix:") and "claude mcp remove" in l)
+    assert "claude mcp remove --scope user swarmbus" in fix
+
+    registry.unlink()
+    line, _ = probe()
+    assert "[✓]" in line
+    assert "scripts/setup-cc-plugin.sh (MCP server swarmbus in" in line
+
+    cfg = tmp_path / "cfg"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"version": 2, "plugins": {"swarmbus@swarmbus": []}})
+    )
+    (cfg / "skills" / "using-swarmbus").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    line, output = probe()
+    assert "registered twice" in line
+    assert f"skill at {cfg}/skills/using-swarmbus" in line
+    assert "MCP server swarmbus" not in line
+    assert any(
+        l.strip().startswith("fix:") and f"rm -rf {cfg}/skills/using-swarmbus" in l
+        for l in output.splitlines()
+    ), output
+
+    (cfg / "plugins" / "installed_plugins.json").write_text("{")
+    line, _ = probe()
+    assert "[⚠]" in line
+    assert "cannot read" in line
+
+
 def test_detect_agent_id_keeps_callers_env_and_defaults_when_unset(monkeypatch):
     from swarmbus.cli import _detect_agent_id
 
