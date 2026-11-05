@@ -8,7 +8,11 @@
         "--broker", "${user_config.broker}",
         "--port", "${user_config.port}",
         "--presence"
-      ]
+      ],
+      "env": {
+        "SWARMBUS_BROKER_USERNAME": "${user_config.broker_username}",
+        "SWARMBUS_BROKER_PASSWORD": "${user_config.broker_password}"
+      }
     }
   }
 }

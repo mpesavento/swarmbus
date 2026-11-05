@@ -57,12 +57,9 @@ def test_mcp_server_uses_only_declared_user_config():
     assert server["command"] == "swarmbus"
     assert server["args"][0] == "mcp-server"
     used = set(re.findall(r"\$\{user_config\.(\w+)\}", json.dumps(server)))
-    assert used <= declared
-    # .mcp.json is an operator hand edit (the build agent cannot write it), so the credential settings may be declared before it passes them (#84)
-    assert declared - used <= set(CREDENTIALS)
+    assert used == declared
     for key, var in CREDENTIALS.items():
-        if key in used:
-            assert server["env"][var] == "${user_config.%s}" % key
+        assert server["env"][var] == "${user_config.%s}" % key
 
 
 def test_plugin_broker_settings_default_to_empty():
