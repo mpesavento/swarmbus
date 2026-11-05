@@ -10,6 +10,10 @@ MANIFEST = PLUGIN_DIR / ".claude-plugin" / "plugin.json"
 MCP_CONFIG = PLUGIN_DIR / ".mcp.json"
 SKILL_SOURCE = ROOT / "src" / "swarmbus" / "skills" / "using-swarmbus" / "SKILL.md"
 SKILL_COPY = PLUGIN_DIR / "skills" / "using-swarmbus" / "SKILL.md"
+CREDENTIALS = {
+    "broker_username": "SWARMBUS_BROKER_USERNAME",
+    "broker_password": "SWARMBUS_BROKER_PASSWORD",
+}
 
 
 def _json(path):
@@ -53,7 +57,48 @@ def test_mcp_server_uses_only_declared_user_config():
     assert server["command"] == "swarmbus"
     assert server["args"][0] == "mcp-server"
     used = set(re.findall(r"\$\{user_config\.(\w+)\}", json.dumps(server)))
-    assert used == declared
+    assert used <= declared
+    # .mcp.json is an operator hand edit (the build agent cannot write it), so the credential settings may be declared before it passes them (#84)
+    assert declared - used <= set(CREDENTIALS)
+    for key, var in CREDENTIALS.items():
+        if key in used:
+            assert server["env"][var] == "${user_config.%s}" % key
+
+
+def test_plugin_broker_settings_default_to_empty():
+    config = _json(MANIFEST)["userConfig"]
+    for key in ("broker", "port"):
+        assert config[key]["type"] == "string", key
+        assert config[key]["default"] == "", key
+        assert not config[key].get("required", False), key
+    [server] = _json(MCP_CONFIG)["mcpServers"].values()
+    args = server["args"]
+    assert args[args.index("--broker") + 1] == "${user_config.broker}"
+    assert args[args.index("--port") + 1] == "${user_config.port}"
+
+
+def test_plugin_takes_optional_sensitive_broker_credentials():
+    config = _json(MANIFEST)["userConfig"]
+    for key in CREDENTIALS:
+        assert config[key]["type"] == "string", key
+        assert config[key]["sensitive"] is True, key
+        assert config[key]["default"] == "", key
+        assert not config[key].get("required", False), key
+
+
+def test_plugin_starts_the_sidecar_with_presence_but_not_persistent():
+    # agent_state refuses without --presence. --persistent gives every session on an agent id the
+    # same MQTT client id, so two sessions would evict each other; it waits for #88.
+    [server] = _json(MCP_CONFIG)["mcpServers"].values()
+    assert "--presence" in server["args"]
+    assert "--persistent" not in server["args"]
+
+
+def test_plugin_advertises_agent_state_not_list_agents():
+    for path in (MANIFEST, MARKETPLACE, PLUGIN_DIR / "README.md"):
+        text = path.read_text()
+        assert "list_agents" not in text, path
+        assert "agent_state" in text, path
 
 
 def test_plugin_folder_holds_only_text_files_and_no_symlinks():

@@ -66,6 +66,38 @@ def _config() -> LoadedConfig:
 # ---------------------------------------------------------------------------
 
 
+class _PortType(click.ParamType):
+    name = "integer"
+
+    def convert(self, value, param, ctx):
+        if value == "":
+            return None
+        return click.INT.convert(value, param, ctx)
+
+
+def _empty_is_unset(ctx, param, value):
+    """An empty --broker / --port counts as not given, so the config file's
+    value and then the built-in default apply; the Claude Code plugin passes
+    both even when its settings are empty (#84)."""
+    if value is None or value == "":
+        configured = ctx.lookup_default(param.name)
+        return configured if configured is not None else param.default
+    return value
+
+
+def _broker_address_options(func):
+    """Apply --broker and --port (rendered in that order) to a Click command."""
+    func = click.option(
+        "--port", type=_PortType(), default=1883, show_default=True,
+        callback=_empty_is_unset,
+    )(func)
+    func = click.option(
+        "--broker", default="localhost", show_default=True,
+        callback=_empty_is_unset,
+    )(func)
+    return func
+
+
 def _broker_auth_options(func):
     """Apply --username / --password / --ca-cert / --client-cert /
     --client-key / --tls to a Click command.
@@ -223,8 +255,7 @@ def _resolve_outbox(
     default=None,
     help="Read message body from a file (use '-' for stdin)",
 )
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option("--content-type", default="text/plain", show_default=True)
 @click.option(
     "--priority",
@@ -421,8 +452,7 @@ def send(
 
 @main.command()
 @click.option("--agent-id", required=True, help="This agent's ID")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option("--inbox", default=None, help="Path for file bridge (inbox.md)")
 @click.option("--invoke", "invoke_cmd", default=None, help="Command to invoke on message")
 @click.option(
@@ -537,8 +567,7 @@ def start(
 
 @main.command()
 @click.option("--agent-id", required=True, help="This agent's ID")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option("--max", "max_messages", default=10, show_default=True, help="Max messages to drain")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON array (default: pretty)")
 @_state_dir_option
@@ -621,8 +650,7 @@ def read(
 
 @main.command()
 @click.option("--agent-id", required=True, help="This agent's ID")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option("--timeout", default=30.0, show_default=True, help="Seconds to wait")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON (default: pretty)")
 @click.option(
@@ -726,8 +754,7 @@ def watch(
 
 
 @main.command("list")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON array")
 @_broker_auth_options
 def list_agents_cmd(
@@ -1014,8 +1041,7 @@ def _doctor_channel(db: Path, agent_id: str, window_minutes: int) -> tuple[str, 
 
 @main.command()
 @click.option("--agent-id", default=None, help="Agent id to audit. Defaults to auto-detect from systemd unit or env.")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @_state_dir_option
 @click.option(
     "--window", type=click.IntRange(min=1), default=15, show_default=True,
@@ -1396,8 +1422,7 @@ def _maintenance_password(
 
 
 @main.command("registry-list")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option(
     "--stale-after-seconds",
     type=float,
@@ -1452,8 +1477,7 @@ def registry_list(
 
 
 @main.command("registry-gc")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option(
     "--stale-after-seconds",
     type=float,
@@ -1541,8 +1565,7 @@ def registry_gc(
 
 @main.command("registry-forget")
 @click.option("--agent-id", required=True, help="Exact agent ID to remove")
-@click.option("--broker", default="localhost", show_default=True)
-@click.option("--port", default=1883, show_default=True)
+@_broker_address_options
 @click.option(
     "--stale-after-seconds",
     type=float,
@@ -1695,18 +1718,24 @@ def _mcp_runtime_options(func):
         show_default=True,
         help="Publish retained presence on startup (online) and shutdown "
              "(offline). Makes this agent visible to `agent_state` and "
-             "`swarmbus list`. Without it the runtime is messaging-only.",
+             "`swarmbus list`. Without it the runtime is messaging-only: it "
+             "subscribes to no directory topics, and `agent_state` refuses "
+             "instead of answering.",
     )(func)
     func = click.option(
         "--persistent/--no-persistent",
         default=False,
         show_default=True,
         help="Use an MQTT persistent session so queued QoS1 messages survive "
-             "between runtime restarts. Only one runtime per agent-id can hold "
-             "the session. Requires --presence.",
+             "between runtime restarts. Only one client per agent-id can hold "
+             "the session -- do not run more than one of `mcp-daemon "
+             "--persistent`, `mcp-server --persistent`, `start` or `watch "
+             "--persistent` for one id; the broker evicts whichever connected "
+             "first. Requires --presence, so the queued identity stays "
+             "discoverable and retirable. Independent of --lifecycle, which "
+             "governs the directory record rather than the MQTT session.",
     )(func)
-    func = click.option("--port", default=1883, show_default=True)(func)
-    func = click.option("--broker", default="localhost", show_default=True)(func)
+    func = _broker_address_options(func)
     return click.option("--agent-id", required=True, help="This agent's ID")(func)
 
 
@@ -1720,15 +1749,18 @@ def _validate_mcp_runtime_mode(
         raise click.UsageError(
             "--lifecycle transient requires --presence: --lifecycle "
             "describes how this identity's directory record is retired, "
-            "and without --presence the runtime has no directory record. "
-            "Add --presence, or use --lifecycle named."
+            "and without --presence the runtime has no directory record, "
+            "so the choice applies to nothing. Add --presence, "
+            "or use --lifecycle named."
         )
     if persistent and not presence:
         raise click.UsageError(
             "--persistent requires --presence: a persistent session makes the "
             "broker queue messages for this identity while it is away, "
             "but without --presence the identity never appears in the "
-            "directory. Add --presence, or use --no-persistent."
+            "directory, so no operator can find it with `swarmbus list` "
+            "or retire it with `swarmbus registry-forget` and its queued "
+            "backlog grows forever. Add --presence, or use --no-persistent."
         )
 
 
@@ -2262,7 +2294,7 @@ def _step_doctor(agent_id: str, dry_run: bool) -> bool:
     show_default=True,
     help="Host type: cc (Claude Code), openclaw, none (archive-only).",
 )
-@click.option("--broker", default="localhost", show_default=True,
+@click.option("--broker", default="localhost", show_default=True, callback=_empty_is_unset,
               help="Broker address. Use 'tailscale' to auto-resolve Tailscale IP.")
 @click.option("--invoke", "invoke_override", default=None,
               help="Override the invoke wrapper path passed to install-systemd.")

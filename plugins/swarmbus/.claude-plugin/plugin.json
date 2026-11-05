@@ -2,7 +2,7 @@
   "name": "swarmbus",
   "displayName": "swarmbus",
   "version": "0.2.1",
-  "description": "Peer messaging between AI agents over MQTT: the swarmbus MCP sidecar (send_message, read_inbox, list_agents) and the using-swarmbus skill",
+  "description": "Peer messaging between AI agents over MQTT: the swarmbus MCP sidecar (send_message, read_inbox, agent_state) and the using-swarmbus skill",
   "author": {
     "name": "Mike Pesavento",
     "url": "https://github.com/mpesavento"
@@ -21,16 +21,28 @@
     "broker": {
       "type": "string",
       "title": "Broker host",
-      "description": "Host name or IP of the MQTT broker",
-      "default": "localhost"
+      "description": "Host name or IP of the MQTT broker. Leave empty to use [broker] host from ~/.swarmbus/config.ini, else localhost.",
+      "default": ""
     },
     "port": {
-      "type": "number",
+      "type": "string",
       "title": "Broker port",
-      "description": "Port of the MQTT broker",
-      "default": 1883,
-      "min": 1,
-      "max": 65535
+      "description": "Port of the MQTT broker. Leave empty to use [broker] port from ~/.swarmbus/config.ini, else 1883.",
+      "default": ""
+    },
+    "broker_username": {
+      "type": "string",
+      "title": "Broker username",
+      "description": "Username for the MQTT broker. Leave empty to use [broker] username from ~/.swarmbus/config.ini, or none.",
+      "sensitive": true,
+      "default": ""
+    },
+    "broker_password": {
+      "type": "string",
+      "title": "Broker password",
+      "description": "Password for the MQTT broker. Leave empty to use [broker] password from ~/.swarmbus/config.ini, or none.",
+      "sensitive": true,
+      "default": ""
     }
   }
 }
