@@ -18,11 +18,20 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ## [Unreleased]
 
+### Added
+- **Registry records carry `state_updated_at`**, the time of the last `status` or `working_set` change, so a reader can tell a freshly published state from a stale one that is merely still alive. Heartbeat and reconnect republishes carry it forward, a no-op update does not advance it, a capability-only update does not advance it, and `agent_state` exposes it. Records from a runtime that predates the field stay readable with a null value.
+
 ### Changed
 - **The Claude Code plugin takes the broker from the config file, and optional broker credentials** (#84). An empty `--broker` or `--port` now counts as unset on every command, so `[broker] host` / `port` from the config file, then `localhost:1883`, applies. The plugin's host and port settings default to empty, and port is now a text setting. New optional, sensitive `broker_username` / `broker_password` settings are passed to the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`.
 
 ### Fixed
 - **The Claude Code plugin caught up with `agent_state`** (#83). `plugin.json` and `marketplace.json` no longer advertise the removed `list_agents` tool, and the plugin starts the sidecar with `--presence`, so `agent_state` answers. The plugin does not pass `--persistent`: with it, two sessions on one agent id would kick each other off the broker in a loop. Queuing messages while the session is closed comes with #88 (one shared daemon per agent id).
+
+### Wire-compat
+1. **Envelope shape — no change.**
+2. **Topic layout — no change.**
+3. **Retain/QoS defaults — no change.** The retained registry record gains one optional field; publish and subscribe defaults are untouched.
+4. **MCP tool contract — additive.** `agent_state` results gain a nullable `state_updated_at`. `RegistryRecord` is a plain pydantic model, so a reader on an older version drops the unknown key rather than rejecting the record, and a new reader accepts its absence from an older publisher. Restart a sidecar or daemon before expecting it to publish the field.
 
 ## [0.2.1] — 2026-10-31
 

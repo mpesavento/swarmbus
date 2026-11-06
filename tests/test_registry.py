@@ -41,6 +41,7 @@ def _record(agent_id: str, *, age_seconds: float = 0) -> RegistryRecord:
         capabilities=["messaging", "agent-state"],
         durability="durable",
         started_at=now - timedelta(minutes=5),
+        state_updated_at=now - timedelta(minutes=2),
         last_seen=now - timedelta(seconds=age_seconds),
     )
 
@@ -101,7 +102,9 @@ def test_working_set_rejects_empty_entries():
         )
 
 
-@pytest.mark.parametrize("field", ["started_at", "last_seen"])
+@pytest.mark.parametrize(
+    "field", ["started_at", "state_updated_at", "last_seen"]
+)
 def test_registry_rejects_naive_timestamps(field):
     payload = _record("foo").model_dump()
     payload[field] = datetime(2026, 10, 1, 12, 0, 0)
@@ -163,6 +166,26 @@ def test_legacy_presence_only_agent_remains_discoverable():
     assert state["online"] is True
     assert state["presence_evidence"] == PresenceEvidence.ONLINE.value
     assert state["untrusted"] is True
+
+
+def test_cache_exposes_state_publication_time():
+    cache = RegistryCache(stale_after_seconds=180)
+    record = _record("foo")
+    cache.update_registry(DEFAULT_TOPICS.registry("foo"), record.to_json())
+
+    assert cache.get_state("foo")["state_updated_at"] == (
+        record.state_updated_at.isoformat()
+    )
+
+
+def test_registry_accepts_record_without_state_publication_time():
+    # Records published by a runtime that predates the field must stay
+    # readable rather than failing validation.
+    payload = _record("foo").model_dump()
+    payload.pop("state_updated_at")
+    record = RegistryRecord.model_validate(payload)
+
+    assert record.state_updated_at is None
 
 
 def test_offline_reason_is_exposed():
