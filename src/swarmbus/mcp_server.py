@@ -47,6 +47,7 @@ class _MCPRuntime(Protocol):
         subject: str,
         body: str,
         content_type: str,
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> None: ...
 
@@ -57,6 +58,14 @@ class _MCPRuntime(Protocol):
         max_messages: int,
         wait_seconds: float,
     ) -> list[dict]: ...
+
+    async def inbox_state(
+        self,
+        *,
+        cursor: dict[str, Any] | None = None,
+        wait_seconds: float = 0.0,
+        max_messages: int = 1000,
+    ) -> dict[str, Any]: ...
 
     async def list_states(
         self,
@@ -86,10 +95,12 @@ def create_mcp_app(runtime: _MCPRuntime) -> _MCPApp:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> str:
         """Send a message to another agent.
 
+        Priority is advisory metadata for attention-enabled recipients.
         When answering a message from read_inbox, pass its id as in_reply_to
         so the reply carries the chain's hop count; without it the reply
         starts a new chain.
@@ -99,6 +110,7 @@ def create_mcp_app(runtime: _MCPRuntime) -> _MCPApp:
             "subject": subject,
             "body": body,
             "content_type": content_type,
+            "priority": priority,
         }
         if in_reply_to:
             kwargs["in_reply_to"] = in_reply_to
