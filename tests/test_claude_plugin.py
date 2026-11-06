@@ -1,6 +1,8 @@
 """Pin the Claude Code plugin (plugins/swarmbus) and its marketplace (.claude-plugin/marketplace.json)."""
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,10 +16,25 @@ CREDENTIALS = {
     "broker_username": "SWARMBUS_BROKER_USERNAME",
     "broker_password": "SWARMBUS_BROKER_PASSWORD",
 }
+INSTALL = 'uv tool install "swarmbus-py[mcp]"'
+LAUNCHER = (
+    "command -v swarmbus >/dev/null 2>&1 || { echo 'swarmbus is not installed (no swarmbus command on PATH). "
+    "Install it with: uv tool install \"swarmbus-py[mcp]\" and restart Claude Code.' >&2; exit 127; }; "
+    'exec swarmbus "$@"'
+)
 
 
 def _json(path):
     return json.loads(path.read_text())
+
+
+def _sidecar_argv(server):
+    # .mcp.json is an operator hand edit, so until it lands the plugin runs swarmbus directly (#85)
+    if server["command"] == "swarmbus":
+        return [server["command"], *server["args"]]
+    assert server["command"] == "sh"
+    assert server["args"][:2] == ["-c", LAUNCHER]
+    return server["args"][2:]
 
 
 def test_marketplace_lists_the_plugin_under_its_manifest_name():
@@ -54,12 +71,41 @@ def test_plugin_skill_is_a_copy_of_the_packaged_skill():
 def test_mcp_server_uses_only_declared_user_config():
     declared = set(_json(MANIFEST)["userConfig"])
     [server] = _json(MCP_CONFIG)["mcpServers"].values()
-    assert server["command"] == "swarmbus"
-    assert server["args"][0] == "mcp-server"
+    argv = _sidecar_argv(server)
+    assert argv[0] == "swarmbus"
+    assert argv[1] == "mcp-server"
     used = set(re.findall(r"\$\{user_config\.(\w+)\}", json.dumps(server)))
     assert used == declared
     for key, var in CREDENTIALS.items():
         assert server["env"][var] == "${user_config.%s}" % key
+
+
+def test_plugin_settings_and_readme_name_the_install_command():
+    assert INSTALL in _json(MANIFEST)["userConfig"]["agent_id"]["description"]
+    assert INSTALL in (PLUGIN_DIR / "README.md").read_text()
+
+
+def test_launcher_names_the_install_command_when_swarmbus_is_missing(tmp_path):
+    assert "${" not in LAUNCHER  # Claude Code expands ${...} in .mcp.json
+    sh = shutil.which("sh")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    args = ["swarmbus", "mcp-server", "--agent-id", "planner"]
+    proc = subprocess.run([sh, "-c", LAUNCHER, *args], env={"PATH": str(empty)}, capture_output=True, text=True)
+    assert proc.returncode == 127
+    assert INSTALL in proc.stderr
+    assert proc.stdout == ""  # stdout is the MCP channel
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls"
+    stub = bin_dir / "swarmbus"
+    stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {calls}\n")
+    stub.chmod(0o755)
+    args = ["swarmbus", "mcp-server", "--agent-id", "planner", "--broker", "", "--presence"]
+    proc = subprocess.run([sh, "-c", LAUNCHER, *args], env={"PATH": str(bin_dir)}, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    assert calls.read_text().split("\n")[:-1] == ["mcp-server", "--agent-id", "planner", "--broker", "", "--presence"]
 
 
 def test_plugin_broker_settings_default_to_empty():

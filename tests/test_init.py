@@ -510,3 +510,25 @@ def test_setup_cc_plugin_uses_claude_mcp_add_and_rerun_does_not_nest(tmp_path):
     remove = "mcp remove --scope user swarmbus"
     add = "mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id planner --broker localhost"
     assert (bin_dir / "claude.calls").read_text().splitlines() == [remove, add, remove, add]
+
+
+def test_setup_cc_plugin_refuses_while_the_plugin_is_installed(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = _stub_bin(home, ("claude",))
+    registry = home / ".claude/plugins/installed_plugins.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text('{"version": 2, "plugins": {"swarmbus@swarmbus": [{"scope": "user"}]}}')
+
+    result = _run_script(home, "setup-cc-plugin.sh", "planner", "localhost")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "plugin is installed" in result.stderr
+    assert "twice" in result.stderr
+    assert not (bin_dir / "claude.calls").exists()
+    assert not (home / ".claude/skills/using-swarmbus").exists()
+
+    registry.write_text('{"version": 2, "plugins": {"other@market": []}}')
+    result = _run_script(home, "setup-cc-plugin.sh", "planner", "localhost")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = (bin_dir / "claude.calls").read_text()
+    assert "mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id planner --broker localhost" in calls
