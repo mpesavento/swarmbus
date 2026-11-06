@@ -135,9 +135,10 @@ _DISPATCH_PARAMS: dict[str, frozenset[str]] = {
     "shutdown": frozenset(),
     "ping": frozenset(),
     "send_message": frozenset(
-        {"to", "subject", "body", "content_type", "in_reply_to"}
+        {"to", "subject", "body", "content_type", "in_reply_to", "priority"}
     ),
     "read_inbox": frozenset({"ack_ids", "max_messages", "wait_seconds"}),
+    "inbox_state": frozenset({"cursor", "wait_seconds", "max_messages"}),
     "list_states": frozenset({"include_offline", "lifecycle"}),
     "get_state": frozenset({"agent_id"}),
     "update_state": frozenset({"status", "working_set", "capabilities"}),
@@ -346,6 +347,7 @@ class LocalRuntimeProxy:
         subject: str,
         body: str,
         content_type: str,
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> None:
         params = {
@@ -355,6 +357,8 @@ class LocalRuntimeProxy:
             "content_type": content_type,
             "in_reply_to": in_reply_to,
         }
+        if priority != "normal":
+            params["priority"] = priority
         await self._call("send_message", params)
 
     async def read_inbox(
@@ -378,6 +382,29 @@ class LocalRuntimeProxy:
         )
         if not isinstance(result, list):
             raise LocalRPCProtocolError("read_inbox result must be an array")
+        return result
+
+    async def inbox_state(
+        self,
+        *,
+        cursor: dict[str, Any] | None = None,
+        wait_seconds: float = 0.0,
+        max_messages: int = 1000,
+    ) -> dict[str, Any]:
+        result = await self._call(
+            "inbox_state",
+            {
+                "cursor": cursor,
+                "wait_seconds": wait_seconds,
+                "max_messages": max_messages,
+            },
+            response_timeout=max(
+                _READ_TIMEOUT_SECONDS,
+                wait_seconds + _RESPONSE_MARGIN_SECONDS,
+            ),
+        )
+        if not isinstance(result, dict):
+            raise LocalRPCProtocolError("inbox_state result must be an object")
         return result
 
     async def list_states(
@@ -587,6 +614,8 @@ class LocalRuntimeDaemon:
             return await self.runtime.send_message(**params)
         if operation == "read_inbox":
             return await self.runtime.read_inbox(**params)
+        if operation == "inbox_state":
+            return await self.runtime.inbox_state(**params)
         if operation == "list_states":
             return await self.runtime.list_states(**params)
         if operation == "get_state":

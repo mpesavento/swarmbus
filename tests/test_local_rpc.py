@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import signal
 import stat
 import struct
@@ -61,6 +62,17 @@ class _FakeRuntime:
         )
         self.send_message = AsyncMock()
         self.read_inbox = AsyncMock(return_value=[])
+        self.inbox_state = AsyncMock(
+            return_value={
+                "cursor": {"instance_id": "runtime-1", "generation": 0},
+                "reset": False,
+                "runtime_state": "connected",
+                "connected": True,
+                "pending_count": 0,
+                "pending_messages": [],
+                "truncated": False,
+            }
+        )
         self.list_states = AsyncMock(return_value=[])
         self.get_state = AsyncMock(return_value={})
         self.update_state = AsyncMock(return_value={})
@@ -201,6 +213,70 @@ async def test_inbox_wait_extends_response_timeout_past_wait_boundary():
             "wait_seconds": 30.0,
         },
         response_timeout=35.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_inbox_state_round_trips_without_consuming_messages(tmp_path):
+    socket_path = tmp_path / "runtime.sock"
+    runtime = _FakeRuntime()
+    expected = {
+        "cursor": {"instance_id": "runtime-1", "generation": 3},
+        "reset": False,
+        "runtime_state": "connected",
+        "connected": True,
+        "pending_count": 1,
+        "pending_messages": [
+            {
+                "id": "message-1",
+                "from": "wren",
+                "received_at": "2026-11-06T00:00:00+00:00",
+                "priority": "high",
+            }
+        ],
+        "truncated": False,
+    }
+    runtime.inbox_state.return_value = expected
+    cursor = {"instance_id": "runtime-1", "generation": 2}
+
+    async with LocalRuntimeDaemon(runtime, socket_path):
+        proxy = LocalRuntimeProxy(socket_path)
+        result = await proxy.inbox_state(
+            cursor=cursor,
+            wait_seconds=12.0,
+            max_messages=25,
+        )
+
+    assert result == expected
+    runtime.inbox_state.assert_awaited_once_with(
+        cursor=cursor,
+        wait_seconds=12.0,
+        max_messages=25,
+    )
+    runtime.read_inbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_default_priority_is_omitted_for_old_daemon_compatibility():
+    proxy = LocalRuntimeProxy("/unused/runtime.sock")
+    proxy._call = AsyncMock()
+
+    await proxy.send_message(
+        to="wren",
+        subject="hello",
+        body="world",
+        content_type="text/plain",
+    )
+
+    proxy._call.assert_awaited_once_with(
+        "send_message",
+        {
+            "to": "wren",
+            "subject": "hello",
+            "body": "world",
+            "content_type": "text/plain",
+            "in_reply_to": None,
+        },
     )
 
 
@@ -419,6 +495,23 @@ def test_dispatch_allowlists_name_only_real_runtime_parameters():
         parameters = set(signature.parameters) - {"self"}
 
         assert allowed <= parameters, operation
+
+
+def test_every_dispatched_operation_is_allowlisted():
+    """The allowlist gate runs before dispatch, so a missing key is dead code.
+
+    The subset check above deliberately lets the allowlist lag the runtime
+    signature. The reverse was unguarded: an operation _dispatch handles but
+    _DISPATCH_PARAMS omits raises "unknown RPC operation" before reaching its
+    branch, with no test failing. That is how inbox_state arrived unreachable.
+    """
+    source = inspect.getsource(LocalRuntimeDaemon._dispatch)
+    dispatched = set(re.findall(r'operation == "([a-z_]+)"', source))
+
+    assert dispatched, "found no dispatch branches; this regex needs updating"
+    assert dispatched <= set(_DISPATCH_PARAMS), sorted(
+        dispatched - set(_DISPATCH_PARAMS)
+    )
 
 
 @pytest.mark.asyncio
