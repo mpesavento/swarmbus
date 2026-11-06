@@ -13,6 +13,10 @@
 #                     — nothing on the physical LAN can reach mosquitto.
 #                     Belt-and-suspenders mode.
 #
+# Every mode also installs scripts/mosquitto-limits.conf (per-client queue and
+# packet-size caps) as /etc/mosquitto/conf.d/swarmbus-limits.conf, unless that
+# file already exists. A broker that never reruns this script is unchanged.
+#
 # For multi-machine deployments we recommend --tailscale: gives you Tailscale
 # reachability without losing local-only ergonomics for daemons on the broker
 # host itself.
@@ -70,6 +74,17 @@ allow_anonymous true"
     exit 1
     ;;
 esac
+
+# Per-client broker caps (#66). An operator's own copy wins: never overwrite it.
+# SWARMBUS_MOSQUITTO_CONF_D overrides the conf directory (the tests use it).
+LIMITS_SRC="$(cd "$(dirname "$0")" && pwd)/mosquitto-limits.conf"
+LIMITS_DEST="${SWARMBUS_MOSQUITTO_CONF_D:-/etc/mosquitto/conf.d}/swarmbus-limits.conf"
+if [ -e "$LIMITS_DEST" ]; then
+  echo "[swarmbus] $LIMITS_DEST already exists; leaving it as it is (your edits win)."
+else
+  echo "[swarmbus] Writing $LIMITS_DEST (requires sudo)..."
+  sudo install -m 644 "$LIMITS_SRC" "$LIMITS_DEST"
+fi
 
 echo "[swarmbus] Enabling mosquitto systemd service..."
 sudo systemctl enable mosquitto

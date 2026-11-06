@@ -18,6 +18,9 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ## [Unreleased]
 
+### Added
+- **`scripts/setup-mosquitto.sh` installs per-client broker caps** (#66). Every mode installs `scripts/mosquitto-limits.conf` as `/etc/mosquitto/conf.d/swarmbus-limits.conf` with `max_packet_size 524288`, `max_queued_messages 1000`, `max_queued_bytes 33554432` and `max_inflight_messages 20`. The script leaves an existing file alone, and brokers that never rerun the script are unchanged. The README's "Broker limits" section shows how to add the file by hand. The envelope shape, topics and QoS defaults are unchanged.
+
 ### Changed
 - **`scripts/setup-cc-plugin.sh` refuses to run while the Claude Code plugin is installed, and `swarmbus doctor` warns when both registered swarmbus** (#85). The plugin is the preferred route and the script stays for now. Doctor's new probe 10 reads `installed_plugins.json`, `.claude.json` and `skills/using-swarmbus` (under `$CLAUDE_CONFIG_DIR` when it is set). `swarmbus init --host-type cc` fails its host-plugin step while the plugin is installed; pass `--skip-plugin`.
 - **The Claude Code plugin takes the broker from the config file, and optional broker credentials** (#84). An empty `--broker` or `--port` now counts as unset on every command, so `[broker] host` / `port` from the config file, then `localhost:1883`, applies. The plugin's host and port settings default to empty, and port is now a text setting. New optional, sensitive `broker_username` / `broker_password` settings are passed to the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`.
