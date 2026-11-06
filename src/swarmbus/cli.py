@@ -7,6 +7,7 @@ import re as _re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +23,7 @@ from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
 from .maintenance import RegistryMaintenance
-from .local_rpc import run_mcp_daemon, run_mcp_proxy
+from .local_rpc import LocalRPCOwnershipError, run_mcp_daemon, run_mcp_proxy
 from .message import (
     DEFAULT_HOP_LIMIT,
     DEFAULT_RATE_COOLDOWN,
@@ -1477,6 +1478,24 @@ def _maintenance_password(
         return password
 
     try:
+        info = os.stat(password_file)
+        if not stat.S_ISREG(info.st_mode):
+            # open() on a fifo blocks until a writer appears, so without this
+            # the command hangs with no output rather than failing.
+            raise click.UsageError(
+                f"password file {password_file} is not a regular file"
+            )
+        if info.st_uid != os.getuid():
+            raise click.UsageError(
+                f"password file {password_file} is owned by uid {info.st_uid}, "
+                f"not {os.getuid()}; its owner chooses the password this reads"
+            )
+        if info.st_mode & 0o077:
+            raise click.UsageError(
+                f"password file {password_file} is readable by group or others "
+                f"(mode {oct(info.st_mode & 0o777)}); "
+                f"chmod 600 {password_file}"
+            )
         with open(password_file, encoding="utf-8") as handle:
             resolved = handle.read().rstrip("\r\n")
     except OSError as exc:
@@ -1929,29 +1948,32 @@ def mcp_daemon(
         lifecycle=lifecycle,
     )
     password = _maintenance_password(password, password_file)
-    run_mcp_daemon(
-        socket_path=socket_path,
-        agent_id=agent_id,
-        broker=broker,
-        port=port,
-        persistent=persistent,
-        presence=presence,
-        lifecycle=lifecycle,
-        capabilities=capabilities,
-        state_dir=state_dir,
-        registry_heartbeat_seconds=registry_heartbeat_seconds,
-        registry_stale_after_seconds=registry_stale_after_seconds,
-        username=username,
-        password=password,
-        tls=tls,
-        ca_cert=ca_cert,
-        client_cert=client_cert,
-        client_key=client_key,
-        hop_limit=hop_limit,
-        rate_limit=rate_limit,
-        rate_cooldown=rate_cooldown,
-        on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
-    )
+    try:
+        run_mcp_daemon(
+            socket_path=socket_path,
+            agent_id=agent_id,
+            broker=broker,
+            port=port,
+            persistent=persistent,
+            presence=presence,
+            lifecycle=lifecycle,
+            capabilities=capabilities,
+            state_dir=state_dir,
+            registry_heartbeat_seconds=registry_heartbeat_seconds,
+            registry_stale_after_seconds=registry_stale_after_seconds,
+            username=username,
+            password=password,
+            tls=tls,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+            on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
+        )
+    except LocalRPCOwnershipError as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 @main.command("mcp-proxy")

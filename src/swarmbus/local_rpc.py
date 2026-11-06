@@ -9,8 +9,9 @@ import signal
 import socket
 import stat
 import struct
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NamedTuple, Protocol
 
 import aiomqtt
 
@@ -37,7 +38,16 @@ from .runtime import (
 SCHEMA_VERSION = 1
 MAX_FRAME_BYTES = 1024 * 1024
 _FRAME_HEADER = struct.Struct("!I")
-_PEER_CREDENTIALS = struct.Struct("3i")
+# Linux SO_PEERCRED returns struct ucred {pid, uid, gid}.
+_LINUX_UCRED = struct.Struct("3i")
+# Darwin LOCAL_PEERCRED returns struct xucred, 76 bytes, whose first two fields
+# are cr_version and cr_uid (both u_int32). A short getsockopt read of just
+# those is legal. FreeBSD's struct of the same name is 88 bytes and carries a
+# pid; do not reuse a layout written for it.
+_DARWIN_XUCRED_PREFIX = struct.Struct("II")
+_DARWIN_XUCRED_VERSION = 0
+# CPython does not expose socket.SOL_LOCAL; on Darwin it is 0.
+_SOL_LOCAL = 0
 _READ_TIMEOUT_SECONDS = 30.0
 _RESPONSE_MARGIN_SECONDS = 5.0
 
@@ -56,6 +66,91 @@ class LocalRPCProtocolError(LocalRPCError):
 
 class LocalRPCOwnershipError(LocalRPCError):
     """The socket or lock path is not safe for this daemon."""
+
+
+class _PeerCredAPI(NamedTuple):
+    """How to ask this platform for a Unix socket peer's uid."""
+
+    level: int
+    option: int
+    nbytes: int
+    decode: Callable[[bytes], int]
+
+
+def _decode_linux_ucred(raw: bytes) -> int:
+    _, uid, _ = _LINUX_UCRED.unpack(raw)
+    return uid
+
+
+def _decode_darwin_xucred(raw: bytes) -> int:
+    version, uid = _DARWIN_XUCRED_PREFIX.unpack(raw)
+    if version != _DARWIN_XUCRED_VERSION:
+        raise LocalRPCOwnershipError(
+            f"unsupported xucred version {version}; refusing to trust peer uid"
+        )
+    return uid
+
+
+def _resolve_peer_cred_api() -> _PeerCredAPI | None:
+    if hasattr(socket, "SO_PEERCRED"):
+        return _PeerCredAPI(
+            socket.SOL_SOCKET,
+            socket.SO_PEERCRED,
+            _LINUX_UCRED.size,
+            _decode_linux_ucred,
+        )
+    if hasattr(socket, "LOCAL_PEERCRED"):
+        return _PeerCredAPI(
+            _SOL_LOCAL,
+            socket.LOCAL_PEERCRED,
+            _DARWIN_XUCRED_PREFIX.size,
+            _decode_darwin_xucred,
+        )
+    return None
+
+
+# Resolved once so start()'s platform refusal and _peer_uid()'s decode can never
+# disagree. If they could, the daemon would start on a platform whose peer uid it
+# cannot read -- and the peer uid is the only thing authenticating a caller.
+_PEER_CRED_API = _resolve_peer_cred_api()
+
+# The accepted parameter names per RPC operation. Pinned explicitly rather than
+# derived from the runtime signatures, so a new runtime parameter does not widen
+# the wire contract until someone adds it here on purpose.
+_DISPATCH_PARAMS: dict[str, frozenset[str]] = {
+    "shutdown": frozenset(),
+    "ping": frozenset(),
+    "send_message": frozenset(
+        {"to", "subject", "body", "content_type", "in_reply_to"}
+    ),
+    "read_inbox": frozenset({"ack_ids", "max_messages", "wait_seconds"}),
+    "list_states": frozenset({"include_offline", "lifecycle"}),
+    "get_state": frozenset({"agent_id"}),
+    "update_state": frozenset({"status", "working_set", "capabilities"}),
+}
+
+# The smallest sun_path across supported platforms: 104 bytes on Darwin, 108 on
+# Linux. Used only to sanity-check a diagnosis, never to predict a limit.
+_SMALLEST_SUN_PATH = 104
+
+
+def _over_long_socket_path(exc: OSError, socket_path: Path) -> str | None:
+    """Explain an AF_UNIX length refusal, or None if that is not the cause.
+
+    CPython rejects a path that will not fit `sun_path` before issuing the
+    syscall and sets no errno, which is what separates this from a kernel bind
+    or connect failure. The limit is platform-dependent, so a path that works
+    on Linux can be refused on macOS.
+    """
+    if exc.errno is not None:
+        return None
+    encoded = len(os.fsencode(str(socket_path)))
+    if encoded < _SMALLEST_SUN_PATH:
+        return None
+    return (
+        f"socket path is {encoded} bytes, past this platform's AF_UNIX limit "
+        f"({_SMALLEST_SUN_PATH} on macOS, 108 on Linux): {socket_path}"
+    )
 
 
 _REMOTE_ERRORS: dict[str, type[Exception]] = {
@@ -188,8 +283,13 @@ class LocalRuntimeProxy:
                 str(self.socket_path)
             )
         except (FileNotFoundError, ConnectionError, OSError) as exc:
+            # Without this the message reads "unavailable", sending a reader
+            # after a daemon that may be running fine.
+            detail = _over_long_socket_path(exc, self.socket_path)
             raise LocalRPCUnavailable(
-                f"local runtime unavailable at {self.socket_path}: {exc}"
+                detail
+                if detail is not None
+                else f"local runtime unavailable at {self.socket_path}: {exc}"
             ) from exc
         try:
             await _write_frame(writer, _request(operation, params))
@@ -404,28 +504,56 @@ class LocalRuntimeDaemon:
         except FileNotFoundError:
             pass
 
-    def _peer_uid(self, writer: asyncio.StreamWriter) -> int | None:
-        if not hasattr(socket, "SO_PEERCRED"):
-            return None
+    def _peer_uid(self, writer: asyncio.StreamWriter) -> int:
+        """The connected peer's effective uid.
+
+        Raises rather than returning None: a caller that cannot read the peer
+        uid must refuse the connection, never serve it unauthenticated.
+        """
+        if _PEER_CRED_API is None:
+            raise LocalRPCOwnershipError(
+                "no peer-credential API on this platform"
+            )
         peer_socket = writer.get_extra_info("socket")
         if peer_socket is None:
-            return None
+            raise LocalRPCOwnershipError(
+                "connection exposes no socket to read credentials from"
+            )
         credentials = peer_socket.getsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_PEERCRED,
-            _PEER_CREDENTIALS.size,
+            _PEER_CRED_API.level,
+            _PEER_CRED_API.option,
+            _PEER_CRED_API.nbytes,
         )
-        _, uid, _ = _PEER_CREDENTIALS.unpack(credentials)
-        return uid
+        return _PEER_CRED_API.decode(credentials)
+
+    def _peer_denial(
+        self,
+        writer: asyncio.StreamWriter,
+    ) -> dict[str, Any] | None:
+        """A failure response when the peer is not this uid, else None."""
+        try:
+            peer_uid = self._peer_uid(writer)
+        except (LocalRPCOwnershipError, OSError, struct.error) as exc:
+            return _failure(
+                "permission_denied",
+                f"cannot verify peer uid: {exc}",
+            )
+        if peer_uid != os.getuid():
+            return _failure("permission_denied", "peer uid does not match")
+        return None
 
     async def _dispatch(self, operation: str, params: dict[str, Any]) -> Any:
+        allowed = _DISPATCH_PARAMS.get(operation)
+        if allowed is None:
+            raise LocalRPCProtocolError(f"unknown RPC operation {operation!r}")
+        rejected = sorted(set(params) - allowed)
+        if rejected:
+            raise ValueError(
+                f"{operation} does not accept {', '.join(rejected)}"
+            )
         if operation == "shutdown":
-            if params:
-                raise ValueError("shutdown does not accept parameters")
             return {"accepted": True}
         if operation == "ping":
-            if params:
-                raise ValueError("ping does not accept parameters")
             return await self.runtime.runtime_status()
         if operation == "send_message":
             return await self.runtime.send_message(**params)
@@ -437,7 +565,9 @@ class LocalRuntimeDaemon:
             return await self.runtime.get_state(**params)
         if operation == "update_state":
             return await self.runtime.update_state(**params)
-        raise LocalRPCProtocolError(f"unknown RPC operation {operation!r}")
+        raise LocalRPCProtocolError(
+            f"operation {operation!r} is allow-listed but not dispatched"
+        )
 
     async def _handle(
         self,
@@ -447,12 +577,9 @@ class LocalRuntimeDaemon:
         shutdown_requested = False
         try:
             try:
-                peer_uid = self._peer_uid(writer)
-                if peer_uid is not None and peer_uid != os.getuid():
-                    response = _failure(
-                        "permission_denied",
-                        "peer uid does not match",
-                    )
+                denial = self._peer_denial(writer)
+                if denial is not None:
+                    response = denial
                 else:
                     request = await asyncio.wait_for(
                         _read_frame(reader),
@@ -493,9 +620,10 @@ class LocalRuntimeDaemon:
         await self._shutdown_requested.wait()
 
     async def start(self) -> None:
-        if fcntl is None or not hasattr(socket, "SO_PEERCRED"):
+        if fcntl is None or _PEER_CRED_API is None:
             raise LocalRPCOwnershipError(
-                "local runtime sharing requires a Unix platform with peer credentials"
+                "local runtime sharing requires a Unix platform with peer "
+                "credentials: Linux SO_PEERCRED or Darwin LOCAL_PEERCRED"
             )
         if self._server is not None:
             raise RuntimeError("local runtime daemon is already started")
@@ -506,10 +634,16 @@ class LocalRuntimeDaemon:
             self._remove_stale_socket()
             await self.runtime.start()
             self._runtime_started = True
-            self._server = await asyncio.start_unix_server(
-                self._handle,
-                path=str(self.socket_path),
-            )
+            try:
+                self._server = await asyncio.start_unix_server(
+                    self._handle,
+                    path=str(self.socket_path),
+                )
+            except OSError as exc:
+                detail = _over_long_socket_path(exc, self.socket_path)
+                if detail is None:
+                    raise
+                raise LocalRPCOwnershipError(detail) from exc
             socket_stat = os.lstat(self.socket_path)
             if (
                 not stat.S_ISSOCK(socket_stat.st_mode)

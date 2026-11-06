@@ -210,7 +210,9 @@ swarmbus mcp-daemon --socket ~/.local/state/swarmbus/planner.sock \
 swarmbus mcp-proxy --socket ~/.local/state/swarmbus/planner.sock
 ```
 
-The private AF_UNIX socket accepts only the daemon's uid and is mode `0600`; a non-blocking sibling lock prevents two daemons from owning the same socket. `mcp-proxy` carries no broker address or credentials and exposes the same three tools as `mcp-server`. It does not auto-start the daemon or fall back to its own MQTT connection: a missing or unhealthy daemon is an explicit error. The daemon removes its socket and stops the managed runtime on a signal or an authenticated local shutdown request.
+The private AF_UNIX socket accepts only the daemon's uid and is mode `0600`; a non-blocking sibling lock prevents two daemons from owning the same socket. `mcp-proxy` carries no broker address or credentials and exposes the same three tools as `mcp-server`. It does not auto-start the daemon or fall back to its own MQTT connection: a missing or unhealthy daemon is an explicit error. The daemon removes its socket and stops the managed runtime on a signal or a local shutdown request from its own uid.
+
+**The trust boundary is the uid, and there is no token.** Any process running as the same user can send as this agent, read and acknowledge its inbox, update its state, and shut the daemon down. That is the same exposure as the broker password file. The only authentication is the peer uid the kernel reports for the connection — `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS. On a platform that offers neither, `mcp-daemon` refuses to start rather than serving unauthenticated callers.
 
 Without `--persistent`, messages received while the runtime is running still survive process restarts in SQLite, but the broker does not queue messages sent while it is offline.
 

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import stat
@@ -19,6 +20,9 @@ from swarmbus.local_rpc import (
     LocalRPCUnavailable,
     LocalRuntimeDaemon,
     LocalRuntimeProxy,
+    _DARWIN_XUCRED_VERSION,
+    _DISPATCH_PARAMS,
+    _decode_darwin_xucred,
     _encode_frame,
     _read_frame,
     _request,
@@ -29,7 +33,11 @@ from swarmbus.message import (
     DEFAULT_RATE_COOLDOWN,
     DEFAULT_RATE_LIMIT,
 )
-from swarmbus.runtime import RuntimeFatalError, TransportUnavailable
+from swarmbus.runtime import (
+    ManagedMCPRuntime,
+    RuntimeFatalError,
+    TransportUnavailable,
+)
 
 
 class _FakeRuntime:
@@ -269,6 +277,155 @@ async def test_shutdown_rejects_a_different_peer_uid(tmp_path):
 
     assert response["ok"] is False
     assert response["error"]["code"] == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_peer_uid_reads_the_real_credentials_of_a_connection(tmp_path):
+    """Unpatched: SO_PEERCRED on Linux, LOCAL_PEERCRED on Darwin.
+
+    The sibling tests above patch _peer_uid because a foreign uid cannot be
+    obtained in-process; this one exercises the real syscall and decode.
+    """
+    socket_path = tmp_path / "peercred.sock"
+    daemon = LocalRuntimeDaemon(_FakeRuntime(), socket_path)
+    seen: list[int] = []
+
+    async def handle(reader, writer):
+        seen.append(daemon._peer_uid(writer))
+        writer.close()
+
+    server = await asyncio.start_unix_server(handle, path=str(socket_path))
+    try:
+        _, writer = await asyncio.open_unix_connection(str(socket_path))
+        writer.close()
+        await writer.wait_closed()
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert seen == [os.getuid()]
+
+
+def test_darwin_xucred_takes_the_uid_from_the_second_word():
+    # struct xucred: cr_version then cr_uid, both u_int32, native order.
+    raw = (_DARWIN_XUCRED_VERSION).to_bytes(4, sys.byteorder) + (
+        4242
+    ).to_bytes(4, sys.byteorder)
+
+    assert _decode_darwin_xucred(raw) == 4242
+
+
+def test_darwin_xucred_of_an_unknown_version_is_not_trusted():
+    raw = (_DARWIN_XUCRED_VERSION + 1).to_bytes(4, sys.byteorder) + (
+        4242
+    ).to_bytes(4, sys.byteorder)
+
+    with pytest.raises(LocalRPCOwnershipError):
+        _decode_darwin_xucred(raw)
+
+
+@pytest.mark.asyncio
+async def test_start_refuses_a_platform_without_peer_credentials(tmp_path):
+    daemon = LocalRuntimeDaemon(_FakeRuntime(), tmp_path / "runtime.sock")
+
+    with patch("swarmbus.local_rpc._PEER_CRED_API", None):
+        with pytest.raises(LocalRPCOwnershipError):
+            await daemon.start()
+
+
+@pytest.mark.asyncio
+async def test_start_names_an_over_long_socket_path(tmp_path):
+    """The refusal comes from a real bind, not a constructed exception.
+
+    125 bytes of filename clears both limits -- 104 on Darwin, 108 on Linux --
+    so this exercises the same path on either platform.
+    """
+    socket_path = tmp_path / ("s" * 120 + ".sock")
+    daemon = LocalRuntimeDaemon(_FakeRuntime(), socket_path)
+
+    with pytest.raises(LocalRPCOwnershipError) as caught:
+        await daemon.start()
+
+    assert "AF_UNIX limit" in str(caught.value)
+    assert str(socket_path) in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_proxy_blames_the_path_not_a_missing_daemon(tmp_path):
+    proxy = LocalRuntimeProxy(tmp_path / ("s" * 120 + ".sock"))
+
+    with pytest.raises(LocalRPCUnavailable) as caught:
+        await proxy.ping()
+
+    assert "AF_UNIX limit" in str(caught.value)
+    assert "unavailable" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_peer_uid_denies_instead_of_serving(tmp_path):
+    """The uid check fails closed.
+
+    Pins the regression that matters if the platform predicate used by start()
+    ever disagrees with the one used to decode: the daemon must refuse, not
+    serve every caller unauthenticated.
+    """
+    socket_path = tmp_path / "runtime.sock"
+    runtime = _FakeRuntime()
+    daemon = LocalRuntimeDaemon(runtime, socket_path)
+
+    async with daemon:
+        with patch("swarmbus.local_rpc._PEER_CRED_API", None):
+            response = await _raw_call(socket_path, _request("ping", {}))
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "permission_denied"
+    runtime.runtime_status.assert_not_awaited()
+
+
+def test_dispatch_allowlists_name_only_real_runtime_parameters():
+    """A typo'd allowlist key would otherwise fail only at call time.
+
+    Deliberately a subset check, not equality: a new runtime parameter must not
+    reach the wire until someone adds it to _DISPATCH_PARAMS on purpose.
+    """
+    for operation, allowed in _DISPATCH_PARAMS.items():
+        if operation in {"shutdown", "ping"}:
+            continue
+        signature = inspect.signature(getattr(ManagedMCPRuntime, operation))
+        parameters = set(signature.parameters) - {"self"}
+
+        assert allowed <= parameters, operation
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refuses_a_parameter_outside_the_allowlist(tmp_path):
+    socket_path = tmp_path / "runtime.sock"
+    runtime = _FakeRuntime()
+
+    async with LocalRuntimeDaemon(runtime, socket_path):
+        response = await _raw_call(
+            socket_path,
+            _request(
+                "send_message",
+                {
+                    "to": "peer",
+                    "subject": "s",
+                    "body": "b",
+                    "hops": 7,
+                    "origin": "spoofed",
+                },
+            ),
+        )
+
+    assert response["ok"] is False
+    assert response["error"]["code"] == "ValueError"
+    assert "hops" in response["error"]["message"]
+    assert "origin" in response["error"]["message"]
+    runtime.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -574,6 +731,7 @@ def test_mcp_runtime_commands_read_password_file(
 ):
     password_file = tmp_path / "mqtt.password"
     password_file.write_text("file-secret\n")
+    password_file.chmod(0o600)
 
     with patch(patch_target) as mock_run:
         result = CliRunner().invoke(
@@ -583,6 +741,87 @@ def test_mcp_runtime_commands_read_password_file(
 
     assert result.exit_code == 0, result.output
     assert mock_run.call_args.kwargs["password"] == "file-secret"
+
+
+@pytest.mark.parametrize("command,patch_target", _MCP_RUNTIME_COMMANDS)
+def test_mcp_runtime_commands_refuse_a_readable_password_file(
+    tmp_path,
+    command,
+    patch_target,
+):
+    password_file = tmp_path / "mqtt.password"
+    password_file.write_text("file-secret\n")
+    password_file.chmod(0o644)
+
+    with patch(patch_target) as mock_run:
+        result = CliRunner().invoke(
+            main,
+            [*command, "--password-file", str(password_file)],
+        )
+
+    assert result.exit_code == 2
+    assert "readable by group or others" in result.output
+    mock_run.assert_not_called()
+
+
+@pytest.mark.parametrize("command,patch_target", _MCP_RUNTIME_COMMANDS)
+def test_mcp_runtime_commands_refuse_a_fifo_password_file(
+    tmp_path,
+    command,
+    patch_target,
+):
+    """A fifo would block open() forever, so this must be refused on stat.
+
+    If the regular-file check is ever removed this test HANGS rather than
+    fails, which is the same symptom a user would get.
+    """
+    password_file = tmp_path / "mqtt.password"
+    os.mkfifo(password_file, 0o600)
+
+    with patch(patch_target) as mock_run:
+        result = CliRunner().invoke(
+            main,
+            [*command, "--password-file", str(password_file)],
+        )
+
+    assert result.exit_code == 2
+    assert "not a regular file" in result.output
+    mock_run.assert_not_called()
+
+
+@pytest.mark.parametrize("command,patch_target", _MCP_RUNTIME_COMMANDS)
+def test_mcp_runtime_commands_refuse_a_foreign_owned_password_file(
+    tmp_path,
+    command,
+    patch_target,
+):
+    # chown to another uid needs privileges, so the foreign owner is injected
+    # for this one path and every other stat is delegated untouched.
+    password_file = tmp_path / "mqtt.password"
+    password_file.write_text("file-secret\n")
+    password_file.chmod(0o600)
+    real_stat = os.stat
+
+    def foreign_owner(path, *args, **kwargs):
+        info = real_stat(path, *args, **kwargs)
+        if str(path) != str(password_file):
+            return info
+        fields = list(info)
+        fields[4] = info.st_uid + 1
+        return os.stat_result(fields)
+
+    with (
+        patch(patch_target) as mock_run,
+        patch("os.stat", side_effect=foreign_owner),
+    ):
+        result = CliRunner().invoke(
+            main,
+            [*command, "--password-file", str(password_file)],
+        )
+
+    assert result.exit_code == 2
+    assert "owned by uid" in result.output
+    mock_run.assert_not_called()
 
 
 @pytest.mark.parametrize("command,patch_target", _MCP_RUNTIME_COMMANDS)
