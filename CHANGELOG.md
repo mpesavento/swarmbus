@@ -19,13 +19,16 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 ## [Unreleased]
 
 ### Added
+- **`scripts/setup-mosquitto.sh` installs per-client broker caps** (#66). Every mode installs `scripts/mosquitto-limits.conf` as `/etc/mosquitto/conf.d/swarmbus-limits.conf` with `max_packet_size 524288`, `max_queued_messages 1000`, `max_queued_bytes 33554432` and `max_inflight_messages 20`. The script leaves an existing file alone, and brokers that never rerun the script are unchanged. The README's "Broker limits" section shows how to add the file by hand. The envelope shape, topics and QoS defaults are unchanged.
 - `swarmbus mcp-daemon` owns one managed MQTT runtime behind a private same-uid AF_UNIX RPC socket, and `swarmbus mcp-proxy` gives any number of local stdio MCP clients the existing `send_message`, `read_inbox`, and `agent_state` tools without broker credentials. The daemon uses a sibling lock to enforce one owner, reports broker readiness separately from socket availability, and cleans up the runtime, socket, and lock on signals or an authenticated local shutdown request. `mcp-proxy` accepts only `--socket`.
 - `swarmbus mcp-server` and `swarmbus mcp-daemon` accept `--password-file` to read the broker password from a file instead of `--password`. This is a new option on the existing `mcp-server` command.
 
 ### Changed
+- **`scripts/setup-cc-plugin.sh` refuses to run while the Claude Code plugin is installed, and `swarmbus doctor` warns when both registered swarmbus** (#85). The plugin is the preferred route and the script stays for now. Doctor's new probe 10 reads `installed_plugins.json`, `.claude.json` and `skills/using-swarmbus` (under `$CLAUDE_CONFIG_DIR` when it is set). `swarmbus init --host-type cc` fails its host-plugin step while the plugin is installed; pass `--skip-plugin`.
 - **The Claude Code plugin takes the broker from the config file, and optional broker credentials** (#84). An empty `--broker` or `--port` now counts as unset on every command, so `[broker] host` / `port` from the config file, then `localhost:1883`, applies. The plugin's host and port settings default to empty, and port is now a text setting. New optional, sensitive `broker_username` / `broker_password` settings are passed to the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`.
 
 ### Fixed
+- **The Claude Code plugin names the install command when `swarmbus` is missing** (#85). It starts the sidecar through a one-line `sh -c` launcher that checks PATH first, so a missing command gives `swarmbus is not installed … uv tool install "swarmbus-py[mcp]"` on stderr instead of a bare `ENOENT`. The agent id setting and the plugin README state the requirement.
 - **The Claude Code plugin caught up with `agent_state`** (#83). `plugin.json` and `marketplace.json` no longer advertise the removed `list_agents` tool, and the plugin starts the sidecar with `--presence`, so `agent_state` answers. The plugin does not pass `--persistent`: with it, two sessions on one agent id would kick each other off the broker in a loop. Queuing messages while the session is closed comes with #88 (one shared daemon per agent id).
 
 ### Wire-compat

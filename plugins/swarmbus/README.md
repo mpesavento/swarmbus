@@ -12,7 +12,7 @@ The plugin adds two things:
 The plugin starts the sidecar but does not install swarmbus or run a broker. Before you enable it:
 
 1. Install the package with its MCP extra, so `swarmbus` is on your PATH:
-   `pip install "swarmbus-py[mcp]"` (or `uv tool install "swarmbus-py[mcp]"`).
+   `uv tool install "swarmbus-py[mcp]"` (or `pip install "swarmbus-py[mcp]"`). The plugin does not install it. Without it the sidecar does not start, and its Claude Code MCP log says `swarmbus is not installed` and names `uv tool install "swarmbus-py[mcp]"`.
 2. Have an MQTT broker the agent can reach. `scripts/setup-mosquitto.sh` in the swarmbus repo sets up mosquitto on localhost.
 3. Choose an agent id for this session, such as `planner`.
 
@@ -26,7 +26,7 @@ Claude Code asks for the agent id. The broker host, port, username and password 
 
 ## What it runs and connects to
 
-- It runs `swarmbus mcp-server --agent-id <id> --broker <host> --port <port> --presence` from your PATH, once per Claude Code session.
+- It runs `sh -c` with a one-line check that `swarmbus` is on your PATH, then `swarmbus mcp-server --agent-id <id> --broker <host> --port <port> --presence`, once per Claude Code session. The settings reach `swarmbus` as separate arguments, never as part of the shell line.
 - With `--presence` the sidecar publishes this agent's online or offline state and a registry record to the broker, retained, so peers can see it. That is also what lets `agent_state` answer.
 - The sidecar connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one.
 - An empty host or port counts as unset, so the config file's value applies, then the built-in default. A host or port set in the plugin beats the config file.
@@ -35,7 +35,7 @@ Claude Code asks for the agent id. The broker host, port, username and password 
 
 ## Things to know
 
-- If you used `scripts/setup-cc-plugin.sh` before, remove its registration (`claude mcp remove --scope user swarmbus`) and its skill copy (`~/.claude/skills/using-swarmbus`), or Claude gets two sets of swarmbus tools.
+- The plugin is the preferred route. `scripts/setup-cc-plugin.sh` stays for now, but using both registers swarmbus twice, so Claude gets two sets of swarmbus tools. The script refuses to run while the plugin is installed, and `swarmbus doctor` warns when it finds both. If you used the script before, remove its registration (`claude mcp remove --scope user swarmbus`) and its skill copy (`~/.claude/skills/using-swarmbus`).
 - Each session that has the plugin enabled starts its own sidecar under the same agent id. Without `--persistent` each sidecar has its own broker session, so each gets a copy of every message, but the sidecars share one presence and registry record for that id. Give each session its own id if you need them told apart.
 - The sidecar does not run `--persistent`, so messages sent to this agent id while no session is open are not queued. Persistence comes with #88 (one shared daemon per agent id): `--persistent` gives an id a single MQTT client id (`swarmbus-<agent-id>`), and two sessions on one id would kick each other off the broker in a loop.
 - To retire an id you no longer use, run `swarmbus registry-forget --agent-id <id>` to remove its registry record; see `docs/configuration.md`.
