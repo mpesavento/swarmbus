@@ -160,7 +160,7 @@ The quickstart above uses the CLI path (#4 below) because it's the most universa
 
 ### 1. Claude Code — MCP server + behavioral skill
 
-Install the swarmbus plugin from this repo's plugin marketplace. It needs `swarmbus` on PATH (`pip install "swarmbus-py[mcp]"`) and a broker:
+Install the swarmbus plugin from this repo's plugin marketplace. The plugin runs the `swarmbus` command but does not install it, so run `uv tool install "swarmbus-py[mcp]"` first; without it the sidecar does not start and its MCP log names that command. You also need a broker:
 
 ```bash
 claude plugin install swarmbus --marketplace mpesavento/swarmbus
@@ -168,7 +168,7 @@ claude plugin install swarmbus --marketplace mpesavento/swarmbus
 
 Claude Code asks for the agent id, broker host and broker port, and keeps them in `/config`. The plugin runs `swarmbus mcp-server` in each session and loads the `using-swarmbus` skill; `claude plugin update swarmbus@swarmbus` picks up a new release. [plugins/swarmbus/README.md](plugins/swarmbus/README.md) says what it runs and connects to.
 
-Or run the setup script instead. Don't use both: each registers its own `swarmbus` MCP server and skill. The script registers the MCP server for your user with `claude mcp add --scope user` (Claude Code keeps user-scoped MCP servers in `~/.claude.json`) **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches agents when to send, read, acknowledge, wait, and list agents. It needs `claude` on PATH. Re-running it replaces both. An older version of this script wrote `mcpServers` into `~/.claude/settings.json`, which Claude Code does not read for MCP servers; delete that key if you have it.
+Or run the setup script instead. The plugin is the preferred route and the script stays for now. Don't use both: each registers its own `swarmbus` MCP server and skill, so the script refuses to run while the plugin is installed, and `swarmbus doctor` warns when it finds both. The script registers the MCP server for your user with `claude mcp add --scope user` (Claude Code keeps user-scoped MCP servers in `~/.claude.json`) **and** installs a behavioral skill at `~/.claude/skills/using-swarmbus/` that teaches agents when to send, read, acknowledge, wait, and list agents. It needs `claude` on PATH. Re-running it replaces both. An older version of this script wrote `mcpServers` into `~/.claude/settings.json`, which Claude Code does not read for MCP servers; delete that key if you have it.
 
 ```bash
 bash scripts/setup-cc-plugin.sh <agent-id> [broker-host]
@@ -478,20 +478,44 @@ For deeper diagnosis: `systemctl --user status swarmbus-<agent>.service`, `journ
 
 ### Broker limits
 
-swarmbus's listeners hold a sender that goes over `--rate-limit` (see Message envelope), but only after the broker has delivered to them; mosquitto itself has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps, set in `mosquitto.conf` or a file in `/etc/mosquitto/conf.d/`:
+swarmbus's listeners hold a sender that goes over `--rate-limit` (see Message envelope), but only after the broker has delivered to them; mosquitto itself has no per-client publish-rate option. A rate-limit line copied from older advice makes mosquitto refuse to start (`Unknown configuration variable`). What mosquitto does offer are per-client queue and size caps. `scripts/setup-mosquitto.sh` installs them in every mode, from `scripts/mosquitto-limits.conf`, as `/etc/mosquitto/conf.d/swarmbus-limits.conf`:
 
 ```
-# QoS 1/2 messages queued per client beyond those in flight (default 1000; 0 = no cap)
+# swarmbus per-client broker caps (#66).
+# scripts/setup-mosquitto.sh installs this file as
+# /etc/mosquitto/conf.d/swarmbus-limits.conf. An operator's own copy there is
+# never overwritten.
+
+# 512 KiB. The largest valid envelope is a 64 KiB body (_MAX_BODY_BYTES in
+# src/swarmbus/message.py) serialized by json.dumps, whose ASCII escaping can
+# turn one body byte into six (\u0000). That makes about 384 KiB, plus the
+# envelope's other fields.
+max_packet_size 524288
+
+# QoS 1/2 messages queued per client beyond those in flight; mosquitto's
+# default, written out so it is visible.
 max_queued_messages 1000
-# Byte cap on the same queue (default 0 = no cap). Whichever limit is hit first applies.
-max_queued_bytes 0
-# QoS 1/2 messages in flight per client (default 20)
+
+# 32 MiB byte cap on the same queue (mosquitto's default is 0, no cap), so a
+# long-offline persistent agent can hold a few hundred full-size messages
+# without one client's queue growing without bound. Whichever queue limit is
+# hit first applies.
+max_queued_bytes 33554432
+
+# QoS 1/2 messages in flight per client; mosquitto's default, written out.
 max_inflight_messages 20
-# Largest packet the broker accepts, in bytes (default 2000000 since mosquitto 2.1)
-max_packet_size 2000000
 ```
 
-Messages over a queue cap are dropped by the broker. Restart mosquitto after changing: `sudo systemctl restart mosquitto`. A per-client publish-rate limit needs a mosquitto plugin or a broker that supports it natively; [#26](https://github.com/mpesavento/swarmbus/issues/26) tracks that.
+The script leaves an existing `/etc/mosquitto/conf.d/swarmbus-limits.conf` alone, so your edits win. A broker set up earlier does not change until the file is added. To add it by hand, from a checkout of this repository:
+
+```
+sudo cp scripts/mosquitto-limits.conf /etc/mosquitto/conf.d/swarmbus-limits.conf
+sudo systemctl restart mosquitto
+```
+
+Debian's `mosquitto.conf` reads every file in `/etc/mosquitto/conf.d/`; on another layout, paste the four settings into `mosquitto.conf` instead.
+
+Messages over a queue cap are dropped by the broker. A per-client publish-rate limit needs a mosquitto plugin or a broker that supports it natively; [#26](https://github.com/mpesavento/swarmbus/issues/26) tracks that.
 
 ## Onboarding a new agent
 

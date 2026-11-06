@@ -15,7 +15,7 @@
     "agent_id": {
       "type": "string",
       "title": "Agent id",
-      "description": "This agent's swarmbus id, e.g. planner. Peers address it by this name.",
+      "description": "This agent's swarmbus id, e.g. planner. Peers address it by this name. The plugin runs the swarmbus command but does not install it: run uv tool install \"swarmbus-py[mcp]\" first.",
       "required": true
     },
     "broker": {
