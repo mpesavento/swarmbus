@@ -1060,6 +1060,30 @@ async def test_runtime_registry_reads_and_updates_use_held_connection():
 
 
 @pytest.mark.asyncio
+async def test_state_publication_time_tracks_changes_not_republishes():
+    runtime = _runtime(_FakeStore([]), presence=True)
+    _mark_directory_ready(runtime)
+    await runtime._publish_presence("online")
+
+    initial = await runtime.update_state(status="working", working_set=["repo"])
+    published_at = initial["state_updated_at"]
+    assert published_at is not None
+
+    # A heartbeat or reconnect republish carries the time forward.
+    await runtime._publish_registry()
+    assert (await runtime.get_state("foo"))["state_updated_at"] == published_at
+
+    # Same values settle to the same record, so nothing changed.
+    unchanged = await runtime.update_state(status="working", working_set=["repo"])
+    assert unchanged["state_updated_at"] == published_at
+
+    changed = await runtime.update_state(status=None, working_set=["repo", "acl"])
+    assert datetime.fromisoformat(changed["state_updated_at"]) > (
+        datetime.fromisoformat(published_at)
+    )
+
+
+@pytest.mark.asyncio
 async def test_update_state_does_not_mutate_before_transport_is_available():
     runtime = _runtime(
         _FakeStore([]),

@@ -54,6 +54,7 @@ class RegistryRecord(BaseModel):
     lifecycle: AgentLifecycle = "named"
     durability: Literal["durable", "ephemeral", "unknown"] = "unknown"
     started_at: datetime
+    state_updated_at: datetime | None = None
     last_seen: datetime
 
     @field_validator("agent_id")
@@ -61,10 +62,15 @@ class RegistryRecord(BaseModel):
     def validate_agent_id(cls, value: str) -> str:
         return _validate_agent_id(value)
 
-    @field_validator("started_at", "last_seen")
+    @field_validator("started_at", "state_updated_at", "last_seen")
     @classmethod
-    def validate_aware_timestamp(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
+    def validate_aware_timestamp(
+        cls, value: datetime | None
+    ) -> datetime | None:
+        # state_updated_at is absent on records from runtimes that predate it.
+        if value is not None and (
+            value.tzinfo is None or value.utcoffset() is None
+        ):
             raise ValueError("registry timestamps must be timezone-aware")
         return value
 
@@ -486,6 +492,11 @@ class RegistryCache:
             "lifecycle": record.lifecycle if record else "unknown",
             "durability": record.durability if record else "unknown",
             "started_at": record.started_at.isoformat() if record else None,
+            "state_updated_at": (
+                record.state_updated_at.isoformat()
+                if record and record.state_updated_at
+                else None
+            ),
             "last_seen": record.last_seen.isoformat() if record else None,
         }
         if presence and presence.state == "offline" and presence.reason:
