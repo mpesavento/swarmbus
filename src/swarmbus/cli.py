@@ -7,6 +7,7 @@ import re as _re
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -22,6 +23,7 @@ from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
 from .maintenance import RegistryMaintenance
+from .local_rpc import LocalRPCOwnershipError, run_mcp_daemon, run_mcp_proxy
 from .message import (
     DEFAULT_HOP_LIMIT,
     DEFAULT_RATE_COOLDOWN,
@@ -1476,6 +1478,24 @@ def _maintenance_password(
         return password
 
     try:
+        info = os.stat(password_file)
+        if not stat.S_ISREG(info.st_mode):
+            # open() on a fifo blocks until a writer appears, so without this
+            # the command hangs with no output rather than failing.
+            raise click.UsageError(
+                f"password file {password_file} is not a regular file"
+            )
+        if info.st_uid != os.getuid():
+            raise click.UsageError(
+                f"password file {password_file} is owned by uid {info.st_uid}, "
+                f"not {os.getuid()}; its owner chooses the password this reads"
+            )
+        if info.st_mode & 0o077:
+            raise click.UsageError(
+                f"password file {password_file} is readable by group or others "
+                f"(mode {oct(info.st_mode & 0o777)}); "
+                f"chmod 600 {password_file}"
+            )
         with open(password_file, encoding="utf-8") as handle:
             resolved = handle.read().rstrip("\r\n")
     except OSError as exc:
@@ -1726,77 +1746,112 @@ def registry_forget(
         )
 
 
+def _mcp_runtime_options(func):
+    func = _broker_auth_options(func)
+    func = _on_trip_option(func)
+    func = _rate_limit_options(func)
+    func = _hop_limit_option(func)
+    func = click.option(
+        "--password-file",
+        type=click.Path(exists=True, dir_okay=False, readable=True),
+        help="Read the broker password from this file.",
+    )(func)
+    func = click.option(
+        "--state-dir",
+        default="~/.local/state/swarmbus",
+        envvar="SWARMBUS_STATE_DIR",
+        show_default=True,
+        help="Directory for the persistent SQLite inbox. [env: SWARMBUS_STATE_DIR]",
+    )(func)
+    func = click.option(
+        "--registry-stale-after-seconds",
+        type=float,
+        default=180,
+        envvar="SWARMBUS_REGISTRY_STALE_AFTER_SECONDS",
+        show_default=True,
+        help="Seconds without a heartbeat before online state is stale. "
+             "[env: SWARMBUS_REGISTRY_STALE_AFTER_SECONDS]",
+    )(func)
+    func = click.option(
+        "--registry-heartbeat-seconds",
+        type=float,
+        default=60,
+        envvar="SWARMBUS_REGISTRY_HEARTBEAT_SECONDS",
+        show_default=True,
+        help="Seconds between registry heartbeats. "
+             "[env: SWARMBUS_REGISTRY_HEARTBEAT_SECONDS]",
+    )(func)
+    func = click.option(
+        "--capability",
+        "capabilities",
+        multiple=True,
+        help="Advisory capability to publish; repeat for more than one.",
+    )(func)
+    func = click.option(
+        "--lifecycle",
+        type=click.Choice(["named", "transient"]),
+        default="named",
+        show_default=True,
+        help="Retained registry lifecycle for this agent identity. "
+             "'transient' publishes a retained registry record and "
+             "tombstones it on clean shutdown, and therefore requires "
+             "--presence. Independent of --persistent, which governs the MQTT "
+             "session rather than the directory record.",
+    )(func)
+    func = click.option(
+        "--presence/--no-presence",
+        default=False,
+        show_default=True,
+        help="Publish retained presence on startup (online) and shutdown "
+             "(offline). Makes this agent visible to `agent_state` and "
+             "`swarmbus list`. Without it the runtime is messaging-only: it "
+             "subscribes to no directory topics, and `agent_state` refuses "
+             "instead of answering.",
+    )(func)
+    func = click.option(
+        "--persistent/--no-persistent",
+        default=False,
+        show_default=True,
+        help="Use an MQTT persistent session so queued QoS1 messages survive "
+             "between runtime restarts. Only one client per agent-id can hold "
+             "the session -- do not run more than one of `mcp-daemon "
+             "--persistent`, `mcp-server --persistent`, `start` or `watch "
+             "--persistent` for one id; the broker evicts whichever connected "
+             "first. Requires --presence, so the queued identity stays "
+             "discoverable and retirable. Independent of --lifecycle, which "
+             "governs the directory record rather than the MQTT session.",
+    )(func)
+    func = _broker_address_options(func)
+    return click.option("--agent-id", required=True, help="This agent's ID")(func)
+
+
+def _validate_mcp_runtime_mode(
+    *,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+) -> None:
+    if lifecycle == "transient" and not presence:
+        raise click.UsageError(
+            "--lifecycle transient requires --presence: --lifecycle "
+            "describes how this identity's directory record is retired, "
+            "and without --presence the runtime has no directory record, "
+            "so the choice applies to nothing. Add --presence, "
+            "or use --lifecycle named."
+        )
+    if persistent and not presence:
+        raise click.UsageError(
+            "--persistent requires --presence: a persistent session makes the "
+            "broker queue messages for this identity while it is away, "
+            "but without --presence the identity never appears in the "
+            "directory, so no operator can find it with `swarmbus list` "
+            "or retire it with `swarmbus registry-forget` and its queued "
+            "backlog grows forever. Add --presence, or use --no-persistent."
+        )
+
+
 @main.command("mcp-server")
-@click.option("--agent-id", required=True, help="This agent's ID")
-@_broker_address_options
-@click.option(
-    "--persistent/--no-persistent",
-    default=False,
-    show_default=True,
-    help="Use an MQTT persistent session so queued QoS1 messages survive "
-         "between MCP server restarts. Enables persistent delivery without a "
-         "listener daemon. Only one client per agent-id can hold the "
-         "session -- do not combine with a running daemon. Requires "
-         "--presence, so the queued identity stays discoverable and "
-         "retirable. Independent of --lifecycle, which governs the "
-         "directory record rather than the MQTT session.",
-)
-@click.option(
-    "--presence/--no-presence",
-    default=False,
-    show_default=True,
-    help="Publish retained presence on startup (online) and shutdown "
-         "(offline). Makes this agent visible to `agent_state` and "
-         "`swarmbus list` without a listener daemon. Without it the "
-         "sidecar is messaging-only: it subscribes to no directory "
-         "topics, and `agent_state` refuses instead of answering.",
-)
-@click.option(
-    "--lifecycle",
-    type=click.Choice(["named", "transient"]),
-    default="named",
-    show_default=True,
-    help="Retained registry lifecycle for this agent identity. "
-         "'transient' publishes a retained registry record and "
-         "tombstones it on clean shutdown, and therefore requires "
-         "--presence. Independent of --persistent, which governs the MQTT "
-         "session rather than the directory record.",
-)
-@click.option(
-    "--capability",
-    "capabilities",
-    multiple=True,
-    help="Advisory capability to publish; repeat for more than one.",
-)
-@click.option(
-    "--registry-heartbeat-seconds",
-    type=float,
-    default=60,
-    envvar="SWARMBUS_REGISTRY_HEARTBEAT_SECONDS",
-    show_default=True,
-    help="Seconds between registry heartbeats. "
-         "[env: SWARMBUS_REGISTRY_HEARTBEAT_SECONDS]",
-)
-@click.option(
-    "--registry-stale-after-seconds",
-    type=float,
-    default=180,
-    envvar="SWARMBUS_REGISTRY_STALE_AFTER_SECONDS",
-    show_default=True,
-    help="Seconds without a heartbeat before online state is stale. "
-         "[env: SWARMBUS_REGISTRY_STALE_AFTER_SECONDS]",
-)
-@click.option(
-    "--state-dir",
-    default="~/.local/state/swarmbus",
-    envvar="SWARMBUS_STATE_DIR",
-    show_default=True,
-    help="Directory for the persistent SQLite inbox. [env: SWARMBUS_STATE_DIR]",
-)
-@_hop_limit_option
-@_rate_limit_options
-@_on_trip_option
-@_broker_auth_options
+@_mcp_runtime_options
 def mcp_server(
     agent_id: str,
     broker: str,
@@ -1808,6 +1863,7 @@ def mcp_server(
     registry_heartbeat_seconds: float,
     registry_stale_after_seconds: float,
     state_dir: str,
+    password_file: str | None,
     hop_limit: int,
     rate_limit: int,
     rate_cooldown: float,
@@ -1820,25 +1876,12 @@ def mcp_server(
     tls: bool,
 ) -> None:
     """Start the MCP sidecar for this agent."""
-    # Validate here for Click's exit-2 error; the runtime guards embedders.
-    if lifecycle == "transient" and not presence:
-        raise click.UsageError(
-            "--lifecycle transient requires --presence: --lifecycle "
-            "describes how this identity's directory record is retired, "
-            "and without --presence the sidecar has no directory "
-            "record, so the choice applies to nothing. Add --presence, "
-            "or use --lifecycle named."
-        )
-    if persistent and not presence:
-        raise click.UsageError(
-            "--persistent requires --presence: a persistent session makes the "
-            "broker queue messages for this identity while it is away, "
-            "but without --presence the identity never appears in the "
-            "directory, so no operator can find it with `swarmbus list` "
-            "or retire it with `swarmbus registry-forget` and its queued "
-            "backlog grows forever. Add --presence, or use --no-persistent "
-            "for a live-session sidecar."
-        )
+    _validate_mcp_runtime_mode(
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+    password = _maintenance_password(password, password_file)
 
     from .mcp_server import run_mcp_server
     run_mcp_server(
@@ -1863,6 +1906,87 @@ def mcp_server(
         client_cert=client_cert,
         client_key=client_key,
     )
+
+
+@main.command("mcp-daemon")
+@click.option(
+    "--socket",
+    "socket_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Private AF_UNIX socket for local MCP frontends.",
+)
+@_mcp_runtime_options
+def mcp_daemon(
+    socket_path: str,
+    agent_id: str,
+    broker: str,
+    port: int,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+    capabilities: tuple[str, ...],
+    registry_heartbeat_seconds: float,
+    registry_stale_after_seconds: float,
+    state_dir: str,
+    password_file: str | None,
+    hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
+    on_trip: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """Own one managed runtime for local stdio MCP frontends."""
+    _validate_mcp_runtime_mode(
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+    password = _maintenance_password(password, password_file)
+    try:
+        run_mcp_daemon(
+            socket_path=socket_path,
+            agent_id=agent_id,
+            broker=broker,
+            port=port,
+            persistent=persistent,
+            presence=presence,
+            lifecycle=lifecycle,
+            capabilities=capabilities,
+            state_dir=state_dir,
+            registry_heartbeat_seconds=registry_heartbeat_seconds,
+            registry_stale_after_seconds=registry_stale_after_seconds,
+            username=username,
+            password=password,
+            tls=tls,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+            hop_limit=hop_limit,
+            rate_limit=rate_limit,
+            rate_cooldown=rate_cooldown,
+            on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
+        )
+    except LocalRPCOwnershipError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+
+@main.command("mcp-proxy")
+@click.option(
+    "--socket",
+    "socket_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Private AF_UNIX socket owned by mcp-daemon.",
+)
+def mcp_proxy(socket_path: str) -> None:
+    """Run a credential-free stdio MCP frontend."""
+    run_mcp_proxy(socket_path)
 
 
 @main.command()

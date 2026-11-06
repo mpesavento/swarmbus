@@ -2140,6 +2140,7 @@ def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
 def test_registry_gc_cli_reads_password_file(tmp_path):
     password_file = tmp_path / "mqtt-password"
     password_file.write_text("secret\n")
+    password_file.chmod(0o600)
     report = RegistryGCReport(
         dry_run=True,
         scanned=0,

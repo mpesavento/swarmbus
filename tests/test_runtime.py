@@ -1354,6 +1354,30 @@ _MESSAGING_OPERATIONS = frozenset(
     {"send_message", "read_inbox", "ack_inbox", "watch_inbox"}
 )
 _LIFECYCLE_OPERATIONS = frozenset({"start", "wait_until_ready", "stop"})
+_HEALTH_OPERATIONS = frozenset({"runtime_status"})
+
+
+@pytest.mark.asyncio
+async def test_runtime_status_reports_transport_readiness(tmp_path):
+    runtime = ManagedMCPRuntime(
+        agent_id="foo",
+        state_path=tmp_path / "foo.sqlite3",
+    )
+
+    assert await runtime.runtime_status() == {
+        "ready": False,
+        "connected": False,
+        "state": "stopped",
+    }
+
+    runtime._client = _FakeClient()
+    runtime._state = RuntimeState.CONNECTED
+    assert await runtime.runtime_status() == {
+        "ready": True,
+        "connected": True,
+        "state": "connected",
+    }
+
 
 def test_directory_operation_matrix_covers_the_mcp_runtime_contract():
     """Cover every public directory method with presence-refusal tests."""
@@ -1367,7 +1391,7 @@ def test_directory_operation_matrix_covers_the_mcp_runtime_contract():
     }
 
     assert {name for name, _ in _DIRECTORY_OPERATIONS} == (
-        declared - _MESSAGING_OPERATIONS - _LIFECYCLE_OPERATIONS
+        declared - _MESSAGING_OPERATIONS - _LIFECYCLE_OPERATIONS - _HEALTH_OPERATIONS
     )
 
 @pytest.mark.asyncio
