@@ -5,6 +5,7 @@ import json
 import logging
 import random
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -230,6 +231,8 @@ class ManagedMCPRuntime:
         self._ready = asyncio.Event()
         self._stopping = asyncio.Event()
         self._inbox_condition = asyncio.Condition()
+        self._inbox_instance_id = uuid.uuid4().hex
+        self._inbox_generation = 0
         self._state = RuntimeState.STOPPED
         self._last_fatal_error: Exception | None = None
         self._last_store_error: Exception | None = None
@@ -344,8 +347,9 @@ class ManagedMCPRuntime:
             f"swarmbus managed MQTT runtime failed: {self._last_fatal_error}"
         )
 
-    async def _notify_inbox_waiters(self) -> None:
+    async def _advance_inbox_generation(self) -> None:
         async with self._inbox_condition:
+            self._inbox_generation += 1
             self._inbox_condition.notify_all()
 
     async def start(self) -> None:
@@ -384,7 +388,7 @@ class ManagedMCPRuntime:
             await self._connection_loop()
         except Exception as exc:
             self._record_fatal(exc)
-            await self._notify_inbox_waiters()
+            await self._advance_inbox_generation()
             raise
 
     def _connection_task_done(self, task: asyncio.Task[None]) -> None:
@@ -399,7 +403,7 @@ class ManagedMCPRuntime:
                 exc,
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
-            asyncio.create_task(self._notify_inbox_waiters())
+            asyncio.create_task(self._advance_inbox_generation())
 
     def _heartbeat_task_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled() or self._stopping.is_set():
@@ -410,7 +414,7 @@ class ManagedMCPRuntime:
         self._record_fatal(exc)
         if self._connection_task is not None and not self._connection_task.done():
             self._connection_task.cancel()
-        asyncio.create_task(self._notify_inbox_waiters())
+        asyncio.create_task(self._advance_inbox_generation())
 
     async def wait_until_ready(self, timeout: float = 10.0) -> None:
         """Wait for the first broker connection, surfacing early task failure."""
@@ -547,7 +551,7 @@ class ManagedMCPRuntime:
                             self._heartbeat_task_done
                         )
                     self._state = RuntimeState.CONNECTED
-                    await self._notify_inbox_waiters()
+                    await self._advance_inbox_generation()
                     self._ready.set()
                     async for message in client.messages:
                         if self.persistent and not self._replay_settled:
@@ -599,7 +603,7 @@ class ManagedMCPRuntime:
                     self._heartbeat_task = None
                 if self._state is RuntimeState.CONNECTED:
                     self._state = RuntimeState.CONNECTING
-                await self._notify_inbox_waiters()
+                await self._advance_inbox_generation()
 
             client = None
             ack_adapter = None
@@ -658,7 +662,7 @@ class ManagedMCPRuntime:
             except (OSError, sqlite3.Error) as exc:
                 self._last_store_error = exc
                 self._state = RuntimeState.STORE_DEGRADED
-                await self._notify_inbox_waiters()
+                await self._advance_inbox_generation()
                 if self.persistent:
                     raise
                 logger.error(
@@ -730,8 +734,7 @@ class ManagedMCPRuntime:
                 source_topic=topic,
             )
             if inserted:
-                async with self._inbox_condition:
-                    self._inbox_condition.notify_all()
+                await self._advance_inbox_generation()
             ack_adapter.ack(mqtt_message)
             return
 
@@ -780,6 +783,7 @@ class ManagedMCPRuntime:
         subject: str,
         body: str,
         content_type: str = "text/plain",
+        priority: str = "normal",
         in_reply_to: str | None = None,
     ) -> None:
         if self._client is None:
@@ -799,6 +803,7 @@ class ManagedMCPRuntime:
             subject=subject,
             body=body,
             content_type=content_type,
+            priority=priority,
             in_reply_to=in_reply_to or None,
             hops=hops,
             origin=origin,
@@ -853,6 +858,100 @@ class ManagedMCPRuntime:
                 continue
             self._replay_settled = True
 
+    async def _read_stored_messages(
+        self,
+        *,
+        max_messages: int,
+    ) -> list[dict]:
+        reader = getattr(self.store, "read_with_status", None)
+        if reader is None:
+            return await self.store.read(max_messages=max_messages)
+        messages, quarantined_ids = await reader(max_messages=max_messages)
+        if quarantined_ids:
+            await self._advance_inbox_generation()
+        return messages
+
+    async def inbox_state(
+        self,
+        *,
+        cursor: dict[str, Any] | None = None,
+        wait_seconds: float = 0.0,
+        max_messages: int = 1000,
+    ) -> dict:
+        """Return or wait for a non-consuming pending-inbox snapshot."""
+        if wait_seconds < 0:
+            raise ValueError("wait_seconds must be non-negative")
+        if max_messages < 1:
+            raise ValueError("max_messages must be at least 1")
+        if (
+            self._state is RuntimeState.STORE_DEGRADED
+            and self._last_store_error is not None
+        ):
+            raise self._transport_unavailable()
+
+        cursor_instance: str | None = None
+        cursor_generation: int | None = None
+        if cursor is not None:
+            if not isinstance(cursor, dict):
+                raise ValueError("cursor must be an object")
+            cursor_instance = cursor.get("instance_id")
+            cursor_generation = cursor.get("generation")
+            if (
+                not isinstance(cursor_instance, str)
+                or not cursor_instance
+                or not isinstance(cursor_generation, int)
+                or isinstance(cursor_generation, bool)
+                or cursor_generation < 0
+            ):
+                raise ValueError(
+                    "cursor requires a non-empty instance_id and "
+                    "non-negative integer generation"
+                )
+
+        async with self._inbox_condition:
+            reset = cursor is not None and (
+                cursor_instance != self._inbox_instance_id
+                or cursor_generation > self._inbox_generation
+            )
+            unchanged = (
+                cursor is not None
+                and not reset
+                and cursor_generation == self._inbox_generation
+            )
+            if unchanged and wait_seconds > 0:
+                deadline = asyncio.get_running_loop().time() + wait_seconds
+                while cursor_generation == self._inbox_generation:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            self._inbox_condition.wait(),
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        break
+
+            try:
+                metadata = await self.store.pending_metadata(limit=max_messages)
+            except (OSError, sqlite3.Error) as exc:
+                self._last_store_error = exc
+                self._state = RuntimeState.STORE_DEGRADED
+                raise StoreUnavailable(
+                    f"swarmbus durable inbox is degraded: {exc}"
+                ) from exc
+            status = await self.runtime_status()
+            return {
+                "cursor": {
+                    "instance_id": self._inbox_instance_id,
+                    "generation": self._inbox_generation,
+                },
+                "reset": reset,
+                "runtime_state": status["state"],
+                "connected": status["connected"],
+                **metadata,
+            }
+
     async def read_inbox(
         self,
         *,
@@ -876,12 +975,16 @@ class ManagedMCPRuntime:
                 timeout=wait_seconds,
             )
 
-        messages = await self.store.read(max_messages=max_messages)
+        messages = await self._read_stored_messages(
+            max_messages=max_messages
+        )
         if messages:
             return messages
         if self.connected:
             await self._await_startup_replay()
-            messages = await self.store.read(max_messages=max_messages)
+            messages = await self._read_stored_messages(
+                max_messages=max_messages
+            )
             if messages:
                 return messages
             if self._state is RuntimeState.STORE_DEGRADED:
@@ -890,7 +993,10 @@ class ManagedMCPRuntime:
         raise self._transport_unavailable()
 
     async def ack_inbox(self, *, message_ids: list[str]) -> int:
-        return await self.store.ack(message_ids)
+        acknowledged = await self.store.ack(message_ids)
+        if acknowledged:
+            await self._advance_inbox_generation()
+        return acknowledged
 
     async def _wait_for_inbox(
         self,
@@ -902,7 +1008,12 @@ class ManagedMCPRuntime:
         deadline = loop.time() + timeout
         await self._await_startup_replay()
         while True:
-            messages = await self.store.read(max_messages=max_messages)
+            async with self._inbox_condition:
+                observed_generation = self._inbox_generation
+
+            messages = await self._read_stored_messages(
+                max_messages=max_messages
+            )
             if messages:
                 return messages
             if (
@@ -913,10 +1024,10 @@ class ManagedMCPRuntime:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return []
+
             async with self._inbox_condition:
-                messages = await self.store.read(max_messages=max_messages)
-                if messages:
-                    return messages
+                if self._inbox_generation != observed_generation:
+                    continue
                 if (
                     not self.connected
                     or self._state is RuntimeState.STORE_DEGRADED

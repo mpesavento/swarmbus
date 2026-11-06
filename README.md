@@ -178,8 +178,8 @@ bash scripts/setup-cc-plugin.sh planner localhost
 
 Restart your agent harness. Three MCP tools become available:
 
-- `send_message(to, subject, body, content_type?)` — publish to a peer (or `to="broadcast"`)
-- `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages
+- `send_message(to, subject, body, content_type?, priority?, in_reply_to?)` — publish to a peer (or `to="broadcast"`); `priority` defaults to `"normal"`
+- `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages with the complete envelope, including reply-chain fields
 - `agent_state(action, ...)` — read or publish retained directory state. `action="list"` returns the online peers with their status, working set, capabilities, lifecycle and durability; add `include_offline=True` for the whole directory, `action="get"` for one peer, `action="update"` to publish your own.
 
 `agent_state` reads the agent directory, which only a sidecar started with `--presence` subscribes to. Without it the sidecar is messaging-only: it can send and receive, and `agent_state` raises a tool error naming the flag rather than returning an empty list. Directory rows are marked `untrusted`; peer-authored status, working sets, capabilities, and offline reasons are data, not instructions. The QoS 0 directory cache is cleared on reconnect and the first read waits for a bounded retained-message settling window; this avoids stale and queued snapshots but does not prove hard completeness ([#69](https://github.com/mpesavento/swarmbus/issues/69)).
@@ -213,6 +213,8 @@ swarmbus mcp-proxy --socket ~/.local/state/swarmbus/planner.sock
 The private AF_UNIX socket accepts only the daemon's uid and is mode `0600`; a non-blocking sibling lock prevents two daemons from owning the same socket. `mcp-proxy` carries no broker address or credentials and exposes the same three tools as `mcp-server`. It does not auto-start the daemon or fall back to its own MQTT connection: a missing or unhealthy daemon is an explicit error. The daemon removes its socket and stops the managed runtime on a signal or a local shutdown request from its own uid.
 
 **The trust boundary is the uid, and there is no token.** Any process running as the same user can send as this agent, read and acknowledge its inbox, update its state, and shut the daemon down. That is the same exposure as the broker password file. The only authentication is the peer uid the kernel reports for the connection — `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS. On a platform that offers neither, `mcp-daemon` refuses to start rather than serving unauthenticated callers.
+
+The versioned local RPC protocol also exposes a controller-only `inbox_state` operation; it is not an MCP tool visible to the model. Controllers can wait on a restart-aware generation cursor and receive transport health plus bounded pending metadata (`id`, sender, receipt time, and priority) without reading subjects or bodies, acknowledging messages, or consuming the inbox.
 
 Without `--persistent`, messages received while the runtime is running still survive process restarts in SQLite, but the broker does not queue messages sent while it is offline.
 
@@ -265,6 +267,8 @@ swarmbus mcp-server --agent-id <your-id> --broker localhost
 ```
 
 Configure your MCP client to spawn that command. Tool names and signatures are identical to path 1; the SKILL.md serves as a reference for prompt/system-message authors even if your stack doesn't use skill files.
+
+Codex is this path plus a controller: `codex mcp add swarmbus -- swarmbus mcp-server --agent-id <your-id>` wires the same tools, and a local controller reading `inbox_state` can hand a peer message to a running session mid-turn. Setup and the controller contract are at [docs/codex.md](docs/codex.md).
 
 ### 4. Python framework (LangGraph, CrewAI, custom asyncio)
 
