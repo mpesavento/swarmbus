@@ -26,9 +26,11 @@ Claude Code asks for the agent id. The broker host, port, username and password 
 
 ## What it runs and connects to
 
-- It runs `sh -c` with a one-line check that `swarmbus` is on your PATH, then `swarmbus mcp-server --agent-id <id> --broker <host> --port <port> --presence`, once per Claude Code session. The settings reach `swarmbus` as separate arguments, never as part of the shell line.
-- With `--presence` the sidecar publishes this agent's online or offline state and a registry record to the broker, retained, so peers can see it. That is also what lets `agent_state` answer.
-- The sidecar connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one.
+- It runs `sh -c` with a one-line check that `swarmbus` is on your PATH, then `swarmbus mcp-attach --agent-id <id> --broker <host> --port <port> --persistent --presence`, once per Claude Code session. The settings reach `swarmbus` as separate arguments, never as part of the shell line.
+- `mcp-attach` looks for the shared daemon for this agent id. The first session starts one, detached from the session, and later sessions attach to it with no second broker connection. The session itself only serves the `send_message`, `read_inbox` and `agent_state` tools through that daemon.
+- The daemon runs `--persistent`, so messages sent to this agent id while no session is open are queued by the broker for the id and arrive when a session reads its inbox.
+- With `--presence` the daemon publishes this agent's online or offline state and a registry record to the broker, retained, so peers can see it. That is also what lets `agent_state` answer.
+- The daemon connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one. Its log is `~/.local/state/swarmbus/<agent-id>.daemon.log`.
 - An empty host or port counts as unset, so the config file's value applies, then the built-in default. A host or port set in the plugin beats the config file.
 - The username and password reach the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`. An empty one counts as unset, so the config file's values apply.
 - TLS settings still come from the config file or the `SWARMBUS_BROKER_*` environment variables; see `docs/configuration.md`.
@@ -36,8 +38,10 @@ Claude Code asks for the agent id. The broker host, port, username and password 
 ## Things to know
 
 - The plugin is the preferred route. `scripts/setup-cc-plugin.sh` stays for now, but using both registers swarmbus twice, so Claude gets two sets of swarmbus tools. The script refuses to run while the plugin is installed, and `swarmbus doctor` warns when it finds both. If you used the script before, remove its registration (`claude mcp remove --scope user swarmbus`) and its skill copy (`~/.claude/skills/using-swarmbus`).
-- Each session that has the plugin enabled starts its own sidecar under the same agent id. Without `--persistent` each sidecar has its own broker session, so each gets a copy of every message, but the sidecars share one presence and registry record for that id. Give each session its own id if you need them told apart.
-- The sidecar does not run `--persistent`, so messages sent to this agent id while no session is open are not queued. Persistence comes with #88 (one shared daemon per agent id): `--persistent` gives an id a single MQTT client id (`swarmbus-<agent-id>`), and two sessions on one id would kick each other off the broker in a loop.
+- Sessions on one agent id share one inbox, which works as a shared work queue: whichever session reads and acks a message first takes it. If each session should see every message, give each its own agent id.
+- `swarmbus doctor` lists each daemon socket in the state directory with the daemon's pid, swarmbus version and agent id.
+- Stop a daemon with `kill <pid>`; it shuts down cleanly on SIGTERM. A daemon keeps running between sessions, so a `named` agent id stays up and keeps queueing messages after you close Claude Code. After you change the broker settings or upgrade swarmbus, `mcp-attach` refuses to attach to the old daemon and names the differing fields and the pid. Run `kill <pid>`, then start the session again.
+- The broker credentials are used only to start a daemon, and reach it through its environment, never its command line or log.
 - To retire an id you no longer use, run `swarmbus registry-forget --agent-id <id>` to remove its registry record; see `docs/configuration.md`.
 
 swarmbus is MIT-licensed. Source, docs and issues: https://github.com/mpesavento/swarmbus

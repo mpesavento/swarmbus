@@ -9,6 +9,8 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, NamedTuple, Protocol
@@ -20,6 +22,7 @@ try:
 except ImportError:
     fcntl = None
 
+from . import __version__
 from .message import DEFAULT_HOP_LIMIT, DEFAULT_RATE_COOLDOWN, DEFAULT_RATE_LIMIT
 from .mcp_server import (
     FastMCP,
@@ -50,6 +53,9 @@ _DARWIN_XUCRED_VERSION = 0
 _SOL_LOCAL = 0
 _READ_TIMEOUT_SECONDS = 30.0
 _RESPONSE_MARGIN_SECONDS = 5.0
+DAEMON_START_TIMEOUT_SECONDS = 15.0
+_PROBE_TIMEOUT_SECONDS = 2.0
+_START_POLL_SECONDS = 0.1
 
 
 class LocalRPCError(RuntimeError):
@@ -66,6 +72,14 @@ class LocalRPCProtocolError(LocalRPCError):
 
 class LocalRPCOwnershipError(LocalRPCError):
     """The socket or lock path is not safe for this daemon."""
+
+
+class LocalRPCDaemonMismatch(LocalRPCError):
+    """A running daemon's settings or version differ from the caller's."""
+
+
+class LocalRPCStartTimeout(LocalRPCError):
+    """A started daemon never answered."""
 
 
 class _PeerCredAPI(NamedTuple):
@@ -412,8 +426,15 @@ class LocalRuntimeProxy:
 class LocalRuntimeDaemon:
     """Own one managed runtime and serve its typed operations locally."""
 
-    def __init__(self, runtime: _LocalRuntime, socket_path: str | Path) -> None:
+    def __init__(
+        self,
+        runtime: _LocalRuntime,
+        socket_path: str | Path,
+        *,
+        settings: dict[str, Any] | None = None,
+    ) -> None:
         self.runtime = runtime
+        self.settings = settings
         self.socket_path = Path(socket_path)
         self.lock_path = Path(f"{self.socket_path}.lock")
         self._lock_fd: int | None = None
@@ -554,7 +575,14 @@ class LocalRuntimeDaemon:
         if operation == "shutdown":
             return {"accepted": True}
         if operation == "ping":
-            return await self.runtime.runtime_status()
+            return {
+                **(await self.runtime.runtime_status()),
+                "daemon": {
+                    "pid": os.getpid(),
+                    "version": __version__,
+                    "settings": self.settings,
+                },
+            }
         if operation == "send_message":
             return await self.runtime.send_message(**params)
         if operation == "read_inbox":
@@ -696,6 +724,190 @@ class LocalRuntimeDaemon:
         await self.stop()
 
 
+def _normalized_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def daemon_settings(
+    *,
+    agent_id: str,
+    broker: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+    tls: bool,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+) -> dict[str, Any]:
+    """The settings fingerprint a daemon reports and an attaching session compares.
+
+    It holds only whether a password is set. There is no password key and no
+    hash or other derivation of it, because the fingerprint crosses the socket
+    in every ping reply and appears in error messages.
+    """
+    return {
+        "agent_id": agent_id,
+        "broker": broker,
+        "port": port,
+        "username": username,
+        "password_set": password is not None,
+        "tls": tls,
+        "ca_cert": _normalized_path(ca_cert),
+        "client_cert": _normalized_path(client_cert),
+        "client_key": _normalized_path(client_key),
+        "persistent": persistent,
+        "presence": presence,
+        "lifecycle": lifecycle,
+    }
+
+
+def probe_daemon(
+    socket_path: str | Path,
+    *,
+    timeout: float = _PROBE_TIMEOUT_SECONDS,
+) -> dict[str, Any] | None:
+    """Ask the daemon at `socket_path` to ping; None when nothing answers."""
+    path = Path(socket_path)
+    try:
+        result = asyncio.run(
+            LocalRuntimeProxy(path)._call("ping", {}, response_timeout=timeout)
+        )
+    except LocalRPCUnavailable as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError):
+            detail = _over_long_socket_path(cause, path)
+            if detail is not None:
+                raise LocalRPCOwnershipError(detail) from exc
+        return None
+    if not isinstance(result, dict):
+        raise LocalRPCProtocolError("ping result must be an object")
+    return result
+
+
+def _private_dir(path: Path) -> None:
+    """Create `path` private to this user, or insist an existing one already is.
+
+    Two sessions can attach at once on a first run, so creation must not be a
+    check-then-create: whoever loses the mkdir leaves the winner's directory,
+    or one that already existed, exactly as it is.
+    """
+    try:
+        path.mkdir(mode=0o700, parents=True)
+        # The umask may have narrowed the mode mkdir was given.
+        os.chmod(path, 0o700)
+    except FileExistsError:
+        pass
+    info = path.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise LocalRPCOwnershipError(
+            f"{path} must be private to this user: chmod 700 {path}"
+        )
+
+
+def _check_fingerprint(
+    reply: dict[str, Any],
+    settings: dict[str, Any],
+    socket_path: str | Path,
+) -> dict[str, Any]:
+    daemon = reply.get("daemon")
+    if not isinstance(daemon, dict) or not isinstance(daemon.get("settings"), dict):
+        raise LocalRPCDaemonMismatch(
+            f"the swarmbus daemon at {socket_path} reports no pid, version or "
+            "settings because it predates mcp-attach. Stop that mcp-daemon, "
+            "then start this session again."
+        )
+    running = daemon["settings"]
+    fields: list[str] = []
+    if daemon.get("version") != __version__:
+        fields.append("version")
+    fields.extend(
+        key
+        for key in sorted(set(running) | set(settings))
+        if running.get(key) != settings.get(key)
+    )
+    if fields:
+        pid = daemon.get("pid")
+        raise LocalRPCDaemonMismatch(
+            f"the swarmbus daemon for {settings['agent_id']!r} at {socket_path} "
+            f"(pid {pid}, swarmbus {daemon.get('version')}) differs from this "
+            f"session in: {', '.join(fields)}. Stop it with `kill {pid}` (it "
+            "shuts down cleanly on SIGTERM), then start this session again."
+        )
+    return reply
+
+
+def ensure_daemon(
+    socket_path: str | Path,
+    *,
+    settings: dict[str, Any],
+    daemon_argv: list[str],
+    env: dict[str, str],
+    log_path: str | Path,
+    start_timeout: float = DAEMON_START_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Return the ping reply of the daemon on `socket_path`, starting one if needed.
+
+    A daemon that is already running must carry this session's settings and
+    swarmbus version, or LocalRPCDaemonMismatch names the differing fields.
+    """
+    socket_path = Path(socket_path)
+    log_path = Path(log_path)
+    _private_dir(socket_path.parent)
+    _private_dir(log_path.parent)
+
+    reply = probe_daemon(socket_path)
+    if reply is not None:
+        return _check_fingerprint(reply, settings, socket_path)
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    log_fd = os.open(log_path, flags, 0o600)
+    try:
+        # The child must never inherit this process's stdin or stdout: they are
+        # the MCP channel to the session, and a daemon holding them would corrupt
+        # it and outlive it.
+        proc = subprocess.Popen(
+            daemon_argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fd,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(socket_path.parent),
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        os.close(log_fd)
+
+    deadline = time.monotonic() + start_timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # Reap a child that exited. It is not a failure by itself: under a
+        # concurrent attach the loser exits while the winner comes up.
+        proc.poll()
+        reply = probe_daemon(
+            socket_path, timeout=min(_PROBE_TIMEOUT_SECONDS, remaining)
+        )
+        if reply is not None:
+            return _check_fingerprint(reply, settings, socket_path)
+        time.sleep(_START_POLL_SECONDS)
+
+    code = proc.poll()
+    exited = f" (it exited with status {code})" if code is not None else ""
+    raise LocalRPCStartTimeout(
+        f"swarmbus mcp-daemon did not answer at {socket_path} within "
+        f"{start_timeout:g}s{exited}; see {log_path}"
+    )
+
+
 def run_mcp_proxy(socket_path: str) -> None:
     """Run one official stdio MCP session over the local runtime daemon."""
     if not _MCP_AVAILABLE:
@@ -759,8 +971,23 @@ def run_mcp_daemon(
         trip_listener="mcp-daemon",
     )
 
+    settings = daemon_settings(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+
     async def serve() -> None:
-        daemon = LocalRuntimeDaemon(runtime, socket_path)
+        daemon = LocalRuntimeDaemon(runtime, socket_path, settings=settings)
         loop = asyncio.get_running_loop()
         installed: list[signal.Signals] = []
         for signum in (signal.SIGINT, signal.SIGTERM):

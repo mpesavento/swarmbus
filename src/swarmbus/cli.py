@@ -23,13 +23,25 @@ from .handlers.file_bridge import FileBridgeHandler
 from .handlers.direct_invoke import DEFAULT_INVOKE_TIMEOUT, DirectInvocationHandler
 from .handlers.persistent import PersistentListenerHandler
 from .maintenance import RegistryMaintenance
-from .local_rpc import LocalRPCOwnershipError, run_mcp_daemon, run_mcp_proxy
+from .local_rpc import (
+    LocalRPCDaemonMismatch,
+    LocalRPCError,
+    LocalRPCOwnershipError,
+    LocalRPCStartTimeout,
+    daemon_settings,
+    ensure_daemon,
+    probe_daemon,
+    run_mcp_daemon,
+    run_mcp_proxy,
+)
+from .mcp_server import _MCP_AVAILABLE
 from .message import (
     DEFAULT_HOP_LIMIT,
     DEFAULT_RATE_COOLDOWN,
     DEFAULT_RATE_LIMIT,
     UNTRUSTED_METADATA_LABEL,
     _validate_agent_id,
+    _validate_registered_agent_id,
     frame_body,
     sanitize_field,
 )
@@ -1040,6 +1052,47 @@ def _doctor_channel(db: Path, agent_id: str, window_minutes: int) -> tuple[str, 
     return (text, "ok", None)
 
 
+def _doctor_local_daemons(state_dir: str) -> list[tuple[str, str, str | None]]:
+    """One row per `*.sock` in the state dir: who answers on it, or that nobody does."""
+    from . import __version__
+
+    prefix = "local daemons..........."
+    root = Path(state_dir).expanduser()
+    sockets = sorted(root.glob("*.sock"))
+    if not sockets:
+        return [(f"{prefix} (none in {root})", "skip", None)]
+    rows: list[tuple[str, str, str | None]] = []
+    for path in sockets:
+        try:
+            reply = probe_daemon(path)
+        except Exception as exc:
+            rows.append((f"{prefix} {path.name}: {exc}", "warn", None))
+            continue
+        if reply is None:
+            rows.append((
+                f"{prefix} {path.name}: no daemon answers (stale socket)",
+                "warn",
+                "the next swarmbus mcp-attach or mcp-daemon for this id replaces it",
+            ))
+            continue
+        info = reply.get("daemon")
+        info = info if isinstance(info, dict) else {}
+        pid = info.get("pid", "?")
+        version = info.get("version", "?")
+        settings = info.get("settings")
+        agent = settings.get("agent_id", "?") if isinstance(settings, dict) else "?"
+        label = f"{prefix} {path.name}: pid {pid}, swarmbus {version}, agent {agent}"
+        if version != __version__:
+            rows.append((
+                f"{label} (this CLI is {__version__})",
+                "warn",
+                f"kill {pid}  (the next session starts a daemon on the new code)",
+            ))
+        else:
+            rows.append((label, "ok", None))
+    return rows
+
+
 def _doctor_claude_registration() -> tuple[str, str, str | None]:
     """The doctor's double-registration probe: the Claude Code plugin and scripts/setup-cc-plugin.sh each register swarmbus (#85)."""
     prefix = "claude registration....."
@@ -1126,7 +1179,8 @@ def doctor(
 ) -> None:
     """Run a self-diagnosis of the local swarmbus install + daemon state.
 
-    Prints a checklist of 10 probes: CLI version, broker reachability, my
+    Prints a checklist of 10 probes plus one line per daemon socket in
+    --state-dir: CLI version, broker reachability, my
     systemd unit state, daemon library freshness (catches stale in-memory
     Python — the root cause of the 2026-04-14 priority-field incident),
     --invoke wired, outbox env resolvable, peer discovery, tripped senders
@@ -1402,6 +1456,9 @@ def doctor(
 
     # 10. Claude Code registration
     results.append(_doctor_claude_registration())
+
+    # Local mcp-daemon sockets, one line each (after 1-10 so those keep their numbers)
+    results.extend(_doctor_local_daemons(state_dir))
 
     # Render
     click.echo(f"\n[doctor] swarmbus health check for agent-id={agent_id_resolved}\n")
@@ -1987,6 +2044,190 @@ def mcp_daemon(
 def mcp_proxy(socket_path: str) -> None:
     """Run a credential-free stdio MCP frontend."""
     run_mcp_proxy(socket_path)
+
+
+def _mcp_daemon_argv(
+    *,
+    socket: Path,
+    agent_id: str,
+    broker: str,
+    port: int,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+    capabilities: tuple[str, ...],
+    state_root: Path,
+    registry_heartbeat_seconds: float,
+    registry_stale_after_seconds: float,
+    hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
+    on_trip: str | None,
+    username: str | None,
+    tls: bool,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+) -> list[str]:
+    """The argv that starts `mcp-daemon` with the same settings as this attach.
+
+    Never carries the broker password: it reaches the daemon through its
+    environment only. `sys.executable` runs the daemon on this attach's
+    swarmbus version.
+    """
+    argv = [
+        sys.executable, "-c", "from swarmbus.cli import main; main()",
+        "mcp-daemon",
+        "--socket", str(socket),
+        "--agent-id", agent_id,
+        "--broker", broker,
+        "--port", str(port),
+        "--persistent" if persistent else "--no-persistent",
+        "--presence" if presence else "--no-presence",
+        "--lifecycle", lifecycle,
+        "--state-dir", str(state_root),
+        "--registry-heartbeat-seconds", str(registry_heartbeat_seconds),
+        "--registry-stale-after-seconds", str(registry_stale_after_seconds),
+        "--hop-limit", str(hop_limit),
+        "--rate-limit", str(rate_limit),
+        "--rate-cooldown", str(rate_cooldown),
+        "--tls" if tls else "--no-tls",
+    ]
+    for capability in capabilities:
+        argv += ["--capability", capability]
+    if username is not None:
+        argv += ["--username", username]
+    if on_trip:
+        argv += ["--on-trip", on_trip]
+    for flag, path in (
+        ("--ca-cert", ca_cert),
+        ("--client-cert", client_cert),
+        ("--client-key", client_key),
+    ):
+        if path is not None:
+            argv += [flag, os.path.abspath(os.path.expanduser(path))]
+    return argv
+
+
+@main.command("mcp-attach")
+@click.option(
+    "--socket",
+    "socket_path",
+    default=None,
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Private AF_UNIX socket of the shared mcp-daemon. "
+         "Default: <state-dir>/<agent-id>.sock",
+)
+@_mcp_runtime_options
+def mcp_attach(
+    socket_path: str | None,
+    agent_id: str,
+    broker: str,
+    port: int,
+    persistent: bool,
+    presence: bool,
+    lifecycle: str,
+    capabilities: tuple[str, ...],
+    registry_heartbeat_seconds: float,
+    registry_stale_after_seconds: float,
+    state_dir: str,
+    password_file: str | None,
+    hop_limit: int,
+    rate_limit: int,
+    rate_cooldown: float,
+    on_trip: str | None,
+    username: str | None,
+    password: str | None,
+    ca_cert: str | None,
+    client_cert: str | None,
+    client_key: str | None,
+    tls: bool,
+) -> None:
+    """Attach this session to the shared mcp-daemon for --agent-id, starting it if needed.
+
+    If no daemon answers, this starts `mcp-daemon` detached with these
+    settings and logs to <state-dir>/<agent-id>.daemon.log. It refuses a
+    running daemon whose settings or swarmbus version differ, naming the
+    fields and `kill <pid>`. Broker credentials are used only to start a
+    daemon.
+    """
+    _validate_mcp_runtime_mode(
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+    try:
+        _validate_registered_agent_id(agent_id)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    password = _maintenance_password(password, password_file)
+    if not _MCP_AVAILABLE:
+        raise click.ClickException(
+            "mcp package not installed. Run: uv pip install 'swarmbus-py[mcp]'"
+        )
+
+    state_root = Path(state_dir).expanduser().absolute()
+    socket = (
+        Path(socket_path).expanduser().absolute()
+        if socket_path
+        else state_root / f"{agent_id}.sock"
+    )
+    log_path = state_root / f"{agent_id}.daemon.log"
+    settings = daemon_settings(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+    )
+    daemon_argv = _mcp_daemon_argv(
+        socket=socket,
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+        capabilities=capabilities,
+        state_root=state_root,
+        registry_heartbeat_seconds=registry_heartbeat_seconds,
+        registry_stale_after_seconds=registry_stale_after_seconds,
+        hop_limit=hop_limit,
+        rate_limit=rate_limit,
+        rate_cooldown=rate_cooldown,
+        on_trip=on_trip,
+        username=username,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+    )
+    env = dict(os.environ)
+    env.pop("SWARMBUS_BROKER_PASSWORD", None)
+    if password is not None:
+        env["SWARMBUS_BROKER_PASSWORD"] = password
+
+    # stdout is the MCP channel: nothing below prints to it.
+    try:
+        ensure_daemon(
+            socket,
+            settings=settings,
+            daemon_argv=daemon_argv,
+            env=env,
+            log_path=log_path,
+        )
+    except LocalRPCOwnershipError as exc:
+        raise click.UsageError(str(exc)) from exc
+    except (LocalRPCDaemonMismatch, LocalRPCStartTimeout, LocalRPCError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    run_mcp_proxy(str(socket))
 
 
 @main.command()
