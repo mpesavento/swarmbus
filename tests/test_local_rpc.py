@@ -1,10 +1,14 @@
 import asyncio
+import base64
+import hashlib
 import inspect
 import json
 import os
+import signal
 import stat
 import struct
 import sys
+import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,6 +16,7 @@ from click.testing import CliRunner
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+import swarmbus
 from swarmbus.cli import main
 from swarmbus.local_rpc import (
     MAX_FRAME_BYTES,
@@ -133,6 +138,11 @@ async def test_ping_and_tool_contract_use_one_managed_runtime(tmp_path):
             "ready": True,
             "connected": True,
             "state": "connected",
+            "daemon": {
+                "pid": os.getpid(),
+                "version": swarmbus.__version__,
+                "settings": None,
+            },
         }
 
         app = create_mcp_app(proxy)
@@ -163,6 +173,11 @@ async def test_ping_reports_broker_unavailable_while_socket_is_up(tmp_path):
             "ready": False,
             "connected": False,
             "state": "connecting",
+            "daemon": {
+                "pid": os.getpid(),
+                "version": swarmbus.__version__,
+                "settings": None,
+            },
         }
 
 
@@ -210,6 +225,11 @@ async def test_four_clients_can_reuse_the_same_request_shape(tmp_path):
                 "ready": True,
                 "connected": True,
                 "state": "connected",
+                "daemon": {
+                    "pid": os.getpid(),
+                    "version": swarmbus.__version__,
+                    "settings": None,
+                },
             },
         }
     ] * 4
@@ -540,6 +560,11 @@ async def test_backend_loss_fails_without_retry(tmp_path):
             "ready": True,
             "connected": True,
             "state": "connected",
+            "daemon": {
+                "pid": os.getpid(),
+                "version": swarmbus.__version__,
+                "settings": None,
+            },
         }
 
     with pytest.raises(LocalRPCUnavailable):
@@ -843,3 +868,439 @@ def test_mcp_runtime_commands_reject_password_env_with_file(
     assert result.exit_code == 2
     assert "--password and --password-file are mutually exclusive" in result.output
     mock_run.assert_not_called()
+
+
+# A throwaway daemon for the attach tests: it serves a stub runtime on the given
+# socket, records its pid in the marker file once it owns the socket, and never
+# outlives the test run (SIGTERM, plus a 30 second watchdog).
+_STUB_DAEMON = """
+import asyncio, json, os, signal, sys
+from swarmbus.local_rpc import LocalRuntimeDaemon
+
+
+class Runtime:
+    broker = "stub"
+    port = 0
+
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def runtime_status(self):
+        return {"ready": True, "connected": True}
+
+    async def send_message(self, **kwargs):
+        pass
+
+    async def read_inbox(self, **kwargs):
+        return []
+
+    async def list_states(self, **kwargs):
+        return []
+
+    async def get_state(self, agent_id):
+        return {"agent_id": agent_id}
+
+    async def update_state(self, **kwargs):
+        return {}
+
+
+async def main(socket, settings_json, marker):
+    daemon = LocalRuntimeDaemon(
+        Runtime(), socket, settings=json.loads(settings_json)
+    )
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, daemon.request_shutdown)
+    loop.call_later(30, daemon.request_shutdown)
+    async with daemon:
+        with open(marker, "a") as handle:
+            handle.write(f"{os.getpid()}\\n")
+        await daemon.wait_for_shutdown()
+
+
+asyncio.run(main(*sys.argv[1:4]))
+"""
+
+_PASSWORD = "pw-s3cret-value"
+
+
+@pytest.fixture
+def stub_pids():
+    pids: list[int] = []
+    yield pids
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+
+def _settings(**overrides):
+    from swarmbus.local_rpc import daemon_settings
+
+    values = dict(
+        agent_id="loom",
+        broker="mqtt.example",
+        port=1883,
+        username=None,
+        password=None,
+        tls=False,
+        ca_cert=None,
+        client_cert=None,
+        client_key=None,
+        persistent=True,
+        presence=True,
+        lifecycle="named",
+    )
+    values.update(overrides)
+    return daemon_settings(**values)
+
+
+def _stub_argv(socket_path, settings, marker):
+    return [
+        sys.executable,
+        "-c",
+        _STUB_DAEMON,
+        str(socket_path),
+        json.dumps(settings),
+        str(marker),
+    ]
+
+
+def _marker_pids(marker):
+    return marker.read_text().splitlines() if marker.exists() else []
+
+
+@pytest.mark.asyncio
+async def test_ping_reports_daemon_pid_version_and_settings(tmp_path):
+    settings = _settings(username="alice")
+    socket_path = tmp_path / "runtime.sock"
+
+    async with LocalRuntimeDaemon(_FakeRuntime(), socket_path, settings=settings):
+        reply = await LocalRuntimeProxy(socket_path).ping()
+
+    assert reply == {
+        "ready": True,
+        "connected": True,
+        "state": "connected",
+        "daemon": {
+            "pid": os.getpid(),
+            "version": swarmbus.__version__,
+            "settings": settings,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_ping_never_carries_the_password(tmp_path):
+    settings = _settings(password=_PASSWORD)
+    socket_path = tmp_path / "runtime.sock"
+
+    async with LocalRuntimeDaemon(_FakeRuntime(), socket_path, settings=settings):
+        raw = json.dumps(await _raw_call(socket_path, _request("ping", {})))
+
+    secret = _PASSWORD.encode()
+    forbidden = [
+        _PASSWORD,
+        hashlib.sha256(secret).hexdigest(),
+        hashlib.sha1(secret).hexdigest(),
+        hashlib.md5(secret).hexdigest(),
+        base64.b64encode(secret).decode(),
+        base64.urlsafe_b64encode(secret).decode(),
+    ]
+    for needle in forbidden:
+        assert needle not in raw
+    assert settings["password_set"] is True
+    assert "password" not in settings
+    assert _settings(password=None)["password_set"] is False
+
+
+def test_run_mcp_daemon_reports_its_settings_without_the_password(tmp_path):
+    from swarmbus.local_rpc import daemon_settings, run_mcp_daemon
+
+    captured = {}
+
+    class _Capture:
+        def __init__(self, runtime, socket_path, *, settings=None):
+            captured["settings"] = settings
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        def request_shutdown(self):
+            pass
+
+        async def wait_for_shutdown(self):
+            return None
+
+    with (
+        patch(
+            "swarmbus.local_rpc.create_managed_runtime",
+            return_value=_FakeRuntime(),
+        ),
+        patch("swarmbus.local_rpc.LocalRuntimeDaemon", _Capture),
+    ):
+        run_mcp_daemon(
+            socket_path=str(tmp_path / "loom.sock"),
+            agent_id="loom",
+            broker="mqtt.example",
+            username="alice",
+            password=_PASSWORD,
+            persistent=True,
+            presence=True,
+        )
+
+    assert captured["settings"] == daemon_settings(
+        agent_id="loom",
+        broker="mqtt.example",
+        port=1883,
+        username="alice",
+        password=_PASSWORD,
+        tls=False,
+        ca_cert=None,
+        client_cert=None,
+        client_key=None,
+        persistent=True,
+        presence=True,
+        lifecycle="named",
+    )
+    assert "password" not in captured["settings"]
+
+
+def test_ensure_starts_a_detached_daemon_in_a_private_dir(tmp_path, stub_pids):
+    from swarmbus.local_rpc import ensure_daemon
+
+    socket_path = tmp_path / "run" / "a.sock"
+    log_path = tmp_path / "a.daemon.log"
+    marker = tmp_path / "marker"
+    settings = _settings()
+
+    reply = ensure_daemon(
+        socket_path,
+        settings=settings,
+        daemon_argv=_stub_argv(socket_path, settings, marker),
+        env=dict(os.environ),
+        log_path=log_path,
+    )
+
+    pid = reply["daemon"]["pid"]
+    stub_pids.append(pid)
+    assert pid != os.getpid()
+    assert os.getsid(pid) == pid
+    assert stat.S_IMODE(socket_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+    assert _marker_pids(marker) == [str(pid)]
+
+
+def test_second_ensure_attaches_without_spawning(tmp_path, stub_pids):
+    from swarmbus.local_rpc import ensure_daemon
+
+    socket_path = tmp_path / "run" / "a.sock"
+    log_path = tmp_path / "a.daemon.log"
+    marker = tmp_path / "marker"
+    settings = _settings()
+
+    first = ensure_daemon(
+        socket_path,
+        settings=settings,
+        daemon_argv=_stub_argv(socket_path, settings, marker),
+        env=dict(os.environ),
+        log_path=log_path,
+    )
+    stub_pids.append(first["daemon"]["pid"])
+    second = ensure_daemon(
+        socket_path,
+        settings=settings,
+        daemon_argv=[sys.executable, "-c", "raise SystemExit(9)"],
+        env=dict(os.environ),
+        log_path=log_path,
+    )
+
+    assert second["daemon"]["pid"] == first["daemon"]["pid"]
+    assert len(_marker_pids(marker)) == 1
+
+
+def test_concurrent_ensures_end_with_one_daemon(tmp_path, stub_pids):
+    from swarmbus.local_rpc import ensure_daemon
+
+    socket_path = tmp_path / "run" / "a.sock"
+    log_path = tmp_path / "a.daemon.log"
+    marker = tmp_path / "marker"
+    settings = _settings()
+    results: list = []
+    errors: list = []
+    barrier = threading.Barrier(2)
+
+    def attach():
+        try:
+            barrier.wait()
+            results.append(
+                ensure_daemon(
+                    socket_path,
+                    settings=settings,
+                    daemon_argv=_stub_argv(socket_path, settings, marker),
+                    env=dict(os.environ),
+                    log_path=log_path,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=attach) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    pids = [reply["daemon"]["pid"] for reply in results]
+    stub_pids.extend(pids)
+    assert errors == []
+    assert len(pids) == 2
+    assert pids[0] == pids[1]
+    assert _marker_pids(marker) == [str(pids[0])]
+
+
+@pytest.mark.asyncio
+async def test_ensure_refuses_a_daemon_with_different_settings(tmp_path):
+    from swarmbus.local_rpc import LocalRPCDaemonMismatch, ensure_daemon
+
+    socket_path = tmp_path / "run" / "a.sock"
+    socket_path.parent.mkdir(mode=0o700)
+    marker = tmp_path / "marker"
+    running = _settings(broker="old.example", username="bob", persistent=False)
+    wanted = _settings(
+        broker="mqtt.example",
+        username="alice",
+        password=_PASSWORD,
+        persistent=True,
+    )
+    argv = [
+        sys.executable,
+        "-c",
+        f"open({str(marker)!r}, 'w').write('ran')",
+    ]
+
+    async with LocalRuntimeDaemon(_FakeRuntime(), socket_path, settings=running):
+        with pytest.raises(LocalRPCDaemonMismatch) as caught:
+            await asyncio.to_thread(
+                ensure_daemon,
+                socket_path,
+                settings=wanted,
+                daemon_argv=argv,
+                env=dict(os.environ),
+                log_path=tmp_path / "a.daemon.log",
+            )
+
+    message = str(caught.value)
+    assert "broker" in message
+    assert "username" in message
+    assert "persistent" in message
+    assert f"kill {os.getpid()}" in message
+    assert _PASSWORD not in message
+    assert not marker.exists()
+
+
+def test_ensure_refuses_a_daemon_on_another_version(tmp_path):
+    from swarmbus.local_rpc import LocalRPCDaemonMismatch, ensure_daemon
+
+    settings = _settings()
+    reply = {
+        "ready": True,
+        "daemon": {"pid": 4242, "version": "0.0.1", "settings": settings},
+    }
+
+    with patch("swarmbus.local_rpc.probe_daemon", return_value=reply):
+        with pytest.raises(LocalRPCDaemonMismatch) as caught:
+            ensure_daemon(
+                tmp_path / "a.sock",
+                settings=settings,
+                daemon_argv=[sys.executable, "-c", "raise SystemExit(9)"],
+                env=dict(os.environ),
+                log_path=tmp_path / "a.daemon.log",
+            )
+
+    assert "version" in str(caught.value)
+    assert "kill 4242" in str(caught.value)
+
+
+def test_ensure_names_the_log_when_no_daemon_answers(tmp_path):
+    from swarmbus.local_rpc import LocalRPCStartTimeout, ensure_daemon
+
+    log_path = tmp_path / "a.daemon.log"
+
+    with pytest.raises(LocalRPCStartTimeout) as caught:
+        ensure_daemon(
+            tmp_path / "a.sock",
+            settings=_settings(),
+            daemon_argv=[
+                sys.executable,
+                "-c",
+                "print('boom'); raise SystemExit(3)",
+            ],
+            env=dict(os.environ),
+            log_path=log_path,
+            start_timeout=1.0,
+        )
+
+    assert str(log_path) in str(caught.value)
+    assert "status 3" in str(caught.value)
+    assert "boom" in log_path.read_text()
+
+
+def test_private_dir_tolerates_a_concurrent_create(tmp_path):
+    from swarmbus.local_rpc import _private_dir
+
+    for attempt in range(20):
+        target = tmp_path / f"state{attempt}"
+        barrier = threading.Barrier(2)
+        errors: list = []
+
+        def create():
+            try:
+                barrier.wait()
+                _private_dir(target)
+            except Exception as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=create) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert stat.S_IMODE(target.stat().st_mode) == 0o700
+        assert target.stat().st_uid == os.getuid()
+
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    with pytest.raises(LocalRPCOwnershipError, match="chmod 700"):
+        _private_dir(shared)
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o755
+
+
+def test_ensure_refuses_an_over_long_socket_path(tmp_path):
+    from swarmbus.local_rpc import ensure_daemon
+
+    socket_path = tmp_path / ("s" * 120 + ".sock")
+    marker = tmp_path / "marker"
+    settings = _settings()
+
+    with pytest.raises(LocalRPCOwnershipError) as caught:
+        ensure_daemon(
+            socket_path,
+            settings=settings,
+            daemon_argv=_stub_argv(socket_path, settings, marker),
+            env=dict(os.environ),
+            log_path=tmp_path / "a.daemon.log",
+        )
+
+    assert "AF_UNIX limit" in str(caught.value)
+    assert str(socket_path) in str(caught.value)
+    assert not marker.exists()
