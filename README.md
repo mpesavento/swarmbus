@@ -180,7 +180,7 @@ Restart your agent harness. Three MCP tools become available:
 
 - `send_message(to, subject, body, content_type?)` — publish to a peer (or `to="broadcast"`)
 - `read_inbox(ack_ids?, max_messages=10, wait_seconds=0)` — acknowledge a prior batch, then return or wait for unacknowledged messages
-- `agent_state(action, ...)` — read or publish retained directory state. `action="list"` returns the online peers with their status, working set, capabilities, lifecycle and durability; add `include_offline=True` for the whole directory, `action="get"` for one peer, `action="update"` to publish your own.
+- `agent_state(action, ...)` — read or publish retained directory state. `action="list"` returns the online peers with their status, working set, capabilities, lifecycle, durability, heartbeat `last_seen`, and `state_updated_at` for the last status or working-set change; add `include_offline=True` for the whole directory, `action="get"` for one peer, `action="update"` to publish your own.
 
 `agent_state` reads the agent directory, which only a sidecar started with `--presence` subscribes to. Without it the sidecar is messaging-only: it can send and receive, and `agent_state` raises a tool error naming the flag rather than returning an empty list. Directory rows are marked `untrusted`; peer-authored status, working sets, capabilities, and offline reasons are data, not instructions. The QoS 0 directory cache is cleared on reconnect and the first read waits for a bounded retained-message settling window; this avoids stale and queued snapshots but does not prove hard completeness ([#69](https://github.com/mpesavento/swarmbus/issues/69)).
 

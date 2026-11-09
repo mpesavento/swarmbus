@@ -203,6 +203,7 @@ class ManagedMCPRuntime:
         self.started_at = datetime.now(timezone.utc)
         self.status = ""
         self.working_set: list[str] = []
+        self.state_updated_at: datetime | None = None
         self.runtime_capabilities = [
             "messaging",
             "durable-inbox",
@@ -1004,11 +1005,25 @@ class ManagedMCPRuntime:
             lifecycle=self.lifecycle,
             durability="durable" if self.persistent else "ephemeral",
             started_at=self.started_at,
+            state_updated_at=self.state_updated_at,
             last_seen=datetime.now(timezone.utc),
         )
+        # Compare the VALIDATED candidate, not the raw arguments: status is
+        # sanitized and working_set normalized on the way in, so a caller can
+        # pass a different string that settles to the same stored value.
+        # Capabilities deliberately do not advance it -- the field describes
+        # status and working-set changes only.
+        if (
+            candidate.status != self.status
+            or candidate.working_set != self.working_set
+        ):
+            candidate = candidate.model_copy(
+                update={"state_updated_at": datetime.now(timezone.utc)}
+            )
         await self._publish_registry(candidate)
         self.status = candidate.status
         self.working_set = candidate.working_set
+        self.state_updated_at = candidate.state_updated_at
         runtime_capabilities = set(self.runtime_capabilities)
         self.declared_capabilities = [
             capability
@@ -1052,6 +1067,7 @@ class ManagedMCPRuntime:
             lifecycle=self.lifecycle,
             durability="durable" if self.persistent else "ephemeral",
             started_at=self.started_at,
+            state_updated_at=self.state_updated_at,
             last_seen=datetime.now(timezone.utc),
         )
         topic = self.topics.registry(self.agent_id)
