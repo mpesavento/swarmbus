@@ -330,6 +330,46 @@ port = 1884
     assert (kw["broker"], kw["port"]) == ("cfg.example", 1884)
 
 
+def test_mcp_daemon_takes_an_empty_broker_and_port_from_the_config_file(
+    tmp_path, monkeypatch,
+):
+    # mcp-daemon owns the broker connection on behalf of every attached
+    # proxy, so it has to honour [broker] like every other command. The
+    # Claude Code plugin passes both flags even when its settings are empty.
+    from swarmbus import config as sb_config
+
+    monkeypatch.setattr(sb_config, "default_config_path",
+                        lambda: tmp_path / "home" / ".swarmbus" / "config.ini")
+    cfg = _write(tmp_path / "daemon.ini", """
+[agent]
+id = sparrow
+
+[broker]
+host = cfg.example
+port = 1884
+""")
+    socket_path = str(tmp_path / "sparrow.sock")
+
+    # run_mcp_daemon is bound into cli at import, so patch it there.
+    with patch("swarmbus.cli.run_mcp_daemon") as run_daemon:
+        result = CliRunner().invoke(main, [
+            "--config", str(cfg), "mcp-daemon",
+            "--socket", socket_path, "--broker", "", "--port", "",
+        ])
+    assert result.exit_code == 0, result.output
+    kw = run_daemon.call_args.kwargs
+    assert (kw["broker"], kw["port"]) == ("cfg.example", 1884)
+
+    with patch("swarmbus.cli.run_mcp_daemon") as run_daemon:
+        result = CliRunner().invoke(main, [
+            "--config", str(cfg), "mcp-daemon",
+            "--socket", socket_path, "--broker", "flag.example", "--port", "1999",
+        ])
+    assert result.exit_code == 0, result.output
+    kw = run_daemon.call_args.kwargs
+    assert (kw["broker"], kw["port"]) == ("flag.example", 1999)
+
+
 def test_empty_credential_env_vars_count_as_unset(tmp_path, monkeypatch):
     from swarmbus import config as sb_config
 

@@ -207,6 +207,57 @@ def create_mcp_app(runtime: _MCPRuntime) -> _MCPApp:
     return app
 
 
+
+def create_managed_runtime(
+    agent_id: str,
+    broker: str = "localhost",
+    port: int = 1883,
+    *,
+    persistent: bool = False,
+    presence: bool = False,
+    lifecycle: Literal["named", "transient"] = "named",
+    capabilities: tuple[str, ...] = (),
+    state_dir: str = "~/.local/state/swarmbus",
+    registry_heartbeat_seconds: float = 60,
+    registry_stale_after_seconds: float = 180,
+    username: str | None = None,
+    password: str | None = None,
+    tls: bool = False,
+    ca_cert: str | None = None,
+    client_cert: str | None = None,
+    client_key: str | None = None,
+    hop_limit: int = DEFAULT_HOP_LIMIT,
+    rate_limit: int = DEFAULT_RATE_LIMIT,
+    rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
+    on_trip: list[str] | None = None,
+    trip_listener: str = "mcp-server",
+) -> ManagedMCPRuntime:
+    """Build the managed runtime shared by MCP transports."""
+    state_path = Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
+    return ManagedMCPRuntime(
+        agent_id=agent_id,
+        broker=broker,
+        port=port,
+        persistent=persistent,
+        presence=presence,
+        lifecycle=lifecycle,
+        heartbeat_seconds=registry_heartbeat_seconds,
+        stale_after_seconds=registry_stale_after_seconds,
+        capabilities=capabilities,
+        state_path=state_path,
+        username=username,
+        password=password,
+        tls=tls,
+        ca_cert=ca_cert,
+        client_cert=client_cert,
+        client_key=client_key,
+        hop_limit=hop_limit,
+        rate_limit=rate_limit,
+        rate_cooldown=rate_cooldown,
+        on_trip=on_trip,
+        trip_listener=trip_listener,
+    )
+
 def run_mcp_server(
     agent_id: str,
     broker: str = "localhost",
@@ -238,18 +289,17 @@ def run_mcp_server(
 
     from mcp.server.fastmcp import FastMCP
 
-    state_path = Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
-    runtime = ManagedMCPRuntime(
+    runtime = create_managed_runtime(
         agent_id=agent_id,
         broker=broker,
         port=port,
         persistent=persistent,
         presence=presence,
         lifecycle=lifecycle,
-        heartbeat_seconds=registry_heartbeat_seconds,
-        stale_after_seconds=registry_stale_after_seconds,
         capabilities=capabilities,
-        state_path=state_path,
+        state_dir=state_dir,
+        registry_heartbeat_seconds=registry_heartbeat_seconds,
+        registry_stale_after_seconds=registry_stale_after_seconds,
         username=username,
         password=password,
         tls=tls,

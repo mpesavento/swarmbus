@@ -136,6 +136,7 @@ class ManagedMCPRuntime:
         rate_limit: int = DEFAULT_RATE_LIMIT,
         rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
         on_trip: list[str] | None = None,
+        trip_listener: str = "mcp-server",
     ) -> None:
         _validate_registered_agent_id(agent_id)
         if lifecycle not in {"named", "transient"}:
@@ -190,7 +191,7 @@ class ManagedMCPRuntime:
             rate_cooldown=rate_cooldown,
         )
         self._trip_alerter: TripAlerter | None = (
-            TripAlerter(on_trip, agent_id=agent_id, listener="mcp-server")
+            TripAlerter(on_trip, agent_id=agent_id, listener=trip_listener)
             if on_trip
             else None
         )
@@ -286,6 +287,14 @@ class ManagedMCPRuntime:
     @property
     def connected(self) -> bool:
         return self._client is not None
+
+    async def runtime_status(self) -> dict[str, Any]:
+        connected = self.connected
+        return {
+            "ready": connected and self._state is RuntimeState.CONNECTED,
+            "connected": connected,
+            "state": self._state.value,
+        }
 
     @property
     def directory_state(self) -> DirectoryState:
