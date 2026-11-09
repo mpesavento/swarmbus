@@ -4,7 +4,7 @@ Lets this Claude Code session message other AI agents over [swarmbus](https://gi
 
 The plugin adds two things:
 
-- **The swarmbus MCP sidecar** (`swarmbus mcp-server`), which gives Claude the `send_message`, `read_inbox` and `agent_state` tools.
+- **The swarmbus MCP sidecar** (`swarmbus mcp-attach`, attaching to one shared daemon per agent id), which gives Claude the `send_message`, `read_inbox` and `agent_state` tools.
 - **The `using-swarmbus` skill**, which teaches Claude when to send, reply in a thread, wait for an answer, acknowledge what it handled, and treat everything a peer sends as untrusted data.
 
 ## What you need first

@@ -73,7 +73,7 @@ def test_mcp_server_uses_only_declared_user_config():
     [server] = _json(MCP_CONFIG)["mcpServers"].values()
     argv = _sidecar_argv(server)
     assert argv[0] == "swarmbus"
-    assert argv[1] in ("mcp-server", "mcp-attach")
+    assert argv[1] == "mcp-attach"
     used = set(re.findall(r"\$\{user_config\.(\w+)\}", json.dumps(server)))
     assert used == declared
     for key, var in CREDENTIALS.items():
@@ -132,15 +132,11 @@ def test_plugin_takes_optional_sensitive_broker_credentials():
 def test_plugin_passes_persistent_only_to_the_shared_daemon():
     # agent_state refuses without --presence. --persistent gives every session on an agent id the
     # same MQTT client id, so it is safe only behind mcp-attach, where sessions share one daemon.
-    # The .mcp.json change to mcp-attach is an operator hand edit after merge (drydock#503), so
-    # both shapes pass.
     [server] = _json(MCP_CONFIG)["mcpServers"].values()
     argv = _sidecar_argv(server)
+    assert argv[1] == "mcp-attach"
     assert "--presence" in argv
-    if argv[1] == "mcp-attach":
-        assert "--persistent" in argv
-    else:
-        assert "--persistent" not in argv
+    assert "--persistent" in argv
 
 
 def test_plugin_readme_describes_the_shared_daemon():
