@@ -1304,3 +1304,177 @@ def test_ensure_refuses_an_over_long_socket_path(tmp_path):
     assert "AF_UNIX limit" in str(caught.value)
     assert str(socket_path) in str(caught.value)
     assert not marker.exists()
+
+
+def test_mcp_attach_cli_starts_the_daemon_with_its_own_settings(tmp_path):
+    from swarmbus.local_rpc import daemon_settings
+
+    password_file = tmp_path / "mqtt.password"
+    password_file.write_text("file-secret\n")
+    password_file.chmod(0o600)
+    state = tmp_path / "swarmbus-state"
+
+    with patch("swarmbus.cli.ensure_daemon") as mock_ensure, \
+         patch("swarmbus.cli.run_mcp_proxy") as mock_proxy:
+        result = CliRunner().invoke(
+            main,
+            [
+                "mcp-attach",
+                "--agent-id", "loom",
+                "--broker", "mqtt.example",
+                "--username", "alice",
+                "--password-file", str(password_file),
+                "--persistent",
+                "--presence",
+                "--tls",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    args, kwargs = mock_ensure.call_args
+    assert args == (state / "loom.sock",)
+    assert kwargs["log_path"] == state / "loom.daemon.log"
+    assert kwargs["settings"] == daemon_settings(
+        agent_id="loom",
+        broker="mqtt.example",
+        port=1883,
+        username="alice",
+        password="file-secret",
+        tls=True,
+        ca_cert=None,
+        client_cert=None,
+        client_key=None,
+        persistent=True,
+        presence=True,
+        lifecycle="named",
+    )
+    argv = kwargs["daemon_argv"]
+    assert argv[3] == "mcp-daemon"
+    for flag in ("--persistent", "--presence", "--tls"):
+        assert flag in argv
+    assert argv[argv.index("--username") + 1] == "alice"
+    assert argv[argv.index("--socket") + 1] == str(state / "loom.sock")
+    assert not any("file-secret" in element for element in argv)
+    assert kwargs["env"]["SWARMBUS_BROKER_PASSWORD"] == "file-secret"
+    mock_proxy.assert_called_once_with(str(state / "loom.sock"))
+
+
+def test_mcp_attach_cli_exits_non_zero_on_a_mismatch():
+    from swarmbus.local_rpc import LocalRPCDaemonMismatch
+
+    with patch(
+        "swarmbus.cli.ensure_daemon",
+        side_effect=LocalRPCDaemonMismatch(
+            "the daemon differs in: broker. Stop it with `kill 4242`"
+        ),
+    ), patch("swarmbus.cli.run_mcp_proxy") as mock_proxy:
+        result = CliRunner().invoke(
+            main, ["mcp-attach", "--agent-id", "loom"]
+        )
+
+    assert result.exit_code == 1
+    assert "kill 4242" in result.output
+    mock_proxy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mcp_attach_serves_the_three_tools_through_a_running_daemon(
+    tmp_path,
+):
+    from swarmbus.local_rpc import daemon_settings
+
+    runtime = _FakeRuntime()
+    socket_path = tmp_path / "e2e.sock"
+    settings = daemon_settings(
+        agent_id="attach-e2e",
+        broker="127.0.0.1",
+        port=1883,
+        username=None,
+        password=None,
+        tls=False,
+        ca_cert=None,
+        client_cert=None,
+        client_key=None,
+        persistent=True,
+        presence=True,
+        lifecycle="named",
+    )
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=[
+            "-c",
+            "from swarmbus.cli import main; main()",
+            "mcp-attach",
+            "--socket", str(socket_path),
+            "--state-dir", str(tmp_path),
+            "--agent-id", "attach-e2e",
+            "--broker", "127.0.0.1",
+            "--port", "1883",
+            "--persistent",
+            "--presence",
+        ],
+        env={"HOME": str(tmp_path)},
+    )
+
+    async with LocalRuntimeDaemon(runtime, socket_path, settings=settings):
+        async with stdio_client(parameters) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                result = await session.call_tool(
+                    "agent_state",
+                    {"action": "get", "agent_id": "attach-e2e"},
+                )
+
+    assert {tool.name for tool in tools.tools} == {
+        "send_message",
+        "read_inbox",
+        "agent_state",
+    }
+    assert not result.isError
+    runtime.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_doctor_lists_each_daemon_socket(tmp_path):
+    import socket as socket_module
+    from unittest.mock import MagicMock
+
+    settings = _settings()
+    stale = tmp_path / "old.sock"
+    sock = socket_module.socket(socket_module.AF_UNIX)
+    sock.bind(str(stale))
+    sock.close()
+    empty = tmp_path / "empty"
+    empty.mkdir(mode=0o700)
+
+    def run_doctor(state_dir):
+        with patch(
+            "subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr=""),
+        ), patch("swarmbus.cli.AgentBus") as mock_bus, \
+             patch("swarmbus.cli.aiomqtt"):
+            mock_bus.probe.return_value._aiomqtt_kwargs = lambda: {}
+            mock_bus.probe.return_value.list_agents = AsyncMock(return_value=[])
+            return CliRunner().invoke(
+                main,
+                [
+                    "doctor",
+                    "--agent-id", "loom",
+                    "--state-dir", str(state_dir),
+                ],
+            )
+
+    async with LocalRuntimeDaemon(
+        _FakeRuntime(), tmp_path / "loom.sock", settings=settings
+    ):
+        listed = await asyncio.to_thread(run_doctor, tmp_path)
+        none = await asyncio.to_thread(run_doctor, empty)
+
+    assert "local daemons" in listed.output
+    assert (
+        f"loom.sock: pid {os.getpid()}, swarmbus {swarmbus.__version__}, "
+        "agent loom"
+    ) in listed.output
+    assert "old.sock: no daemon answers" in listed.output
+    assert "(none in" in none.output
