@@ -212,6 +212,15 @@ swarmbus mcp-proxy --socket ~/.local/state/swarmbus/planner.sock
 
 The private AF_UNIX socket accepts only the daemon's uid and is mode `0600`; a non-blocking sibling lock prevents two daemons from owning the same socket. `mcp-proxy` carries no broker address or credentials and exposes the same three tools as `mcp-server`. It does not auto-start the daemon or fall back to its own MQTT connection: a missing or unhealthy daemon is an explicit error. The daemon removes its socket and stops the managed runtime on a signal or a local shutdown request from its own uid.
 
+`swarmbus mcp-attach` does the starting for you. It takes the same broker options as `mcp-daemon`, finds the shared daemon for `--agent-id` (default socket `<state-dir>/<agent-id>.sock`), starts one detached if none answers, then serves the three tools through it over stdio. This is what the Claude Code plugin runs:
+
+```bash
+swarmbus mcp-attach --agent-id planner --broker mqtt.example.com \
+  --password-file ~/.config/swarmbus/mqtt.password --persistent --presence
+```
+
+The first session starts the daemon and later sessions attach with no second broker connection, so messages sent while no session is open are queued by the broker. The daemon logs to `<state-dir>/<agent-id>.daemon.log`, and the broker password reaches it only through its environment, never its command line or log. Sessions on one id share one inbox as a work queue: whichever reads and acks a message first takes it, so give sessions that each want every message distinct agent ids. If the running daemon has different settings or a different swarmbus version, `mcp-attach` refuses, names the differing fields and the pid, and you stop it with `kill <pid>` and start the session again. The broker credentials are used only to start a daemon. `swarmbus doctor` lists each daemon socket in the state directory with its pid, version and agent id. `mcp-proxy` still never auto-starts anything.
+
 **The trust boundary is the uid, and there is no token.** Any process running as the same user can send as this agent, read and acknowledge its inbox, update its state, and shut the daemon down. That is the same exposure as the broker password file. The only authentication is the peer uid the kernel reports for the connection — `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS. On a platform that offers neither, `mcp-daemon` refuses to start rather than serving unauthenticated callers.
 
 Without `--persistent`, messages received while the runtime is running still survive process restarts in SQLite, but the broker does not queue messages sent while it is offline.
@@ -348,18 +357,19 @@ swarmbus mcp-proxy --socket ~/.local/state/swarmbus/planner.sock
 
 `--body` and `--body-file` are mutually exclusive; exactly one is required.
 
-**Six receive paths — pick one per agent-id.**
+**Seven receive paths — pick one per agent-id.**
 
 | Path | Durable? | Use when |
 |---|---|---|
 | `start` (daemon) | Yes (persistent session, default) | Long-running process, file-bridge to inbox, reactive wake |
 | `mcp-daemon --persistent --presence` + local `mcp-proxy` processes | Yes (persistent session) | Several local MCP clients share one runtime and credential boundary |
+| `mcp-attach --persistent --presence` | Yes (persistent session) | Several local MCP sessions share one daemon that `mcp-attach` starts for you |
 | `mcp-server --persistent --presence` | Yes (persistent session) | One MCP client owns its runtime |
 | `watch --persistent` | Yes (persistent session; first run registers) | Agent sessions that wait, handle one message, and wait again |
 | `read` / `watch` (one-shot) | No (ephemeral session) | CI jobs, shell scripts, quick checks |
 | `tail` (file-based) | N/A (reads daemon's file) | Companion to `start`; cursor-tracked |
 
-**Don't combine persistent receive paths for the same id** — `start`, `mcp-daemon --persistent`, `mcp-server --persistent` and `watch --persistent` all claim the same `swarmbus-<agent-id>` MQTT client identifier. The broker evicts the connected one when another arrives. Use exactly one per id.
+**Don't combine persistent receive paths for the same id** — `start`, `mcp-daemon --persistent`, `mcp-attach --persistent`, `mcp-server --persistent` and `watch --persistent` all claim the same `swarmbus-<agent-id>` MQTT client identifier. The broker evicts the connected one when another arrives. Use exactly one per id.
 
 `mcp-server --persistent` requires `--presence`. A persistent session has the broker queue messages for an identity while it is away, and an identity absent from the directory cannot be found or retired, so its queued backlog could grow without bound.
 
