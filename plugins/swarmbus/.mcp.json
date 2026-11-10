@@ -6,10 +6,11 @@
         "-c",
         "command -v swarmbus >/dev/null 2>&1 || { echo 'swarmbus is not installed (no swarmbus command on PATH). Install it with: uv tool install \"swarmbus-py[mcp]\" and restart Claude Code.' >&2; exit 127; }; exec swarmbus \"$@\"",
         "swarmbus",
-        "mcp-server",
+        "mcp-attach",
         "--agent-id", "${user_config.agent_id}",
         "--broker", "${user_config.broker}",
         "--port", "${user_config.port}",
+        "--persistent",
         "--presence"
       ],
       "env": {
