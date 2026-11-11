@@ -129,6 +129,7 @@ async def _start_listener(bus: AgentBus) -> asyncio.Task:
         broker=bus.broker,
         port=bus.port,
         retain=True,
+        topics=bus.topics,
     )
     try:
         await probe.send(to=bus.agent_id, subject="ready", body="ready")
@@ -188,6 +189,56 @@ async def test_send_receive_roundtrip(mosquitto_broker, listening_agent):
     assert msg.from_agent == "wren"
     assert msg.subject == "ping"
     assert msg.body == "hello from wren"
+
+
+@pytest.mark.asyncio
+async def test_a_topic_root_keeps_two_fleets_apart_on_one_broker(mosquitto_broker):
+    """One agent id under two roots: each hears only its own root's directed
+    messages, and a broadcast reaches both."""
+    host, port = mosquitto_broker
+    fleet = TopicMap(root="fleet")
+    h_plain, h_fleet = CollectingHandler(), CollectingHandler()
+
+    plain = AgentBus(agent_id="sparrow", broker=host, port=port)
+    rooted = AgentBus(agent_id="sparrow", broker=host, port=port, topics=fleet)
+    plain.register_handler(h_plain)
+    rooted.register_handler(h_fleet)
+    plain_sender = AgentBus(agent_id="wren", broker=host, port=port)
+    rooted_sender = AgentBus(
+        agent_id="wren", broker=host, port=port, topics=fleet
+    )
+
+    t_plain = await _start_listener(plain)
+    t_rooted = await _start_listener(rooted)
+    try:
+        await rooted_sender.send(to="sparrow", subject="rooted", body="x")
+        await h_fleet.wait_for_message(timeout=3.0)
+        await plain_sender.send(to="sparrow", subject="plain", body="x")
+        await h_plain.wait_for_message(timeout=3.0)
+
+        # The unrooted listener was connected when the rooted message went
+        # out, and received only the later, unrooted one.
+        assert [m.subject for m in h_plain.received] == ["plain"]
+        assert [m.subject for m in h_fleet.received] == ["rooted"]
+
+        await rooted_sender.send(to="broadcast", subject="all", body="x")
+        await asyncio.gather(
+            h_plain.wait_for_message(timeout=3.0),
+            h_fleet.wait_for_message(timeout=3.0),
+        )
+        assert h_plain.received[-1].subject == "all"
+        assert h_fleet.received[-1].subject == "all"
+    finally:
+        await _stop(t_plain)
+        await _stop(t_rooted)
+        await _clear_retained(host, port, [
+            topic
+            for topics in (DEFAULT_TOPICS, fleet)
+            for topic in (
+                topics.presence("sparrow"),
+                topics.registry("sparrow"),
+            )
+        ])
 
 
 @pytest.mark.asyncio

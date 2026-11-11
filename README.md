@@ -134,6 +134,8 @@ port = 1883
 
 Keys, rules and the password-file mode: [docs/configuration.md](docs/configuration.md).
 
+To run several swarms on one broker, or to give a broker ACL one prefix per swarm, set a topic root with `--topic-root`, `SWARMBUS_TOPIC_ROOT` or `[broker] topic_root`: see [Topic root](docs/configuration.md#topic-root).
+
 ---
 
 ## Install

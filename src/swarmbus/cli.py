@@ -45,6 +45,7 @@ from .message import (
     frame_body,
     sanitize_field,
 )
+from .topics import TopicMap
 from .trip_alert import TripAlerter
 
 
@@ -159,6 +160,44 @@ def _broker_auth_options(func):
         help="Broker username. [env: SWARMBUS_BROKER_USERNAME]",
     )(func)
     return func
+
+
+_TOPICS_META_KEY = "swarmbus.topics"
+
+
+def _resolve_topic_root(ctx, _param, value):
+    try:
+        ctx.meta[_TOPICS_META_KEY] = TopicMap(root=value)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc)) from exc
+
+
+def _topic_root_option(func):
+    """Apply --topic-root to a Click command.
+
+    One shared option, because every process on a broker has to agree on
+    the root: a command left without it publishes and subscribes in a
+    namespace nobody else is in, and MQTT reports no error for that. An
+    explicit empty value selects the unrooted layout, even over a root set
+    in the config file.
+    """
+    return click.option(
+        "--topic-root",
+        default="",
+        envvar="SWARMBUS_TOPIC_ROOT",
+        callback=_resolve_topic_root,
+        expose_value=False,
+        help="Namespace prefix for the agent and registry topics, e.g. "
+             "'fleet' gives fleet/agents/<id>/inbox. Empty (the default) "
+             "keeps the unrooted layout. Broadcast is never rooted. Every "
+             "swarmbus process on a broker must use the same root. "
+             "[env: SWARMBUS_TOPIC_ROOT]",
+    )(func)
+
+
+def _configured_topics() -> TopicMap:
+    """The topic map --topic-root resolved for the running command."""
+    return click.get_current_context().meta[_TOPICS_META_KEY]
 
 
 def _state_db_path(state_dir: str, agent_id: str) -> Path:
@@ -326,6 +365,7 @@ def _resolve_outbox(
 )
 @_hop_limit_option
 @_state_dir_option
+@_topic_root_option
 @_broker_auth_options
 @click.pass_context
 def send(
@@ -394,6 +434,7 @@ def send(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topics=_configured_topics(),
     )
 
     parent_id = in_reply_to or os.environ.get("SWARMBUS_ID") or None
@@ -490,6 +531,7 @@ def send(
 @_hop_limit_option
 @_rate_limit_options
 @_on_trip_option
+@_topic_root_option
 @_broker_auth_options
 def start(
     agent_id: str,
@@ -515,6 +557,7 @@ def start(
     from . import __version__
 
     holds_db = _state_db_path(state_dir, agent_id)
+    topics = _configured_topics()
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -533,6 +576,7 @@ def start(
             rate_cooldown=rate_cooldown,
         ),
         trip_alerter=_trip_alerter(on_trip, agent_id, "start"),
+        topics=topics,
     )
 
     if inbox:
@@ -552,6 +596,7 @@ def start(
     click.echo(f"  version:     {__version__}")
     click.echo(f"  config:      {_config().path or '(none)'}")
     click.echo(f"  broker:      {broker}:{port}")
+    click.echo(f"  topic root:  {topics.root or '(none)'}")
     click.echo(f"  persistent:     {'yes' if persistent else 'no'}")
     click.echo(f"  inbox:       {inbox or '(unset — no file bridge)'}")
     click.echo(f"  invoke:      {invoke_cmd or '(unset — no reactive wake)'}")
@@ -585,6 +630,7 @@ def start(
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON array (default: pretty)")
 @_state_dir_option
 @_hop_limit_option
+@_topic_root_option
 @_broker_auth_options
 def read(
     agent_id: str,
@@ -632,6 +678,7 @@ def read(
         client_cert=client_cert,
         client_key=client_key,
         hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
+        topics=_configured_topics(),
     )
     try:
         messages = asyncio.run(bus.read_inbox(max_messages=max_messages))
@@ -680,6 +727,7 @@ def read(
 @_hop_limit_option
 @_rate_limit_options
 @_on_trip_option
+@_topic_root_option
 @_broker_auth_options
 def watch(
     agent_id: str,
@@ -740,6 +788,7 @@ def watch(
             rate_cooldown=rate_cooldown,
         ),
         trip_alerter=_trip_alerter(on_trip, agent_id, "watch"),
+        topics=_configured_topics(),
     )
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
@@ -769,6 +818,7 @@ def watch(
 @main.command("list")
 @_broker_address_options
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON array")
+@_topic_root_option
 @_broker_auth_options
 def list_agents_cmd(
     broker: str,
@@ -796,6 +846,7 @@ def list_agents_cmd(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topics=_configured_topics(),
     )
     try:
         agents = asyncio.run(bus.list_agents())
@@ -1163,6 +1214,7 @@ def _doctor_claude_registration() -> tuple[str, str, str | None]:
     "--window", type=click.IntRange(min=1), default=15, show_default=True,
     help="Minutes of traffic the channel-traffic probe reports.",
 )
+@_topic_root_option
 @_broker_auth_options
 def doctor(
     agent_id: str | None,
@@ -1230,6 +1282,7 @@ def doctor(
             username=username, password=password,
             tls=tls, ca_cert=ca_cert,
             client_cert=client_cert, client_key=client_key,
+            topics=_configured_topics(),
         )
 
         async def _probe_broker():
@@ -1408,6 +1461,7 @@ def doctor(
             ca_cert=ca_cert,
             client_cert=client_cert,
             client_key=client_key,
+            topics=_configured_topics(),
         )
         peers = asyncio.run(bus.list_agents())
         if agent_id_resolved in peers:
@@ -1585,6 +1639,7 @@ def _maintenance_password(
     type=click.Path(exists=True, dir_okay=False, readable=True),
     help="Read the broker password from this file.",
 )
+@_topic_root_option
 @_broker_auth_options
 def registry_list(
     broker: str,
@@ -1611,6 +1666,7 @@ def registry_list(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topics=_configured_topics(),
         snapshot_seconds=snapshot_seconds,
     )
     report = asyncio.run(
@@ -1660,6 +1716,7 @@ def registry_list(
     type=click.Path(exists=True, dir_okay=False, readable=True),
     help="Read the broker password from this file.",
 )
+@_topic_root_option
 @_broker_auth_options
 def registry_gc(
     broker: str,
@@ -1689,6 +1746,7 @@ def registry_gc(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topics=_configured_topics(),
         snapshot_seconds=snapshot_seconds,
     )
     report = asyncio.run(
@@ -1744,6 +1802,7 @@ def registry_gc(
     type=click.Path(exists=True, dir_okay=False, readable=True),
     help="Read the broker password from this file.",
 )
+@_topic_root_option
 @_broker_auth_options
 def registry_forget(
     agent_id: str,
@@ -1780,6 +1839,7 @@ def registry_forget(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topics=_configured_topics(),
         snapshot_seconds=snapshot_seconds,
     )
     result = asyncio.run(
@@ -1805,6 +1865,7 @@ def registry_forget(
 
 def _mcp_runtime_options(func):
     func = _broker_auth_options(func)
+    func = _topic_root_option(func)
     func = _on_trip_option(func)
     func = _rate_limit_options(func)
     func = _hop_limit_option(func)
@@ -1962,6 +2023,7 @@ def mcp_server(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topics=_configured_topics(),
     )
 
 
@@ -2028,6 +2090,7 @@ def mcp_daemon(
             rate_limit=rate_limit,
             rate_cooldown=rate_cooldown,
             on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
+            topics=_configured_topics(),
         )
     except LocalRPCOwnershipError as exc:
         raise click.UsageError(str(exc)) from exc
@@ -2068,12 +2131,14 @@ def _mcp_daemon_argv(
     ca_cert: str | None,
     client_cert: str | None,
     client_key: str | None,
+    topic_root: str,
 ) -> list[str]:
     """The argv that starts `mcp-daemon` with the same settings as this attach.
 
     Never carries the broker password: it reaches the daemon through its
     environment only. `sys.executable` runs the daemon on this attach's
-    swarmbus version.
+    swarmbus version. The topic root is always passed, empty included, so
+    the daemon's own environment or config file cannot give it another one.
     """
     argv = [
         sys.executable, "-c", "from swarmbus.cli import main; main()",
@@ -2092,6 +2157,7 @@ def _mcp_daemon_argv(
         "--rate-limit", str(rate_limit),
         "--rate-cooldown", str(rate_cooldown),
         "--tls" if tls else "--no-tls",
+        "--topic-root", topic_root,
     ]
     for capability in capabilities:
         argv += ["--capability", capability]
@@ -2173,6 +2239,7 @@ def mcp_attach(
         else state_root / f"{agent_id}.sock"
     )
     log_path = state_root / f"{agent_id}.daemon.log"
+    topic_root = _configured_topics().root
     settings = daemon_settings(
         agent_id=agent_id,
         broker=broker,
@@ -2186,6 +2253,7 @@ def mcp_attach(
         persistent=persistent,
         presence=presence,
         lifecycle=lifecycle,
+        topic_root=topic_root,
     )
     daemon_argv = _mcp_daemon_argv(
         socket=socket,
@@ -2208,6 +2276,7 @@ def mcp_attach(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
+        topic_root=topic_root,
     )
     env = dict(os.environ)
     env.pop("SWARMBUS_BROKER_PASSWORD", None)

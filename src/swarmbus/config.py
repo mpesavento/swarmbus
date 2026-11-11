@@ -38,6 +38,7 @@ _KEYS: dict[tuple[str, str], tuple[str, str]] = {
     ("broker", "client_cert"): ("client_cert", "path"),
     ("broker", "client_key"): ("client_key", "path"),
     ("broker", "tls"): ("tls", "boolean"),
+    ("broker", "topic_root"): ("topic_root", "string"),
     ("agent", "id"): ("agent_id", "string"),
     ("agent", "state_dir"): ("state_dir", "path"),
     ("agent", "inbox"): ("inbox", "path"),

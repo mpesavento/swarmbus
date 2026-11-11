@@ -20,6 +20,7 @@ import swarmbus
 from swarmbus.cli import main
 from swarmbus.local_rpc import (
     MAX_FRAME_BYTES,
+    LocalRPCDaemonMismatch,
     LocalRPCOwnershipError,
     LocalRPCProtocolError,
     LocalRPCUnavailable,
@@ -31,6 +32,8 @@ from swarmbus.local_rpc import (
     _encode_frame,
     _read_frame,
     _request,
+    ensure_daemon,
+    run_mcp_daemon,
 )
 from swarmbus.mcp_server import create_mcp_app
 from swarmbus.message import (
@@ -43,6 +46,7 @@ from swarmbus.runtime import (
     RuntimeFatalError,
     TransportUnavailable,
 )
+from swarmbus.topics import TopicMap
 
 
 class _FakeRuntime:
@@ -695,6 +699,7 @@ def test_mcp_daemon_cli_threads_runtime_configuration(monkeypatch):
         "rate_limit": DEFAULT_RATE_LIMIT,
         "rate_cooldown": DEFAULT_RATE_COOLDOWN,
         "on_trip": None,
+        "topics": TopicMap(),
     }
 
 
@@ -1072,6 +1077,45 @@ def test_run_mcp_daemon_reports_its_settings_without_the_password(tmp_path):
     assert "password" not in captured["settings"]
 
 
+def test_run_mcp_daemon_runs_and_reports_on_the_root_it_is_given(tmp_path):
+    fleet = TopicMap(root="fleet")
+    captured = {}
+
+    class _Capture:
+        def __init__(self, runtime, socket_path, *, settings=None):
+            captured["settings"] = settings
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+        def request_shutdown(self):
+            pass
+
+        async def wait_for_shutdown(self):
+            return None
+
+    with (
+        patch(
+            "swarmbus.local_rpc.create_managed_runtime",
+            return_value=_FakeRuntime(),
+        ) as build_runtime,
+        patch("swarmbus.local_rpc.LocalRuntimeDaemon", _Capture),
+    ):
+        run_mcp_daemon(
+            socket_path=str(tmp_path / "loom.sock"),
+            agent_id="loom",
+            presence=True,
+            topics=fleet,
+        )
+
+    assert build_runtime.call_args.kwargs["topics"] is fleet
+    # What an attaching session compares its own root against.
+    assert captured["settings"]["topic_root"] == fleet.root
+
+
 def test_ensure_starts_a_detached_daemon_in_a_private_dir(tmp_path, stub_pids):
     from swarmbus.local_rpc import ensure_daemon
 
@@ -1202,6 +1246,36 @@ async def test_ensure_refuses_a_daemon_with_different_settings(tmp_path):
     assert "persistent" in message
     assert f"kill {os.getpid()}" in message
     assert _PASSWORD not in message
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_refuses_a_daemon_on_another_topic_root(tmp_path):
+    # Reusing it would put this session in a namespace it did not ask for,
+    # and the broker would report nothing.
+    socket_path = tmp_path / "run" / "a.sock"
+    socket_path.parent.mkdir(mode=0o700)
+    marker = tmp_path / "marker"
+    argv = [
+        sys.executable,
+        "-c",
+        f"open({str(marker)!r}, 'w').write('ran')",
+    ]
+
+    async with LocalRuntimeDaemon(
+        _FakeRuntime(), socket_path, settings=_settings()
+    ):
+        with pytest.raises(LocalRPCDaemonMismatch) as caught:
+            await asyncio.to_thread(
+                ensure_daemon,
+                socket_path,
+                settings=_settings(topic_root="fleet"),
+                daemon_argv=argv,
+                env=dict(os.environ),
+                log_path=tmp_path / "a.daemon.log",
+            )
+
+    assert "topic_root" in str(caught.value)
     assert not marker.exists()
 
 

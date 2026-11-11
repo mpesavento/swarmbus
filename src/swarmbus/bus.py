@@ -191,7 +191,8 @@ class AgentBus:
     # builds an instance via cls.__new__ and never runs __init__, so an
     # instance-only attribute would leave probe buses unable to build a
     # topic. Root-less by default, which keeps the wire format unchanged;
-    # a rooted deployment overrides this with TopicMap(root=...).
+    # a rooted deployment passes topics=TopicMap(root=...) to __init__ or
+    # probe().
     topics: TopicMap = DEFAULT_TOPICS
     # Same reasoning: a probe bus never runs __init__ and holds nothing.
     hold_store: "SQLiteMessageStore | None" = None
@@ -214,6 +215,7 @@ class AgentBus:
         hold_store: "SQLiteMessageStore | None" = None,
         trip_alerter: "TripAlerter | None" = None,
         registry_heartbeat_seconds: float = 60.0,
+        topics: TopicMap = DEFAULT_TOPICS,
     ) -> None:
         """Construct an AgentBus.
 
@@ -256,6 +258,11 @@ class AgentBus:
 
         trip_alerter: runs once per sender newly tripped by ``hold_store``;
         closed when ``listen()`` or ``watch_inbox()`` returns.
+
+        topics: the MQTT topic layout. Pass ``TopicMap(root=...)`` to put
+        this agent's inbox, presence and registry topics under a namespace.
+        Every process on the broker that should reach it needs the same
+        root; a mismatch delivers nothing and raises nothing.
         """
         _validate_registered_agent_id(agent_id)
         if registry_heartbeat_seconds <= 0:
@@ -283,6 +290,7 @@ class AgentBus:
         self.hold_store = hold_store
         self.trip_alerter = trip_alerter
         self.registry_heartbeat_seconds = registry_heartbeat_seconds
+        self.topics = topics
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -433,6 +441,7 @@ class AgentBus:
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        topics: TopicMap = DEFAULT_TOPICS,
     ) -> "AgentBus":
         """Construct a broker-only instance for operations that don't need a
         registered agent identity (e.g. `list_agents`).
@@ -443,6 +452,8 @@ class AgentBus:
 
         Auth + TLS kwargs mirror ``__init__``: a probe bus must connect with
         the same credentials as a regular bus on a hardened broker.
+        ``topics`` mirrors it too: a probe sees only the agents under its
+        own root.
         """
         self = cls.__new__(cls)
         self.agent_id = "_probe"
@@ -466,6 +477,7 @@ class AgentBus:
         self.hold_store = None
         self.trip_alerter = None
         self.registry_heartbeat_seconds = 60.0
+        self.topics = topics
         self._client = None
         self._client_cm = None
         return self

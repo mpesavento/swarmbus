@@ -5,6 +5,7 @@ from click.testing import CliRunner
 
 from swarmbus.cli import main
 from swarmbus.maintenance import RegistryListReport
+from swarmbus.topics import TopicMap
 
 SEND = ["send", "--to", "wren", "--subject", "x", "--body", "y"]
 
@@ -90,6 +91,7 @@ tls = yes
         "ca_cert": None,
         "client_cert": None,
         "client_key": None,
+        "topics": TopicMap(),
         "snapshot_seconds": 0.5,
     }
 

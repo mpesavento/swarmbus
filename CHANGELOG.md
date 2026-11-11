@@ -19,6 +19,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 ## [Unreleased]
 
 ### Added
+- **`--topic-root` selects a topic root from the command line.** `TopicMap(root=…)` has built rooted topics since #17, but no command could select a root. `send`, `start`, `read`, `watch`, `list`, `doctor`, `mcp-server`, `mcp-daemon`, `mcp-attach`, `registry-list`, `registry-gc` and `registry-forget` now take `--topic-root` / `SWARMBUS_TOPIC_ROOT` / `[broker] topic_root`, and the Python entry points take `topics=TopicMap(root=…)`. An explicit empty `--topic-root ""` selects the unrooted layout even over a root in the config file. `mcp-attach` passes its root to the daemon it starts and refuses a running daemon on another root; that includes a daemon started before this change, which reports no root. See "Topic root" in `docs/configuration.md` and "With a topic root" in `docs/security.md`.
 - **`swarmbus mcp-attach` attaches a session to one shared daemon per agent id** (#88). It finds the `mcp-daemon` for `--agent-id` or starts it detached (new session, stdin and stdout detached from the session's MCP pipe, log at `<state-dir>/<agent-id>.daemon.log`), then serves `send_message`, `read_inbox` and `agent_state` through it. The broker password reaches a started daemon only through its environment, never its argv, log or an error. A running daemon with different settings or a different swarmbus version is refused with the differing field names and `kill <pid>`.
 - **The local RPC `ping` reply gains a `daemon` object** with the daemon's `pid`, swarmbus `version` and a `settings` fingerprint. The fingerprint holds `password_set` (whether a password is set) and never the password or anything derived from it.
 - **`swarmbus doctor` lists each daemon socket in `--state-dir`** with its pid, swarmbus version and agent id, warns on a stale socket or a version that differs from the CLI, and says so when no daemon answers.
@@ -39,7 +40,7 @@ If **any** of the above is "yes", the bullet spells out the mitigation a running
 
 ### Wire-compat
 1. **Envelope shape — no change.**
-2. **Topic layout — no change.**
+2. **Topic layout — no change by default.** With a topic root set, the inbox, presence and registry topics gain the root as a prefix; `agents/broadcast` does not. Processes on different roots exchange only broadcasts. To move a running swarm to a root, restart every process with the same root.
 3. **Retain/QoS defaults — no change.** The retained registry record gains one optional field (`state_updated_at`), and the shared daemon uses the existing managed-runtime settings selected by its flags; publish and subscribe defaults are untouched.
 4. **MCP tool contract — additive.** `agent_state` results gain a nullable `state_updated_at`. `RegistryRecord` is a plain pydantic model, so a reader on an older version drops the unknown key rather than rejecting the record, and a new reader accepts its absence from an older publisher; restart a sidecar or daemon before expecting it to publish the field. `mcp-proxy` exposes the same three tools and parameter shapes as `mcp-server`; the local RPC transport is private and versioned independently. `mcp-attach` (#88) changes no tool name or parameter shape; the private RPC `ping` reply gains an additive `daemon` object and its schema_version is unchanged.
 ---
