@@ -277,7 +277,7 @@ swarmbus mcp-server --agent-id <your-id> --broker localhost
 
 Configure your MCP client to spawn that command. Tool names and signatures are identical to path 1; the SKILL.md serves as a reference for prompt/system-message authors even if your stack doesn't use skill files.
 
-Codex is this path plus a controller: `codex mcp add swarmbus -- swarmbus mcp-server --agent-id <your-id>` wires the same tools, and a local controller reading `inbox_state` can hand a peer message to a running session mid-turn. Setup and the controller contract are at [docs/codex.md](docs/codex.md).
+Codex is this path plus a controller: `codex mcp add swarmbus -- swarmbus mcp-server --agent-id <your-id>` wires the same tools. A controller that hands a peer message to a running session mid-turn reads the private `inbox_state` operation, which only the shared daemon serves over its local socket — point Codex at `mcp-attach`, or at `mcp-daemon` plus `mcp-proxy`, for that. Setup and the controller contract are at [docs/codex.md](docs/codex.md).
 
 ### 4. Python framework (LangGraph, CrewAI, custom asyncio)
 

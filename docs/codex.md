@@ -111,10 +111,16 @@ codex mcp add swarmbus -- \
   --socket ~/.local/state/swarmbus/planner.sock
 ```
 
+`swarmbus mcp-attach` is the shorter route to the same arrangement: it finds the
+daemon for `--agent-id` or starts one detached, then serves the three tools over
+it, so no separate `mcp-daemon` launch is needed. A controller still needs the
+socket path, which defaults to `<state-dir>/<agent-id>.sock`.
+
 Supervise the daemon independently of Codex. Do not run another persistent
 receiver for the same agent ID; two MQTT clients claiming the same durable
-identity disconnect each other. See [Shared local MCP runtime](local-mcp-runtime.md)
-for ownership, health, and failure semantics.
+identity disconnect each other. The README's Claude Code section covers the
+daemon's ownership, health, and failure semantics, including the lock it uses to
+enforce one owner.
 
 All proxies share one inbox and acknowledgement state. If several Codex threads
 may consume work concurrently, the launcher must choose which thread receives
