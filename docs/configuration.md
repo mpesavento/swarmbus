@@ -61,9 +61,55 @@ Registry `status`, `working_set`, capabilities, and offline reasons are peer-pro
 
 Directory subscriptions use QoS 0 and the cache is cleared on every reconnect. The first `agent_state` read waits for a short bounded retained-message settling window before declaring that connection's snapshot ready. This prevents stale-cache and queued-directory replay, but it is not a proof that every retained record has arrived; hard snapshot completeness is tracked in [#69](https://github.com/mpesavento/swarmbus/issues/69).
 
+## Topic root
+
+A topic root is a prefix on the agent and registry topics. Use one to run several swarms on one broker, or to give a broker ACL one prefix per swarm.
+
+| Topic | Unrooted (default) | With root `fleet` |
+|---|---|---|
+| inbox | `agents/<id>/inbox` | `fleet/agents/<id>/inbox` |
+| presence | `agents/<id>/presence` | `fleet/agents/<id>/presence` |
+| registry | `swarmbus/registry/<id>` | `fleet/swarmbus/registry/<id>` |
+| broadcast | `agents/broadcast` | `agents/broadcast` |
+
+Broadcast is never rooted. A broadcast reaches every agent on the broker, whatever its root.
+
+Set the root with `--topic-root`, `SWARMBUS_TOPIC_ROOT`, or `[broker] topic_root` in the config file. Every command that connects to the broker takes it; the Keys table below lists them.
+
+```bash
+swarmbus start --agent-id planner --topic-root fleet
+swarmbus send --agent-id coder --topic-root fleet --to planner --subject hi --body hello
+```
+
+**Every process in a swarm must use the same root.** A sender on one root and a receiver on another both connect and both report success, and the message is never delivered. `list`, `doctor` and the registry commands see only the agents under their own root. Set the root once, in a shared config file or environment, rather than on each command line. `swarmbus start` prints it on a `topic root:` line in its startup banner.
+
+`mcp-attach` passes its root to the daemon it starts, and refuses a running daemon on a different root.
+
+The Python API takes the same setting as `topics=TopicMap(root="fleet")` on `AgentBus`, `AgentBus.probe`, `run_mcp_server`, `run_mcp_daemon`, `create_managed_runtime`, `ManagedMCPRuntime` and `RegistryMaintenance`.
+
+### Accepted values
+
+- Surrounding whitespace and leading or trailing slashes are stripped, so `/fleet/` means `fleet`.
+- A root may have several levels, such as `org/fleet`.
+- A root with an MQTT wildcard (`+` or `#`), a leading `$`, or an empty level (`a//b`) stops the command with exit 2.
+- An explicit empty `--topic-root ""` selects the unrooted layout, even when the config file sets a root. An empty `SWARMBUS_TOPIC_ROOT` counts as unset.
+
+### What a root does not separate
+
+- **MQTT client identifiers.** A persistent session is always `swarmbus-<agent-id>`, with no root in it. Two persistent receivers with the same agent id disconnect each other even under different roots, so keep agent ids unique across the broker.
+- **`registry-forget`.** It destroys the `swarmbus-<agent-id>` session. Run under one root, it disconnects that agent id when it is live under another.
+
+### Changing the root
+
+Changing the root moves nothing. Retained registry and presence records stay under the old root. To remove them:
+
+1. Stop the receiver.
+2. Run `swarmbus registry-forget --agent-id <id> --topic-root <old root>`. Use `--topic-root ""` when the old layout was unrooted.
+3. Start the receiver under the new root.
+
 ## Registry operations
 
-All three commands default to broker `localhost:1883`. Override that with `--broker HOST --port PORT`.
+All three commands default to broker `localhost:1883`. Override that with `--broker HOST --port PORT`. Each reads and changes only the records under its `--topic-root` (see "Topic root").
 
 | Command | Default behavior | Mutation switch | Main controls |
 |---|---|---|---|
@@ -136,6 +182,8 @@ Every `swarmbus` command can read its host settings (broker, agent id, limits, o
 
 An empty `--broker` or `--port` counts as unset, so the config file and then the built-in default apply. The Claude Code plugin relies on this, because it passes its host and port settings even when they are empty. An empty `SWARMBUS_BROKER_*` env var counts as unset too.
 
+`--topic-root` is the exception: an explicit empty `--topic-root ""` selects the unrooted layout and beats `[broker] topic_root`.
+
 For the outbox path: `--outbox` > `SWARMBUS_OUTBOX_<ID>` > `SWARMBUS_OUTBOX` > `[outbox] path`.
 
 ### Example
@@ -177,6 +225,7 @@ A key sets the default of the CLI option in the table, on the commands that have
 | `[broker] client_cert` | path | `--client-cert` | `SWARMBUS_BROKER_CLIENT_CERT` | the `[broker] host` commands |
 | `[broker] client_key` | path | `--client-key` | `SWARMBUS_BROKER_CLIENT_KEY` | the `[broker] host` commands |
 | `[broker] tls` | boolean | `--tls` | `SWARMBUS_BROKER_TLS` | the `[broker] host` commands |
+| `[broker] topic_root` | string | `--topic-root` | `SWARMBUS_TOPIC_ROOT` | `send`, `start`, `read`, `watch`, `list`, `doctor`, `mcp-server`, `mcp-daemon`, `mcp-attach`, `registry-list`, `registry-gc`, `registry-forget` |
 | `[agent] id` | string | `--agent-id` | none | every command that takes `--agent-id` |
 | `[agent] state_dir` | path | `--state-dir` | `SWARMBUS_STATE_DIR` | `send`, `start`, `read`, `watch`, `doctor`, `mcp-server`, `held` |
 | `[agent] inbox` | path | `--inbox` | none | `start`, `tail`, `init` |
@@ -226,7 +275,7 @@ The file sets defaults for host settings only. It does not cover:
 - per-call options: `send --to/--subject/--body/...`, `read --max/--json`, `watch --timeout/--json`, `list --json`, `tail --consumer/--follow/--reset`, `held --json/--reset/--reset-all`, `init --host-type/--invoke/--skip-broker/--skip-plugin/--dry-run/--yes`, and the registry commands' retention, snapshot, batch, confirmation, force, and password-file controls;
 - `--persistent`, whose default differs by command;
 - `mcp-server --presence` and `tail --cursor-dir`;
-- QoS and the topic root, which have no CLI option;
+- QoS, which has no CLI option;
 - the wake-context env vars (`SWARMBUS_ID`, `SWARMBUS_HOPS`, `SWARMBUS_ORIGIN`, `SWARMBUS_TRIP_*`);
 - the wake scripts' own `SWARMBUS_WAKE_*` and `SWARMBUS_RECEIVE_PROTOCOL` settings.
 

@@ -28,7 +28,7 @@ from .registry import (
     RegistryRecord,
     presence_payload,
 )
-from .topics import DEFAULT_TOPICS
+from .topics import DEFAULT_TOPICS, TopicMap
 from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
@@ -137,6 +137,7 @@ class ManagedMCPRuntime:
         rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
         on_trip: list[str] | None = None,
         trip_listener: str = "mcp-server",
+        topics: TopicMap = DEFAULT_TOPICS,
     ) -> None:
         _validate_registered_agent_id(agent_id)
         if lifecycle not in {"named", "transient"}:
@@ -195,7 +196,7 @@ class ManagedMCPRuntime:
             if on_trip
             else None
         )
-        self.topics = DEFAULT_TOPICS
+        self.topics = topics
         self.registry = RegistryCache(
             stale_after_seconds=stale_after_seconds,
             topics=self.topics,

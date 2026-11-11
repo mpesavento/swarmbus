@@ -2029,6 +2029,8 @@ def test_registry_list_cli_prints_full_directory():
             main,
             [
                 "registry-list",
+                "--topic-root",
+                " /fleet/ ",
                 "--stale-after-seconds",
                 "60",
                 "--snapshot-seconds",
@@ -2042,6 +2044,7 @@ def test_registry_list_cli_prints_full_directory():
         stale_after_seconds=60.0,
     )
     assert maintenance.call_args.kwargs["snapshot_seconds"] == 1.5
+    assert maintenance.call_args.kwargs["topics"] == TopicMap(root="fleet")
 
 
 def test_registry_list_cli_renders_orphan_stamps():
@@ -2127,6 +2130,7 @@ def test_registry_gc_cli_is_dry_run_by_default_and_threads_bounds():
         ca_cert=None,
         client_cert=None,
         client_key=None,
+        topics=TopicMap(),
         snapshot_seconds=0.25,
     )
     maintenance.return_value.gc_transient.assert_awaited_once_with(

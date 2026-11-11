@@ -77,6 +77,7 @@ def _isolated_state_dir(tmp_path, monkeypatch):
         "SWARMBUS_ON_TRIP",
         "SWARMBUS_MAX_OUTBOX_BYTES",
         "SWARMBUS_KEEP_OUTBOX_FILES",
+        "SWARMBUS_TOPIC_ROOT",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("SWARMBUS_CONFIG", raising=False)
