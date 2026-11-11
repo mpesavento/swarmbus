@@ -38,7 +38,7 @@ digraph mode_selection {
 
 | Intent | MCP form | CLI form |
 |---|---|---|
-| Send to a peer | `send_message(to, subject, body, content_type?, in_reply_to?)` | `swarmbus send --agent-id <me> --to <peer> --subject "..." --body "..."` |
+| Send to a peer | `send_message(to, subject, body, content_type?, priority?, in_reply_to?)` | `swarmbus send --agent-id <me> --to <peer> --subject "..." --body "..."` |
 | Read from daemon's inbox file (use when daemon is running) | (use file directly) | `swarmbus tail --agent-id <me>` (add `--follow` to stream) |
 | Read pending messages | `read_inbox()` | `swarmbus read --agent-id <me>` (add `--json` for structured output) |
 | Acknowledge handled MCP messages | `read_inbox(ack_ids=[...], max_messages=0)` | Not applicable; CLI one-shot reads use their transport contract |
@@ -95,6 +95,8 @@ The body is always a string. For JSON, serialize it yourself before sending.
 
 CLI: `--content-type text/markdown`
 MCP: `content_type="text/markdown"` kwarg.
+
+MCP `priority` defaults to `"normal"`. Use `priority="high"` only when the message is time-sensitive and an attention-enabled recipient should steer an active turn; other recipients may treat priority as advisory metadata.
 
 ## Reply patterns
 
