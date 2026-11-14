@@ -19,6 +19,9 @@ from swarmbus.topics import (
     SCOPE_SEPARATOR,
     SINGLE_LEVEL_WILDCARD,
     TopicMap,
+    agent_id_for_topic_address,
+    live_session_client_id,
+    two_level_topic_address,
 )
 
 ROOTED = TopicMap(root="foo")
@@ -608,8 +611,11 @@ def test_parsers_round_trip_their_builders():
         # Right tree, wrong leaf.
         "agents/wren/inbox",
         "agents/wren",
-        # Right tree, wrong depth.
-        "agents/wren/extra/presence",
+        # Right tree, wrong depth: an address has one or two levels.
+        "agents/wren/extra/deep/presence",
+        # Two levels that do not make one unambiguous agent id.
+        "agents/flock__a/wren/presence",
+        "agents/flock_/wren/presence",
         # Empty agent segment.
         "agents//presence",
         "agents/presence",
@@ -630,7 +636,8 @@ def test_presence_parser_raises_on_a_mismatched_topic(topic):
     [
         "wren",
         "foo/swarmbus/registry/wren",
-        "swarmbus/registry/wren/extra",
+        "swarmbus/registry/wren/extra/deep",
+        "swarmbus/registry/flock__a/wren",
         "swarmbus/registry/",
         "swarmbus/registry",
         "agents/wren/presence",
@@ -688,3 +695,175 @@ def test_message_topic_predicate_covers_own_inbox_and_broadcast():
 def test_rooted_message_predicate_still_accepts_unrooted_broadcast():
     assert ROOTED.is_message_topic("agents/broadcast", agent_id="wren") is True
     assert ROOTED.is_message_topic("foo/agents/wren/inbox", agent_id="wren") is True
+
+
+# ---------------------------------------------------------------------------
+# two-level addresses
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "address, agent_id",
+    [
+        ("wren", "wren"),
+        ("flock/wren", "flock__wren"),
+        # One level may hold the separator: that is an ordinary agent id.
+        ("flock__wren", "flock__wren"),
+        ("a/_b", "a___b"),
+    ],
+)
+def test_an_address_names_one_agent_id(address, agent_id):
+    assert agent_id_for_topic_address(address) == agent_id
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "",
+        "a/b/c",
+        "a//b",
+        "/a",
+        "a/",
+        "Flock/wren",
+        "flock/Wren",
+        "flock__a/wren",
+        "flock/a__wren",
+    ],
+)
+def test_a_malformed_address_is_refused(address):
+    with pytest.raises(ValueError):
+        agent_id_for_topic_address(address)
+
+
+def test_only_one_two_level_address_owns_an_agent_id():
+    """``a_/b`` and ``a/_b`` both join to ``a___b``.
+
+    If both were accepted, two different broker logins could publish the
+    registry record of one agent id, and the topic would stop saying whose
+    record it is.
+    """
+    assert agent_id_for_topic_address("a/_b") == "a___b"
+    with pytest.raises(ValueError, match="ambiguous"):
+        agent_id_for_topic_address("a_/b")
+    assert two_level_topic_address("a___b") == "a/_b"
+
+
+@pytest.mark.parametrize(
+    "agent_id, address",
+    [
+        ("flock__wren", "flock/wren"),
+        ("wren", None),
+        ("flock__a__wren", None),
+        ("flock____wren", None),
+        ("__wren", None),
+        ("flock__", None),
+    ],
+)
+def test_only_an_id_with_one_separator_has_a_two_level_address(
+    agent_id, address
+):
+    assert two_level_topic_address(agent_id) == address
+    if address is not None:
+        assert agent_id_for_topic_address(address) == agent_id
+
+
+def test_a_two_level_address_replaces_the_agent_id_in_its_topics():
+    for topics, prefix in ((TopicMap(), ""), (ROOTED, "foo/")):
+        build = {"topic_address": "flock/wren"}
+        assert (
+            topics.inbox("flock__wren", **build)
+            == f"{prefix}agents/flock/wren/inbox"
+        )
+        assert (
+            topics.presence("flock__wren", **build)
+            == f"{prefix}agents/flock/wren/presence"
+        )
+        assert (
+            topics.registry("flock__wren", **build)
+            == f"{prefix}swarmbus/registry/flock/wren"
+        )
+        assert (
+            topics.route("flock__wren", **build)
+            == f"{prefix}agents/flock/wren/inbox"
+        )
+
+
+def test_the_same_id_without_an_address_stays_at_one_level():
+    """The address is opt-in: ``__`` in an id does not move its topics."""
+    topics = TopicMap()
+
+    assert topics.inbox("flock__wren") == "agents/flock__wren/inbox"
+    assert topics.presence("flock__wren") == "agents/flock__wren/presence"
+    assert topics.registry("flock__wren") == "swarmbus/registry/flock__wren"
+
+
+def test_an_address_cannot_build_another_agents_topics():
+    topics = TopicMap()
+
+    for build in (topics.inbox, topics.presence, topics.registry, topics.route):
+        with pytest.raises(ValueError, match="does not belong"):
+            build("flock__wren", topic_address="flock/robin")
+        with pytest.raises(ValueError, match="does not belong"):
+            build("wren", topic_address="flock/wren")
+
+
+def test_broadcast_ignores_an_address():
+    assert ROOTED.route("broadcast", topic_address="flock/wren") == BROADCAST_TOPIC
+
+
+def test_filters_cover_both_address_depths():
+    assert TopicMap().presence_filters() == (
+        "agents/+/presence",
+        "agents/+/+/presence",
+    )
+    assert TopicMap().registry_filters() == (
+        "swarmbus/registry/+",
+        "swarmbus/registry/+/+",
+    )
+    assert ROOTED.presence_filters() == (
+        "foo/agents/+/presence",
+        "foo/agents/+/+/presence",
+    )
+    assert ROOTED.registry_filters() == (
+        "foo/swarmbus/registry/+",
+        "foo/swarmbus/registry/+/+",
+    )
+
+
+def test_parsers_round_trip_a_two_level_address():
+    for topics in (TopicMap(), ROOTED):
+        presence = topics.presence("flock__wren", topic_address="flock/wren")
+        registry = topics.registry("flock__wren", topic_address="flock/wren")
+
+        assert topics.presence_address(presence) == "flock/wren"
+        assert topics.presence_agent(presence) == "flock__wren"
+        assert topics.registry_address(registry) == "flock/wren"
+        assert topics.registry_agent(registry) == "flock__wren"
+
+
+def test_parsers_report_a_one_level_address_as_the_agent_id():
+    topics = TopicMap()
+
+    assert topics.presence_address("agents/flock__wren/presence") == "flock__wren"
+    assert topics.registry_address("swarmbus/registry/wren") == "wren"
+
+
+def test_message_topic_predicate_follows_the_address():
+    topics = TopicMap()
+    own = {"agent_id": "flock__wren", "topic_address": "flock/wren"}
+
+    assert topics.is_message_topic("agents/flock/wren/inbox", **own) is True
+    assert topics.is_message_topic("agents/broadcast", **own) is True
+    # Once the agent lives at two levels, the one-level inbox is not its own.
+    assert topics.is_message_topic("agents/flock__wren/inbox", **own) is False
+    assert topics.is_message_topic("agents/flock/robin/inbox", **own) is False
+
+
+def test_only_a_two_level_address_names_a_live_session_client_id():
+    """One level leaves the client id to the MQTT library, as it always was."""
+    assert live_session_client_id("wren") is None
+    assert live_session_client_id("flock__wren") is None
+    assert live_session_client_id("flock__wren", "flock__wren") is None
+    assert live_session_client_id("flock__wren", "flock/wren") == "wren"
+    with pytest.raises(ValueError, match="does not belong"):
+        live_session_client_id("wren", "flock/wren")

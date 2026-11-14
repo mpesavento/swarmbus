@@ -997,7 +997,8 @@ class AgentBus:
         async with aiomqtt.Client(
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
-            await client.subscribe(self.topics.any_presence_filter(), qos=0)
+            for presence_filter in self.topics.presence_filters():
+                await client.subscribe(presence_filter, qos=0)
             try:
                 async with asyncio_timeout(collect_window):
                     async for mqtt_msg in client.messages:

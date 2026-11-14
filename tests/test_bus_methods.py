@@ -291,9 +291,18 @@ async def test_list_agents_trusts_topic_owner_not_payload_claim():
 async def test_list_agents_skips_unattributable_presence_topic():
     """Unattributable presence topics do not abort listing."""
     assert await _listed([
-        _record_presence("imposter", "online", topic_owner="outer/inner"),
+        _record_presence("imposter", "online", topic_owner="outer/inner/deep"),
         _legacy_presence("sparrow", "online"),
     ]) == ["sparrow"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_names_an_agent_at_a_two_level_address():
+    """A two-level presence topic belongs to the id its two levels join to."""
+    assert await _listed([
+        _record_presence("flock__wren", "online", topic_owner="flock/wren"),
+        _legacy_presence("sparrow", "online"),
+    ]) == ["flock__wren", "sparrow"]
 
 
 @pytest.mark.parametrize("junk", [b"[]", b"null", b"3"])

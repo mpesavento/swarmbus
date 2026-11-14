@@ -22,7 +22,7 @@ from .registry import (
     stamp_presence_payload,
     transient_gc_decision,
 )
-from .topics import DEFAULT_TOPICS, TopicMap
+from .topics import DEFAULT_TOPICS, TopicMap, two_level_topic_address
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,9 @@ class RegistryForgetReport(BaseModel):
     rechecked: bool = False
     # A refusal leaves retained state unchanged.
     refused: bool = False
-    refused_reason: Literal["online", "unconfirmed-offline"] | None = None
+    refused_reason: (
+        Literal["online", "unconfirmed-offline", "ambiguous-address"] | None
+    ) = None
     already_absent: bool = False
     deleted: bool = False
     session_destroyed: bool = False
@@ -153,6 +155,9 @@ class _RegistrySnapshot:
         # Payload bytes as retained, kept so a stamp can be added to the
         # record that is actually there rather than to a rebuilt one.
         self.presence_payloads: dict[str, bytes] = {}
+        # Every address a record for this agent id arrived on. More than one
+        # means the dicts above hold whichever arrived last.
+        self.addresses: dict[str, set[str]] = {}
         self.invalid_messages = 0
 
     def ingest(self, topic: str, payload: bytes) -> None:
@@ -175,6 +180,9 @@ class _RegistrySnapshot:
                 self.invalid_messages += 1
                 return
             self.records[record.agent_id] = record
+            self.addresses.setdefault(record.agent_id, set()).add(
+                record.resolved_topic_address
+            )
             return
 
         if self.topics.is_presence_topic(topic):
@@ -198,6 +206,9 @@ class _RegistrySnapshot:
                 return
             self.presence[record.agent_id] = record
             self.presence_payloads[record.agent_id] = payload
+            self.addresses.setdefault(record.agent_id, set()).add(
+                record.resolved_topic_address
+            )
             return
 
         # Neither tree: this map's subscriptions and predicates disagree.
@@ -352,6 +363,38 @@ class RegistryMaintenance:
         return None
 
     @staticmethod
+    def _observed_addresses(
+        agent_id: str,
+        *snapshots: _RegistrySnapshot,
+    ) -> set[str]:
+        """Every address a record for this agent id arrived on."""
+        seen: set[str] = set()
+        for snapshot in snapshots:
+            seen |= snapshot.addresses.get(agent_id, set())
+        return seen
+
+    @staticmethod
+    def _ambiguous_address_report(
+        agent_id: str,
+        *,
+        dry_run: bool,
+        rechecked: bool = False,
+    ) -> RegistryForgetReport:
+        """Refuse: this agent id has retained records at two addresses.
+
+        Forgetting destroys a session, and with two addresses nothing says
+        which one the caller means. Presence is left unconfirmed because any
+        single reading of it would come from one of the two.
+        """
+        return RegistryForgetReport(
+            agent_id=agent_id,
+            dry_run=dry_run,
+            rechecked=rechecked,
+            refused=True,
+            refused_reason="ambiguous-address",
+        )
+
+    @staticmethod
     def _audit_event(
         *,
         operation: str,
@@ -406,8 +449,8 @@ class RegistryMaintenance:
 
         snapshot = await self._snapshot(
             (
-                self.topics.any_registry_filter(),
-                self.topics.any_presence_filter(),
+                *self.topics.registry_filters(),
+                *self.topics.presence_filters(),
             )
         )
         identities = []
@@ -485,8 +528,8 @@ class RegistryMaintenance:
 
         initial = await self._snapshot(
             (
-                self.topics.any_registry_filter(),
-                self.topics.any_presence_filter(),
+                *self.topics.registry_filters(),
+                *self.topics.presence_filters(),
             )
         )
         preserved: Counter[str] = Counter()
@@ -529,6 +572,15 @@ class RegistryMaintenance:
 
         broker_lost = False
         for original in selected:
+            # Read and tombstone at the one address this record was observed
+            # on, so evidence and action cannot come from two places.
+            address = original.resolved_topic_address
+            registry_topic = self.topics.registry(
+                original.agent_id, topic_address=address
+            )
+            presence_topic = self.topics.presence(
+                original.agent_id, topic_address=address
+            )
             resolved_before = (
                 report.deleted + report.would_delete + report.skipped
             )
@@ -536,10 +588,7 @@ class RegistryMaintenance:
                 async with self._new_client() as client:
                     fresh = await self._snapshot_with_client(
                         client,
-                        (
-                            self.topics.registry(original.agent_id),
-                            self.topics.presence(original.agent_id),
-                        ),
+                        (registry_topic, presence_topic),
                     )
                     report.malformed += fresh.invalid_messages
                     record = fresh.records.get(original.agent_id)
@@ -630,14 +679,14 @@ class RegistryMaintenance:
                                 clean_session=True,
                             ) as agent_client:
                                 await agent_client.publish(
-                                    self.topics.presence(original.agent_id),
+                                    presence_topic,
                                     b"",
                                     qos=1,
                                     retain=True,
                                 )
                                 presence_deleted = True
                                 await agent_client.publish(
-                                    self.topics.registry(original.agent_id),
+                                    registry_topic,
                                     b"",
                                     qos=1,
                                     retain=True,
@@ -645,14 +694,14 @@ class RegistryMaintenance:
                             report.sessions_destroyed += 1
                         else:
                             await client.publish(
-                                self.topics.presence(original.agent_id),
+                                presence_topic,
                                 b"",
                                 qos=1,
                                 retain=True,
                             )
                             presence_deleted = True
                             await client.publish(
-                                self.topics.registry(original.agent_id),
+                                registry_topic,
                                 b"",
                                 qos=1,
                                 retain=True,
@@ -749,6 +798,7 @@ class RegistryMaintenance:
                 await self._write_orphan_presence(
                     report,
                     agent_id=agent_id,
+                    topic_address=presence[agent_id].resolved_topic_address,
                     now=now,
                     retention_seconds=retention_seconds,
                     dry_run=dry_run,
@@ -771,6 +821,7 @@ class RegistryMaintenance:
         report: RegistryGCReport,
         *,
         agent_id: str,
+        topic_address: str,
         now: datetime,
         retention_seconds: float,
         dry_run: bool,
@@ -783,12 +834,17 @@ class RegistryMaintenance:
         offline one.
         """
 
+        presence_topic = self.topics.presence(
+            agent_id, topic_address=topic_address
+        )
         async with self._new_client() as client:
             fresh = await self._snapshot_with_client(
                 client,
                 (
-                    self.topics.registry(agent_id),
-                    self.topics.presence(agent_id),
+                    self.topics.registry(
+                        agent_id, topic_address=topic_address
+                    ),
+                    presence_topic,
                 ),
             )
             report.malformed += fresh.invalid_messages
@@ -858,7 +914,7 @@ class RegistryMaintenance:
                 # own client id would destroy any persistent session it holds,
                 # and an orphan carries no record saying whether it has one.
                 await client.publish(
-                    self.topics.presence(agent_id),
+                    presence_topic,
                     body,
                     qos=1,
                     retain=True,
@@ -898,11 +954,23 @@ class RegistryMaintenance:
         if current.tzinfo is None or current.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
 
-        filters = (
-            self.topics.registry(agent_id),
-            self.topics.presence(agent_id),
+        # An id of the form a__b may live at a/b instead of at one level, and
+        # nothing but its retained records says which. Read both.
+        candidate_addresses = [agent_id]
+        two_level = two_level_topic_address(agent_id)
+        if two_level is not None:
+            candidate_addresses.append(two_level)
+        filters = tuple(
+            topic
+            for address in candidate_addresses
+            for topic in (
+                self.topics.registry(agent_id, topic_address=address),
+                self.topics.presence(agent_id, topic_address=address),
+            )
         )
         snapshot = await self._snapshot(filters)
+        if len(self._observed_addresses(agent_id, snapshot)) > 1:
+            return self._ambiguous_address_report(agent_id, dry_run=dry_run)
         record = snapshot.records.get(agent_id)
         presence = snapshot.presence.get(agent_id)
         initial_absent = (
@@ -944,6 +1012,12 @@ class RegistryMaintenance:
         # Two bounded reads distinguish absence from delayed retained state.
         async with self._new_client() as reader:
             fresh = await self._snapshot_with_client(reader, filters)
+        # Across both reads, so records that moved between them count too.
+        addresses = self._observed_addresses(agent_id, snapshot, fresh)
+        if len(addresses) > 1:
+            return self._ambiguous_address_report(
+                agent_id, dry_run=dry_run, rechecked=True
+            )
         record = fresh.records.get(agent_id)
         presence = fresh.presence.get(agent_id)
         fresh_absent = (
@@ -1016,6 +1090,10 @@ class RegistryMaintenance:
             report.failed = True
             return report
 
+        # At most one address was observed across both reads. None was only
+        # if neither read held a valid record, which --force-online alone
+        # lets through; the one-level topics are then the ones to clear.
+        address = next(iter(addresses), agent_id)
         presence_deleted = False
         try:
             async with self._new_client(
@@ -1023,14 +1101,14 @@ class RegistryMaintenance:
                 clean_session=True,
             ) as client:
                 await client.publish(
-                    self.topics.presence(agent_id),
+                    self.topics.presence(agent_id, topic_address=address),
                     b"",
                     qos=1,
                     retain=True,
                 )
                 presence_deleted = True
                 await client.publish(
-                    self.topics.registry(agent_id),
+                    self.topics.registry(agent_id, topic_address=address),
                     b"",
                     qos=1,
                     retain=True,

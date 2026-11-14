@@ -1114,8 +1114,8 @@ async def test_snapshot_counts_tombstones_on_unparseable_topics():
     factory = _ClientFactory(
         [
             [
-                _Message("swarmbus/registry/nested/worker", b""),
-                _Message("agents/nested/worker/presence", b""),
+                _Message("swarmbus/registry/nested/deep/worker", b""),
+                _Message("agents/nested/deep/worker/presence", b""),
             ]
         ]
     )
@@ -1850,6 +1850,231 @@ async def test_gc_rejects_bad_bounds_before_connecting(override, match):
         await maintenance.gc_transient(**kwargs)
 
     assert factory.calls == []
+
+
+SPLIT_ID = "flock__wren"
+SPLIT_ADDRESS = "flock/wren"
+SPLIT_TOMBSTONES = [
+    (DEFAULT_TOPICS.presence(SPLIT_ID, topic_address=SPLIT_ADDRESS), b""),
+    (DEFAULT_TOPICS.registry(SPLIT_ID, topic_address=SPLIT_ADDRESS), b""),
+]
+
+
+def _message_at(record, address):
+    """A retained record as found on the topics of a two-level address."""
+    build = (
+        DEFAULT_TOPICS.registry
+        if isinstance(record, RegistryRecord)
+        else DEFAULT_TOPICS.presence
+    )
+    return _Message(
+        build(record.agent_id, topic_address=address),
+        record.to_json(),
+    )
+
+
+def _split_offline(now, *, durability="ephemeral", lifecycle="transient"):
+    """Registry and offline presence for one agent at a two-level address."""
+    return [
+        _message_at(
+            _registry(
+                SPLIT_ID,
+                now=now,
+                age_seconds=1200,
+                lifecycle=lifecycle,
+                durability=durability,
+            ),
+            SPLIT_ADDRESS,
+        ),
+        _message_at(_presence(SPLIT_ID, "offline"), SPLIT_ADDRESS),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_registry_list_reports_an_agent_at_a_two_level_address():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    factory = _ClientFactory([_split_offline(now)])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.list_registry(now=now, stale_after_seconds=60)
+
+    assert [identity.agent_id for identity in report.identities] == [SPLIT_ID]
+    assert report.identities[0].topic_address == SPLIT_ADDRESS
+    assert report.identities[0].presence_evidence == "offline"
+    assert report.malformed == 0
+
+
+@pytest.mark.asyncio
+async def test_gc_retires_a_live_session_agent_at_its_two_level_address():
+    """No broker session to destroy, so no client connects under any id."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    factory = _ClientFactory([_split_offline(now), _split_offline(now)])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.deleted == 1
+    assert report.sessions_destroyed == 0
+    assert len(factory.clients) == 2
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    assert [
+        call.args for call in factory.clients[1].publish.await_args_list
+    ] == SPLIT_TOMBSTONES
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_destroys_a_two_level_session_under_the_canonical_client_id():
+    """Where a record sits never chooses the session maintenance destroys."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    retained = _split_offline(now, durability="durable")
+    factory = _ClientFactory([retained, retained, []])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.deleted == 1
+    assert report.sessions_destroyed == 1
+    assert len(factory.clients) == 3
+    assert factory.calls[2][1]["identifier"] == f"swarmbus-{SPLIT_ID}"
+    assert factory.calls[2][1]["clean_session"] is True
+    assert [
+        call.args for call in factory.clients[2].publish.await_args_list
+    ] == SPLIT_TOMBSTONES
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_forget_retires_a_two_level_agent_under_the_canonical_client_id():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    retained = _split_offline(now, lifecycle="named")
+    factory = _ClientFactory([retained, retained, []])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    result = await maintenance.forget(SPLIT_ID, now=now, stale_after_seconds=60)
+
+    assert result.deleted is True
+    assert result.session_destroyed is True
+    assert factory.calls[2][1]["identifier"] == f"swarmbus-{SPLIT_ID}"
+    assert factory.calls[2][1]["clean_session"] is True
+    assert [
+        call.args for call in factory.clients[2].publish.await_args_list
+    ] == SPLIT_TOMBSTONES
+
+
+@pytest.mark.asyncio
+async def test_forget_finds_an_id_with_a_separator_at_one_level():
+    """The separator does not mean two levels: the records say where it is."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    retained = [
+        _message(_registry(SPLIT_ID, now=now, age_seconds=900, lifecycle="named")),
+        _message(_presence(SPLIT_ID, "offline")),
+    ]
+    factory = _ClientFactory([retained, retained, []])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    result = await maintenance.forget(SPLIT_ID, now=now, stale_after_seconds=60)
+
+    assert result.deleted is True
+    assert factory.calls[2][1]["identifier"] == f"swarmbus-{SPLIT_ID}"
+    assert [
+        call.args for call in factory.clients[2].publish.await_args_list
+    ] == [
+        (DEFAULT_TOPICS.presence(SPLIT_ID), b""),
+        (DEFAULT_TOPICS.registry(SPLIT_ID), b""),
+    ]
+
+
+@pytest.mark.parametrize("force_online", [False, True])
+@pytest.mark.asyncio
+async def test_forget_refuses_an_agent_id_retained_at_two_addresses(
+    force_online,
+):
+    """Two addresses, one id: nothing says which the caller means.
+
+    force_online accepts an unprovable eviction; it does not pick a target.
+    """
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    at_one_level = _message(
+        _registry(SPLIT_ID, now=now, age_seconds=900, lifecycle="named")
+    )
+    factory = _ClientFactory([[at_one_level, *_split_offline(now)]])
+    audit_events = []
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=audit_events.append,
+    )
+
+    result = await maintenance.forget(
+        SPLIT_ID,
+        now=now,
+        force_online=force_online,
+        stale_after_seconds=60,
+    )
+
+    assert result.refused is True
+    assert result.refused_reason == "ambiguous-address"
+    assert result.deleted is False
+    assert result.session_destroyed is False
+    # Presence is not reported: either reading would come from one address.
+    assert result.online is None
+    assert result.presence_evidence == "unconfirmed"
+    assert audit_events == []
+    assert len(factory.calls) == 1
+    _assert_nothing_published(factory)
+
+
+@pytest.mark.asyncio
+async def test_forget_refuses_an_agent_id_that_moved_between_its_two_reads():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    at_one_level = [
+        _message(_registry(SPLIT_ID, now=now, age_seconds=900, lifecycle="named")),
+        _message(_presence(SPLIT_ID, "offline")),
+    ]
+    factory = _ClientFactory([at_one_level, _split_offline(now)])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    result = await maintenance.forget(SPLIT_ID, now=now, stale_after_seconds=60)
+
+    assert result.refused is True
+    assert result.refused_reason == "ambiguous-address"
+    assert result.rechecked is True
+    assert len(factory.calls) == 2
+    _assert_nothing_published(factory)
 
 
 @pytest.mark.asyncio

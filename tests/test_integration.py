@@ -713,6 +713,278 @@ async def test_messaging_only_runtime_gets_no_directory_on_real_broker(
 
 
 # ---------------------------------------------------------------------------
+# Two-level topic addresses -- the broker's own wildcard and ACL matching
+# ---------------------------------------------------------------------------
+
+def _session(host, port, tmp_path, name, **kwargs) -> ManagedMCPRuntime:
+    """Runtime for agent ``flock__<name>`` at the address ``flock/<name>``."""
+    return ManagedMCPRuntime(
+        agent_id=f"flock__{name}",
+        topic_address=f"flock/{name}",
+        broker=host,
+        port=port,
+        presence=True,
+        state_path=tmp_path / f"{name}.sqlite3",
+        **kwargs,
+    )
+
+
+def _address_topics(
+    name: str, topics: TopicMap = DEFAULT_TOPICS
+) -> tuple[str, str]:
+    """Presence and registry topics of ``_session(name)``."""
+    build = {"topic_address": f"flock/{name}"}
+    agent_id = f"flock__{name}"
+    return topics.presence(agent_id, **build), topics.registry(agent_id, **build)
+
+
+async def _until_seen(
+    runtime: ManagedMCPRuntime, agent_id: str, timeout: float = 5.0
+) -> dict:
+    """Wait for ``agent_id`` to reach ``runtime``'s directory."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            return await runtime.get_state(agent_id)
+        except ValueError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise
+            await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_one_and_two_level_agents_find_and_reach_each_other(
+    mosquitto_broker,
+    tmp_path,
+):
+    """Neither is told where the other lives. Each reads it from the
+    directory, which only fills if the broker matches both layouts."""
+    host, port = mosquitto_broker
+    finch = _session(host, port, tmp_path, "finch", lifecycle="transient")
+    plain = ManagedMCPRuntime(
+        agent_id="one-level-peer",
+        broker=host,
+        port=port,
+        presence=True,
+        state_path=tmp_path / "one-level-peer.sqlite3",
+    )
+    finch_topics = _address_topics("finch")
+    try:
+        for runtime in (finch, plain):
+            await runtime.start()
+            await runtime.wait_until_ready()
+
+        seen = await _until_seen(plain, "flock__finch")
+        assert seen["topic_address"] == "flock/finch"
+        await plain.send_message(to="flock__finch", subject="down", body="x")
+        inbound = await finch.read_inbox(wait_seconds=5)
+        assert [(m["from"], m["subject"]) for m in inbound] == [
+            ("one-level-peer", "down")
+        ]
+
+        seen = await _until_seen(finch, "one-level-peer")
+        assert "topic_address" not in seen
+        await finch.send_message(
+            to="one-level-peer",
+            subject="up",
+            body="x",
+            in_reply_to=inbound[0]["id"],
+        )
+        reply = await plain.read_inbox(wait_seconds=5)
+        assert [(m["from"], m["subject"]) for m in reply] == [
+            ("flock__finch", "up")
+        ]
+
+        # `swarmbus list` reads presence alone, with no registry record.
+        listed = await AgentBus.probe(host, port).list_agents()
+        assert {"flock__finch", "one-level-peer"} <= set(listed)
+
+        await finch.stop()
+        retained = await _read_retained(host, port, list(finch_topics))
+        assert retained == {}, (
+            "transient shutdown left retained state at its address: "
+            f"{_describe_retained(retained)}"
+        )
+    finally:
+        await finch.stop()
+        await plain.stop()
+        await _clear_retained(host, port, [
+            *finch_topics,
+            DEFAULT_TOPICS.presence("one-level-peer"),
+            DEFAULT_TOPICS.registry("one-level-peer"),
+        ])
+
+
+@pytest.mark.asyncio
+async def test_per_session_acl_tells_one_logins_sessions_apart(
+    mosquitto_acl_broker,
+    tmp_path,
+):
+    """Two sessions share a login. Each takes its client id from its topic
+    address, which is all the broker has to grant them separate topics."""
+    host, port = mosquitto_acl_broker
+    shared_login = {"username": "flock", "lifecycle": "transient"}
+    wren = _session(host, port, tmp_path, "wren", **shared_login)
+    lark = _session(host, port, tmp_path, "lark", **shared_login)
+    wren_presence, _ = _address_topics("wren")
+    try:
+        for runtime in (wren, lark):
+            await runtime.start()
+            await runtime.wait_until_ready()
+
+        # lark can only know of wren if the broker let wren announce itself.
+        await _until_seen(lark, "flock__wren")
+        await lark.send_message(to="flock__wren", subject="hello", body="x")
+        inbound = await wren.read_inbox(wait_seconds=5)
+        assert [(m["from"], m["subject"]) for m in inbound] == [
+            ("flock__lark", "hello")
+        ]
+
+        # Control: the same login under another client id may not write
+        # wren's presence, so the grant is per session and is enforced.
+        async with aiomqtt.Client(
+            host, port=port, username="flock", identifier="magpie"
+        ) as other_session:
+            await other_session.publish(
+                wren_presence, b"", qos=1, retain=True
+            )
+        retained = await _read_retained(host, port, [wren_presence])
+        assert wren_presence in retained
+    finally:
+        await wren.stop()
+        await lark.stop()
+
+
+@pytest.mark.asyncio
+async def test_per_session_acl_does_not_admit_a_persistent_session(
+    mosquitto_acl_broker,
+    tmp_path,
+):
+    """A persistent session keeps the client id ``swarmbus-<agent-id>`` at
+    any address, so a grant keyed on the address passes it by. The live
+    session beside it shows the same broker admitting one that matches."""
+    host, port = mosquitto_acl_broker
+    shared_login = {"username": "flock", "lifecycle": "transient"}
+    live = _session(host, port, tmp_path, "swift", **shared_login)
+    durable = _session(
+        host, port, tmp_path, "owl", persistent=True, **shared_login
+    )
+    live_presence, live_registry = _address_topics("swift")
+    durable_topics = _address_topics("owl")
+    try:
+        for runtime in (live, durable):
+            await runtime.start()
+            await runtime.wait_until_ready()
+
+        retained = await _read_retained(
+            host, port, [live_presence, live_registry, *durable_topics]
+        )
+        assert set(retained) == {live_presence, live_registry}, (
+            _describe_retained(retained)
+        )
+    finally:
+        await durable.stop()
+        await live.stop()
+
+
+@pytest.mark.asyncio
+async def test_registry_gc_collects_a_crashed_two_level_session_on_real_broker(
+    mosquitto_broker,
+    tmp_path,
+):
+    """A crash leaves the last registry record and the Last Will retained at
+    the two-level address. GC is told neither the agent nor the address."""
+    host, port = mosquitto_broker
+    # A root of its own, so this GC collects nothing another test left.
+    topics = TopicMap(root="address-gc")
+    crashed = _session(
+        host, port, tmp_path, "crashed", lifecycle="transient", topics=topics
+    )
+    presence_topic, registry_topic = _address_topics("crashed", topics)
+    try:
+        await crashed.start()
+        await crashed.wait_until_ready()
+        last_record = (
+            await _read_retained(host, port, [registry_topic])
+        )[registry_topic]
+        will = crashed._client_kwargs()["will"]
+        assert will.topic == presence_topic
+        await crashed.stop()
+        # The runtime's own bytes, put back where a crash would leave them.
+        async with aiomqtt.Client(host, port=port) as client:
+            await client.publish(
+                registry_topic, last_record, qos=1, retain=True
+            )
+            await client.publish(
+                presence_topic, will.payload, qos=1, retain=True
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            topics=topics,
+            snapshot_seconds=0.2,
+        )
+        listed = await maintenance.list_registry(stale_after_seconds=60)
+        assert [
+            (identity.agent_id, identity.topic_address)
+            for identity in listed.identities
+        ] == [("flock__crashed", "flock/crashed")]
+
+        report = await maintenance.gc_transient(
+            now=datetime.now(timezone.utc) + timedelta(hours=1),
+            stale_after_seconds=60,
+            retention_seconds=300,
+            batch_size=10,
+        )
+
+        assert report.deleted_agent_ids == ["flock__crashed"]
+        retained = await _read_retained(
+            host, port, [presence_topic, registry_topic]
+        )
+        assert retained == {}, _describe_retained(retained)
+    finally:
+        await crashed.stop()
+        await _clear_retained(host, port, [presence_topic, registry_topic])
+
+
+@pytest.mark.asyncio
+async def test_registry_forget_retires_a_two_level_agent_on_real_broker(
+    mosquitto_broker,
+    tmp_path,
+):
+    """forget is given the agent id alone. Where its records are retained
+    is for forget to find."""
+    host, port = mosquitto_broker
+    retired = _session(host, port, tmp_path, "retired")
+    presence_topic, registry_topic = _address_topics("retired")
+    try:
+        await retired.start()
+        await retired.wait_until_ready()
+        await retired.stop()
+        left_behind = await _read_retained(
+            host, port, [presence_topic, registry_topic]
+        )
+        assert set(left_behind) == {presence_topic, registry_topic}
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            snapshot_seconds=0.2,
+        )
+        report = await maintenance.forget("flock__retired")
+
+        assert report.deleted is True
+        retained = await _read_retained(
+            host, port, [presence_topic, registry_topic]
+        )
+        assert retained == {}, _describe_retained(retained)
+    finally:
+        await retired.stop()
+        await _clear_retained(host, port, [presence_topic, registry_topic])
+
+
+# ---------------------------------------------------------------------------
 # Handler e2e -- side effects on disk / DB / subprocess
 # ---------------------------------------------------------------------------
 

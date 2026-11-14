@@ -147,6 +147,35 @@ Changing the root moves nothing. Under the new root the agent has a new state db
 
 `swarmbus doctor --agent-id <id> --topic-root <new root>` warns when the unrooted state db for that id still holds unacknowledged messages, and when a local daemon for that id is still running on another root.
 
+## Two-level topic address
+
+An agent whose id has the form `<a>__<b>` can put its topics at `<a>/<b>` instead of at `<a>__<b>`. Use it when many short-lived sessions share one broker login and the broker ACL has to tell them apart. Mosquitto's `%u` and `%c` match whole topic levels only; see "One login, many sessions" in [security.md](security.md#one-login-many-sessions).
+
+| Topic | Default | With `--topic-address flock/wren` |
+|---|---|---|
+| inbox | `agents/flock__wren/inbox` | `agents/flock/wren/inbox` |
+| presence | `agents/flock__wren/presence` | `agents/flock/wren/presence` |
+| registry | `swarmbus/registry/flock__wren` | `swarmbus/registry/flock/wren` |
+
+The agent id does not change: messages, `agent_state` and `registry-list` still say `flock__wren`. A topic root still goes in front.
+
+Set the address with `--topic-address` or `SWARMBUS_TOPIC_ADDRESS` on `mcp-server`, `mcp-daemon` and `mcp-attach`. It is opt-in for each agent. An id with `__` in it stays at one level unless the option is given.
+
+```bash
+swarmbus mcp-server --agent-id flock__wren --topic-address flock/wren \
+  --presence --lifecycle transient
+```
+
+- **The address must be the agent id's own.** `flock/wren` belongs to `flock__wren` and to no other id. An address with more than two levels or an empty level, or one that belongs to another id, stops the command with exit 2. So does an ambiguous one: `a_/b` and `a/_b` would both join to `a___b`, so only `a/_b` is accepted.
+- **Without `--persistent`, the MQTT client id is the second level** (`wren`). That is what lets an ACL match the topics with `%c`. With `--persistent` the client id stays `swarmbus-<agent-id>`, as for every persistent session, so a `%c` ACL does not match it.
+- **Senders find the address in the directory.** A runtime started with `--presence` reads it from the agent's registry or presence record and sends to the two-level inbox. A sender with no record of the agent sends to the one-level inbox, where a two-level agent is not listening, and nothing reports the miss. That covers `swarmbus send`, a sidecar without `--presence`, and a message to a transient agent that has shut down.
+- **Use `--presence` with it.** Without presence the agent publishes no record, so no sender can find it.
+- **`mcp-attach` passes the address to the daemon it starts**, and refuses a running daemon at another address.
+- **`swarmbus list`, `agent_state` and the registry commands read both layouts.** `agent_state` adds a `topic_address` field for an agent at two levels. Every `registry-list` identity has one; it is null at one level.
+- **A runtime from before this option does not see a two-level agent.** It subscribes to the one-level directory topics only. Restart the readers first, then start agents at two levels.
+
+The Python API takes `topic_address="flock/wren"` on `run_mcp_server`, `run_mcp_daemon`, `create_managed_runtime` and `ManagedMCPRuntime`.
+
 ## Registry operations
 
 All three commands default to broker `localhost:1883`. Override that with `--broker HOST --port PORT`. Each reads and changes only the records under its `--topic-root` (see "Topic root").
@@ -186,7 +215,14 @@ swarmbus registry-forget --agent-id old-worker --dry-run
 swarmbus registry-forget --agent-id old-worker
 ```
 
-`registry-forget` rechecks the identity immediately before mutation and prints a JSON report on both success and refusal. A refusal exits non-zero with `refused: true` and a reason of `online` or `unconfirmed-offline`. `--force-online` bypasses that safety check and can disconnect a live client; reserve it for operator-confirmed emergencies.
+`registry-forget` rechecks the identity immediately before mutation and prints a JSON report on both success and refusal. A refusal exits non-zero with `refused: true` and a reason of `online`, `unconfirmed-offline` or `ambiguous-address`. `--force-online` bypasses the first two and can disconnect a live client; reserve it for operator-confirmed emergencies.
+
+`ambiguous-address` means the id has retained records at both its one-level and its two-level address (see "Two-level topic address"), so nothing says which pair to retire. `registry-forget` changes nothing, with or without `--force-online`. Clear the pair the agent no longer uses with empty retained publishes, then run the command again:
+
+```bash
+mosquitto_pub -r -n -t agents/flock__wren/presence
+mosquitto_pub -r -n -t swarmbus/registry/flock__wren
+```
 
 GC reports scanned, selected, preserved, deleted, raced, and failed identities. A dry run populates `would_delete` without publishing tombstones. Applied GC remains bounded by `--batch-size` and rechecks every selected identity before mutation.
 
