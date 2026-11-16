@@ -93,14 +93,14 @@ def _presence(agent_id, state, *, first_seen_offline=None):
     )
 
 
-def _message(record):
+def _message(record, *, topics=DEFAULT_TOPICS):
     if isinstance(record, RegistryRecord):
         return _Message(
-            DEFAULT_TOPICS.registry(record.agent_id),
+            topics.registry(record.agent_id),
             record.to_json(),
         )
     return _Message(
-        DEFAULT_TOPICS.presence(record.agent_id),
+        topics.presence(record.agent_id),
         record.to_json(),
     )
 
@@ -1251,6 +1251,56 @@ async def test_forget_tombstones_state_and_destroys_durable_session():
 
 
 @pytest.mark.asyncio
+async def test_forget_destroys_the_session_of_its_own_topic_root():
+    """A forget under one root must not reach another root's session."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    fleet = TopicMap(root="fleet")
+    record = _registry(
+        "rooted-session",
+        now=now,
+        age_seconds=900,
+        lifecycle="named",
+    )
+    offline = _presence(record.agent_id, "offline")
+    factory = _ClientFactory(
+        [
+            [
+                _message(record, topics=fleet),
+                _message(offline, topics=fleet),
+            ],
+            [
+                _message(record, topics=fleet),
+                _message(offline, topics=fleet),
+            ],
+            [],
+        ]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+        topics=fleet,
+    )
+
+    result = await maintenance.forget(
+        "rooted-session",
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert result.deleted is True
+    assert result.session_destroyed is True
+    assert factory.calls[2][1]["identifier"] == fleet.session_client_id(
+        "rooted-session"
+    )
+    assert factory.calls[2][1]["clean_session"] is True
+    assert [call.args for call in factory.clients[2].publish.await_args_list] == [
+        (fleet.presence("rooted-session"), b""),
+        (fleet.registry("rooted-session"), b""),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_forget_refuses_online_identity_without_override():
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
     record = _registry(
@@ -1843,6 +1893,47 @@ async def test_gc_durable_transient_tombstones_on_its_own_client_id():
     assert [c.args for c in factory.clients[2].publish.await_args_list] == [
         (DEFAULT_TOPICS.presence("ghost"), b""),
         (DEFAULT_TOPICS.registry("ghost"), b""),
+    ]
+    _assert_gc_identities(report)
+
+
+@pytest.mark.asyncio
+async def test_gc_durable_transient_client_id_carries_the_topic_root():
+    """GC under one root must not destroy another root's session."""
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    fleet = TopicMap(root="fleet")
+    rec = _registry("rooted-ghost", now=now, age_seconds=1200)
+    rec.durability = "durable"
+    offline = _presence("rooted-ghost", "offline")
+    factory = _ClientFactory(
+        [
+            [_message(rec, topics=fleet), _message(offline, topics=fleet)],
+            [_message(rec, topics=fleet), _message(offline, topics=fleet)],
+            [],
+        ]
+    )
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+        topics=fleet,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.deleted == 1
+    assert report.sessions_destroyed == 1
+    _hostname, kwargs = factory.calls[2]
+    assert kwargs["identifier"] == fleet.session_client_id("rooted-ghost")
+    assert kwargs["clean_session"] is True
+    assert [c.args for c in factory.clients[2].publish.await_args_list] == [
+        (fleet.presence("rooted-ghost"), b""),
+        (fleet.registry("rooted-ghost"), b""),
     ]
     _assert_gc_identities(report)
 

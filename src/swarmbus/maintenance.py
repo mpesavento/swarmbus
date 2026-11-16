@@ -624,7 +624,9 @@ class RegistryMaintenance:
                         if destroy_session:
                             # A stable session is destroyed only with positive offline evidence.
                             async with self._new_client(
-                                identifier=f"swarmbus-{record.agent_id}",
+                                identifier=self.topics.session_client_id(
+                                    record.agent_id
+                                ),
                                 clean_session=True,
                             ) as agent_client:
                                 await agent_client.publish(
@@ -1017,7 +1019,7 @@ class RegistryMaintenance:
         presence_deleted = False
         try:
             async with self._new_client(
-                identifier=f"swarmbus-{agent_id}",
+                identifier=self.topics.session_client_id(agent_id),
                 clean_session=True,
             ) as client:
                 await client.publish(

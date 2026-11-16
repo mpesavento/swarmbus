@@ -30,6 +30,12 @@
       "description": "Port of the MQTT broker. Leave empty to use [broker] port from ~/.swarmbus/config.ini, else 1883.",
       "default": ""
     },
+    "topic_root": {
+      "type": "string",
+      "title": "Topic root",
+      "description": "Topic root of the swarm this agent joins, e.g. fleet. Leave empty to use [broker] topic_root from ~/.swarmbus/config.ini, else the unrooted layout.",
+      "default": ""
+    },
     "broker_username": {
       "type": "string",
       "title": "Broker username",

@@ -75,6 +75,40 @@ def test_broadcast_never_picks_up_the_root():
     assert ROOTED.route("broadcast") == "agents/broadcast"
 
 
+# ---------------------------------------------------------------------------
+# agent names -- per-agent scope and persistent-session client identifier
+# ---------------------------------------------------------------------------
+
+
+def test_unrooted_agent_names_are_the_bare_agent_id():
+    topics = TopicMap()
+
+    assert topics.agent_scope("wren") == "wren"
+    assert topics.session_client_id("wren") == "swarmbus-wren"
+
+
+def test_rooted_agent_names_carry_the_root():
+    topics = TopicMap(root="fleet")
+
+    assert topics.agent_scope("wren") == "wren@fleet"
+    assert topics.session_client_id("wren") == "swarmbus-wren@fleet"
+
+
+def test_a_multi_level_root_stays_one_token():
+    topics = TopicMap(root="fleet/prod")
+
+    assert topics.agent_scope("wren") == "wren@fleet%2Fprod"
+    assert topics.session_client_id("wren") == "swarmbus-wren@fleet%2Fprod"
+
+
+def test_a_root_cannot_forge_the_scope_separator():
+    """An encoded ``@`` keeps the split back into (agent id, root) unique."""
+    topics = TopicMap(root="x@y")
+
+    assert topics.agent_scope("wren") == "wren@x%40y"
+    assert topics.session_client_id("wren") == "swarmbus-wren@x%40y"
+
+
 def test_root_normalisation_strips_slashes_and_whitespace():
     for raw in ("foo", "/foo", "foo/", "/foo/", "  foo  "):
         assert TopicMap(root=raw).inbox("wren") == "foo/agents/wren/inbox"

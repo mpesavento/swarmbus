@@ -6,11 +6,25 @@ set -euo pipefail
 
 AGENT_ID="${1:-}"
 BROKER="${2:-localhost}"
+TOPIC_ROOT="${3:-}"
+TOPIC_ROOT_GIVEN=""
+# A given-but-empty root means the unrooted layout, so presence is read from
+# the argument count rather than from the value.
+if [ "$#" -ge 3 ]; then
+  TOPIC_ROOT_GIVEN="1"
+fi
 
 if [ -z "$AGENT_ID" ]; then
-  echo "Usage: $0 <agent-id> [broker-host]"
-  echo "  Example: $0 planner localhost"
+  echo "Usage: $0 <agent-id> [broker-host] [topic-root]"
+  echo "  Example: $0 planner localhost fleet"
   exit 1
+fi
+
+MCP_ARGS=(mcp-server --agent-id "$AGENT_ID" --broker "$BROKER")
+ROOT_NOTE=""
+if [ -n "$TOPIC_ROOT_GIVEN" ]; then
+  MCP_ARGS+=("--topic-root=$TOPIC_ROOT")
+  ROOT_NOTE=", topic root '$TOPIC_ROOT'"
 fi
 
 CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -21,7 +35,7 @@ if [ -f "$PLUGINS_JSON" ] && grep -q '"swarmbus@' "$PLUGINS_JSON"; then
 fi
 
 if ! command -v claude >/dev/null 2>&1; then
-  echo "ERROR: 'claude' not on PATH. Register by hand: claude mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id $AGENT_ID --broker $BROKER" >&2
+  echo "ERROR: 'claude' not on PATH. Register by hand: claude mcp add --scope user swarmbus -- swarmbus ${MCP_ARGS[*]}" >&2
   exit 1
 fi
 
@@ -32,8 +46,8 @@ SKILL_DST="$CLAUDE_DIR/skills/using-swarmbus"
 
 # `claude mcp add` fails when the name already exists at this scope; a first run has nothing to remove.
 claude mcp remove --scope user swarmbus >/dev/null 2>&1 || true
-claude mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id "$AGENT_ID" --broker "$BROKER"
-echo "[swarmbus] Registered MCP sidecar for agent-id $AGENT_ID (broker $BROKER) at user scope (~/.claude.json)"
+claude mcp add --scope user swarmbus -- swarmbus "${MCP_ARGS[@]}"
+echo "[swarmbus] Registered MCP sidecar for agent-id $AGENT_ID (broker $BROKER${ROOT_NOTE}) at user scope (~/.claude.json)"
 
 # Install the behavioral skill so Claude Code knows when/how to use the tools.
 if [ -d "$SKILL_SRC" ]; then

@@ -14,6 +14,12 @@ A non-empty ``root`` prefixes the agent and registry trees, e.g.
 ``TopicMap(root="foo")`` yields ``foo/agents/alice/inbox`` and
 ``foo/swarmbus/registry/alice``.
 
+The map also names the agent itself: ``agent_scope`` is an agent's name on
+this bus (``alice`` unrooted, ``alice@foo`` under ``foo``) and
+``session_client_id`` is the MQTT client identifier of its persistent
+session. Both carry the root, so one agent id can hold a persistent session
+under each of two roots on the same broker.
+
 ``broadcast`` is DELIBERATELY NOT ROOTED. Broadcasts are bus-wide by
 design: every agent on the broker sees them regardless of which namespace
 it lives under. Do not "fix" this asymmetry.
@@ -34,6 +40,7 @@ See the comments on the parsers below before touching them.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import quote
 
 from .message import _validate_agent_id
 
@@ -45,6 +52,9 @@ REGISTRY_SEGMENT = "swarmbus/registry"
 INBOX_LEAF = "inbox"
 #: Leaf of a per-agent presence topic.
 PRESENCE_LEAF = "presence"
+#: Separates an agent id from its root in an agent scope. Cannot occur in a
+#: valid agent id, so a scope splits back into its two parts one way only.
+SCOPE_SEPARATOR = "@"
 #: The ``to`` sentinel on a message envelope that means "everyone".
 BROADCAST_AGENT_ID = "broadcast"
 #: Bus-wide broadcast topic. Never carries a root -- see the module docstring.
@@ -190,6 +200,32 @@ class TopicMap:
         else is a directed inbox delivery.
         """
         return self.broadcast if to == BROADCAST_AGENT_ID else self.inbox(to)
+
+    # ------------------------------------------------------------------
+    # agent names
+    # ------------------------------------------------------------------
+
+    def agent_scope(self, agent_id: str) -> str:
+        """Name of one agent on this bus, for anything keyed per agent.
+
+        The bare ``agent_id`` under the empty root, so an unrooted
+        deployment keeps every name it has today. Otherwise the root is
+        percent-encoded with nothing left safe, which keeps the result a
+        single token -- usable as a file name and as one MQTT topic level --
+        and keeps the split back into agent id and root unambiguous.
+        """
+        if not self.root:
+            return agent_id
+        return f"{agent_id}{SCOPE_SEPARATOR}{quote(self.root, safe='')}"
+
+    def session_client_id(self, agent_id: str) -> str:
+        """MQTT client identifier of this agent's persistent session here.
+
+        One identifier is one broker session: without the root, the same
+        agent id persistent under two roots would be a single session, and
+        each receiver would disconnect the other.
+        """
+        return f"swarmbus-{self.agent_scope(agent_id)}"
 
     # ------------------------------------------------------------------
     # subscribe filters

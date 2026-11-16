@@ -1548,7 +1548,7 @@ async def test_doctor_lists_each_daemon_socket(tmp_path):
     assert "local daemons" in listed.output
     assert (
         f"loom.sock: pid {os.getpid()}, swarmbus {swarmbus.__version__}, "
-        "agent loom"
+        "agent loom, root (none)"
     ) in listed.output
     assert "old.sock: no daemon answers" in listed.output
     assert "(none in" in none.output

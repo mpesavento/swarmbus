@@ -4,7 +4,7 @@
       "command": "sh",
       "args": [
         "-c",
-        "command -v swarmbus >/dev/null 2>&1 || { echo 'swarmbus is not installed (no swarmbus command on PATH). Install it with: uv tool install \"swarmbus-py[mcp]\" and restart Claude Code.' >&2; exit 127; }; exec swarmbus \"$@\"",
+        "command -v swarmbus >/dev/null 2>&1 || { echo 'swarmbus is not installed (no swarmbus command on PATH). Install it with: uv tool install \"swarmbus-py[mcp]\" and restart Claude Code.' >&2; exit 127; }; [ -n \"$SWARMBUS_PLUGIN_TOPIC_ROOT\" ] && set -- \"$@\" \"--topic-root=$SWARMBUS_PLUGIN_TOPIC_ROOT\"; exec swarmbus \"$@\"",
         "swarmbus",
         "mcp-attach",
         "--agent-id", "${user_config.agent_id}",
@@ -15,7 +15,8 @@
       ],
       "env": {
         "SWARMBUS_BROKER_USERNAME": "${user_config.broker_username}",
-        "SWARMBUS_BROKER_PASSWORD": "${user_config.broker_password}"
+        "SWARMBUS_BROKER_PASSWORD": "${user_config.broker_password}",
+        "SWARMBUS_PLUGIN_TOPIC_ROOT": "${user_config.topic_root}"
       }
     }
   }

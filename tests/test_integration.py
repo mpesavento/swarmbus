@@ -1221,6 +1221,80 @@ async def test_durable_session_queues_message_until_reconnect(
 
 
 @pytest.mark.asyncio
+async def test_two_topic_roots_keep_one_agent_ids_sessions_apart(
+    mosquitto_broker,
+):
+    """One agent id, persistent under two roots on one broker: each session
+    keeps its own queue. The multi-level root also proves the broker accepts
+    a client identifier carrying ``@`` and ``%``."""
+    host, port = mosquitto_broker
+    agent_id = "twin-root-receiver"
+    roots = {
+        "to-prod": TopicMap(root="fleet/prod"),
+        "to-lab": TopicMap(root="lab"),
+    }
+    buses = {
+        subject: AgentBus(
+            agent_id=agent_id,
+            broker=host,
+            port=port,
+            persistent=True,
+            topics=topics,
+        )
+        for subject, topics in roots.items()
+    }
+
+    try:
+        # Subscribe both sessions before publishing: the broker queues QoS1
+        # mail against a subscription made on an earlier connection.
+        for bus in buses.values():
+            assert await bus.watch_inbox(timeout=0.2) is None
+
+        async with aiomqtt.Client(host, port=port) as publisher:
+            # Reverse order: one shared session would hand the first receiver
+            # the other root's message.
+            for subject in reversed(list(buses)):
+                await publisher.publish(
+                    roots[subject].inbox(agent_id),
+                    AgentMessage.create(
+                        from_="sender",
+                        to=agent_id,
+                        subject=subject,
+                        body="belongs to one root only",
+                    ).to_json(),
+                    qos=1,
+                    retain=False,
+                )
+
+        delivered = await asyncio.gather(
+            *(bus.watch_inbox(timeout=5.0) for bus in buses.values())
+        )
+
+        assert [msg["subject"] for msg in delivered] == list(buses)
+    finally:
+        for topics in roots.values():
+            async with aiomqtt.Client(
+                host,
+                port=port,
+                identifier=topics.session_client_id(agent_id),
+                clean_session=True,
+            ):
+                pass
+        await _clear_retained(
+            host,
+            port,
+            [
+                topic
+                for topics in roots.values()
+                for topic in (
+                    topics.presence(agent_id),
+                    topics.registry(agent_id),
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
 async def test_transient_durable_shutdown_destroys_queued_session(
     mosquitto_broker,
     tmp_path,
@@ -1493,6 +1567,85 @@ async def test_registry_forget_destroys_queued_durable_session(
             [
                 DEFAULT_TOPICS.registry(agent_id),
                 DEFAULT_TOPICS.presence(agent_id),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_registry_forget_spares_the_same_id_under_another_root(
+    mosquitto_broker,
+):
+    """Forget retires one root's identity only: a live session for the same
+    agent id under another root keeps its queued mail."""
+    host, port = mosquitto_broker
+    agent_id = "cross-root-survivor"
+    live = TopicMap(root="fleet")
+    retired = TopicMap(root="lab")
+    bus = AgentBus(
+        agent_id=agent_id,
+        broker=host,
+        port=port,
+        persistent=True,
+        topics=live,
+    )
+
+    try:
+        assert await bus.watch_inbox(timeout=0.2) is None
+
+        async with aiomqtt.Client(host, port=port) as publisher:
+            await publisher.publish(
+                live.inbox(agent_id),
+                AgentMessage.create(
+                    from_="sender",
+                    to=agent_id,
+                    subject="queued",
+                    body="must outlive another root's forget",
+                ).to_json(),
+                qos=1,
+                retain=False,
+            )
+            # Offline evidence under the retired root only, so forget there
+            # takes its normal interlock path.
+            await publisher.publish(
+                retired.presence(agent_id),
+                PresenceRecord(agent_id=agent_id, state="offline").to_json(),
+                qos=1,
+                retain=True,
+            )
+
+        maintenance = RegistryMaintenance(
+            broker=host,
+            port=port,
+            snapshot_seconds=0.2,
+            topics=retired,
+        )
+        report = await maintenance.forget(agent_id)
+
+        assert report.session_destroyed is True
+
+        delivered = await bus.watch_inbox(timeout=5.0)
+
+        assert delivered is not None
+        assert delivered["subject"] == "queued"
+    finally:
+        for topics in (live, retired):
+            async with aiomqtt.Client(
+                host,
+                port=port,
+                identifier=topics.session_client_id(agent_id),
+                clean_session=True,
+            ):
+                pass
+        await _clear_retained(
+            host,
+            port,
+            [
+                topic
+                for topics in (live, retired)
+                for topic in (
+                    topics.presence(agent_id),
+                    topics.registry(agent_id),
+                )
             ],
         )
 

@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .topics import TopicMap
+
 
 class ConfigError(Exception):
     """A config file that cannot be used. The message always names the file."""
@@ -38,7 +40,7 @@ _KEYS: dict[tuple[str, str], tuple[str, str]] = {
     ("broker", "client_cert"): ("client_cert", "path"),
     ("broker", "client_key"): ("client_key", "path"),
     ("broker", "tls"): ("tls", "boolean"),
-    ("broker", "topic_root"): ("topic_root", "string"),
+    ("broker", "topic_root"): ("topic_root", "topic_root"),
     ("agent", "id"): ("agent_id", "string"),
     ("agent", "state_dir"): ("state_dir", "path"),
     ("agent", "inbox"): ("inbox", "path"),
@@ -60,6 +62,10 @@ _KIND_WORDS = {
     "integer": "an integer >= 0",
     "number": "a number >= 0",
     "boolean": "one of 1/yes/true/on or 0/no/false/off",
+    "topic_root": (
+        "a topic prefix with no MQTT wildcard (+ or #), no leading $ and no "
+        "empty segment (//)"
+    ),
 }
 
 
@@ -90,6 +96,11 @@ def _convert(kind: str, value: str):
         return real
     if kind == "boolean":
         return configparser.ConfigParser.BOOLEAN_STATES[value.lower()]
+    if kind == "topic_root":
+        # Normalizing here keeps a root from the file identical to the same
+        # root from the flag, and turns an unusable one into a config error
+        # instead of a complaint about a flag the user never passed.
+        return TopicMap(root=value).root
     raise AssertionError(kind)
 
 

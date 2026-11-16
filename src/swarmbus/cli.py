@@ -14,9 +14,10 @@ from pathlib import Path
 
 import aiomqtt
 import click
+from click.core import ParameterSource
 from pydantic import ValidationError
 
-from .archive import SQLiteMessageStore
+from .archive import SQLiteMessageStore, state_db_path
 from .bus import DEFAULT_OUTBOX_KEEP, DEFAULT_OUTBOX_MAX_BYTES, AgentBus
 from .config import ConfigError, LoadedConfig, load_config
 from .handlers.file_bridge import FileBridgeHandler
@@ -162,14 +163,26 @@ def _broker_auth_options(func):
     return func
 
 
-_TOPICS_META_KEY = "swarmbus.topics"
+_TOPIC_ROOT_ENVVAR = "SWARMBUS_TOPIC_ROOT"
 
 
-def _resolve_topic_root(ctx, _param, value):
+def _resolve_topic_root(ctx, param, value) -> str:
+    """Normalize the root and hand the command a usable string."""
+    source = ctx.get_parameter_source(param.name)
+    # Click's env lookup treats an empty variable as unset, so an exported
+    # empty root would otherwise lose to one in the config file. Read it as
+    # the request it is -- the unrooted layout -- while the flag still wins.
+    if source is not ParameterSource.COMMANDLINE and (
+        os.environ.get(_TOPIC_ROOT_ENVVAR) == ""
+    ):
+        return ""
     try:
-        ctx.meta[_TOPICS_META_KEY] = TopicMap(root=value)
+        return TopicMap(root=value).root
     except ValueError as exc:
-        raise click.BadParameter(str(exc)) from exc
+        # Name where the value came from: a root out of the environment is
+        # not a flag the user can see on the command line.
+        hint = _TOPIC_ROOT_ENVVAR if source is ParameterSource.ENVIRONMENT else None
+        raise click.BadParameter(str(exc), param_hint=hint) from exc
 
 
 def _topic_root_option(func):
@@ -179,30 +192,20 @@ def _topic_root_option(func):
     the root: a command left without it publishes and subscribes in a
     namespace nobody else is in, and MQTT reports no error for that. An
     explicit empty value selects the unrooted layout, even over a root set
-    in the config file.
+    in the config file, and so does an empty SWARMBUS_TOPIC_ROOT.
     """
     return click.option(
         "--topic-root",
         default="",
-        envvar="SWARMBUS_TOPIC_ROOT",
+        envvar=_TOPIC_ROOT_ENVVAR,
         callback=_resolve_topic_root,
-        expose_value=False,
         help="Namespace prefix for the agent and registry topics, e.g. "
              "'fleet' gives fleet/agents/<id>/inbox. Empty (the default) "
-             "keeps the unrooted layout. Broadcast is never rooted. Every "
-             "swarmbus process on a broker must use the same root. "
-             "[env: SWARMBUS_TOPIC_ROOT]",
+             "keeps the unrooted layout, and an empty SWARMBUS_TOPIC_ROOT "
+             "selects it even when the config file sets a root. Broadcast "
+             "is never rooted. Every swarmbus process on a broker must use "
+             "the same root. [env: SWARMBUS_TOPIC_ROOT]",
     )(func)
-
-
-def _configured_topics() -> TopicMap:
-    """The topic map --topic-root resolved for the running command."""
-    return click.get_current_context().meta[_TOPICS_META_KEY]
-
-
-def _state_db_path(state_dir: str, agent_id: str) -> Path:
-    """Path of this agent's SQLite state db (inbox, holds, admitted ids)."""
-    return Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
 
 
 def _state_dir_option(func):
@@ -211,7 +214,8 @@ def _state_dir_option(func):
         default="~/.local/state/swarmbus",
         envvar="SWARMBUS_STATE_DIR",
         show_default=True,
-        help="Directory for the agent's SQLite state db. [env: SWARMBUS_STATE_DIR]",
+        help="Directory for the agent's SQLite state db, one file per agent "
+             "and topic root. [env: SWARMBUS_STATE_DIR]",
     )(func)
 
 
@@ -387,6 +391,7 @@ def send(
     force: bool,
     hop_limit: int,
     state_dir: str,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -423,6 +428,7 @@ def send(
             f"SWARMBUS_HOPS must be a non-negative integer, got {env_hops!r}"
         )
 
+    topics = TopicMap(root=topic_root)
     # Building the bus validates --agent-id before a path is built from it.
     bus = AgentBus(
         agent_id=agent_id,
@@ -434,13 +440,13 @@ def send(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        topics=_configured_topics(),
+        topics=topics,
     )
 
     parent_id = in_reply_to or os.environ.get("SWARMBUS_ID") or None
     local = None
     if parent_id:
-        db = _state_db_path(state_dir, agent_id)
+        db = state_db_path(state_dir, agent_id, topics)
         if db.exists():
             try:
                 local = asyncio.run(SQLiteMessageStore(db).lookup(parent_id))
@@ -524,8 +530,8 @@ def send(
     default=True,
     show_default=True,
     help="Use an MQTT persistent session so queued QoS1 messages survive "
-         "daemon restarts. Disable only if another process holds the same "
-         "`swarmbus-<id>` client identifier.",
+         "daemon restarts. Disable only if another process holds this "
+         "agent's persistent session on this topic root.",
 )
 @_state_dir_option
 @_hop_limit_option
@@ -546,6 +552,7 @@ def start(
     rate_limit: int,
     rate_cooldown: float,
     on_trip: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -556,8 +563,8 @@ def start(
     """Start the swarmbus listener daemon."""
     from . import __version__
 
-    holds_db = _state_db_path(state_dir, agent_id)
-    topics = _configured_topics()
+    topics = TopicMap(root=topic_root)
+    holds_db = state_db_path(state_dir, agent_id, topics)
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -640,6 +647,7 @@ def read(
     as_json: bool,
     state_dir: str,
     hop_limit: int,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -656,8 +664,10 @@ def read(
     `swarmbus start --agent-id <me> --inbox <path>`.
 
     Messages past the hop limit are held and left out; every message read
-    is recorded in <state-dir>/<agent-id>.sqlite3 so a later
-    `swarmbus send --in-reply-to <id>` counts from it.
+    is recorded in the state db of this agent on this topic root
+    (<state-dir>/<agent-id>.sqlite3 unrooted, <agent-id>@<root>.sqlite3
+    under a root) so a later `swarmbus send --in-reply-to <id>` counts
+    from it.
 
     Exit 0 on success, including an empty inbox; exit 2 on broker or state
     db error.
@@ -666,7 +676,8 @@ def read(
     swarmbus read --agent-id planner
     swarmbus read --agent-id planner --json | jq '.[] | .subject'
     """
-    holds_db = _state_db_path(state_dir, agent_id)
+    topics = TopicMap(root=topic_root)
+    holds_db = state_db_path(state_dir, agent_id, topics)
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -678,7 +689,7 @@ def read(
         client_cert=client_cert,
         client_key=client_key,
         hold_store=SQLiteMessageStore(holds_db, hop_limit=hop_limit),
-        topics=_configured_topics(),
+        topics=topics,
     )
     try:
         messages = asyncio.run(bus.read_inbox(max_messages=max_messages))
@@ -720,8 +731,9 @@ def read(
     help="Use an MQTT persistent session so the broker queues messages for "
          "this agent id while no watch is connected. Each run prints the "
          "oldest queued message; the first run only registers the session. "
-         "Only one client per agent id can hold the session -- do not "
-         "combine with a running daemon or `mcp-server --persistent`.",
+         "Only one client per agent id on a topic root can hold the session "
+         "-- do not combine with a running daemon or `mcp-server "
+         "--persistent` on that root.",
 )
 @_state_dir_option
 @_hop_limit_option
@@ -741,6 +753,7 @@ def watch(
     rate_limit: int,
     rate_cooldown: float,
     on_trip: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -769,7 +782,8 @@ def watch(
     swarmbus watch --agent-id planner --timeout 60
     swarmbus watch --agent-id planner --persistent --timeout 60
     """
-    holds_db = _state_db_path(state_dir, agent_id)
+    topics = TopicMap(root=topic_root)
+    holds_db = state_db_path(state_dir, agent_id, topics)
     bus = AgentBus(
         agent_id=agent_id,
         broker=broker,
@@ -788,7 +802,7 @@ def watch(
             rate_cooldown=rate_cooldown,
         ),
         trip_alerter=_trip_alerter(on_trip, agent_id, "watch"),
-        topics=_configured_topics(),
+        topics=topics,
     )
     try:
         msg = asyncio.run(bus.watch_inbox(timeout=timeout))
@@ -824,6 +838,7 @@ def list_agents_cmd(
     broker: str,
     port: int,
     as_json: bool,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -846,7 +861,7 @@ def list_agents_cmd(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        topics=_configured_topics(),
+        topics=TopicMap(root=topic_root),
     )
     try:
         agents = asyncio.run(bus.list_agents())
@@ -1103,8 +1118,22 @@ def _doctor_channel(db: Path, agent_id: str, window_minutes: int) -> tuple[str, 
     return (text, "ok", None)
 
 
-def _doctor_local_daemons(state_dir: str) -> list[tuple[str, str, str | None]]:
-    """One row per `*.sock` in the state dir: who answers on it, or that nobody does."""
+def _root_label(root: str | None) -> str:
+    """How a topic root reads in a report: the unrooted layout has no name."""
+    if root is None:
+        return "?"
+    return root or "(none)"
+
+
+def _doctor_local_daemons(
+    state_dir: str, agent_id: str, topics: TopicMap
+) -> list[tuple[str, str, str | None]]:
+    """One row per `*.sock` in the state dir: who answers on it, or that nobody does.
+
+    A daemon for `agent_id` on another root is a warning: this doctor run
+    reports on a namespace that daemon is not in, and the broker reports
+    nothing about the difference.
+    """
     from . import __version__
 
     prefix = "local daemons..........."
@@ -1131,17 +1160,71 @@ def _doctor_local_daemons(state_dir: str) -> list[tuple[str, str, str | None]]:
         pid = info.get("pid", "?")
         version = info.get("version", "?")
         settings = info.get("settings")
-        agent = settings.get("agent_id", "?") if isinstance(settings, dict) else "?"
-        label = f"{prefix} {path.name}: pid {pid}, swarmbus {version}, agent {agent}"
+        if isinstance(settings, dict):
+            agent = settings.get("agent_id", "?")
+            daemon_root = settings.get("topic_root", "")
+        else:
+            agent = "?"
+            daemon_root = None
+        label = (
+            f"{prefix} {path.name}: pid {pid}, swarmbus {version}, "
+            f"agent {agent}, root {_root_label(daemon_root)}"
+        )
+        problems: list[str] = []
+        hints: list[str] = []
         if version != __version__:
-            rows.append((
-                f"{label} (this CLI is {__version__})",
-                "warn",
-                f"kill {pid}  (the next session starts a daemon on the new code)",
-            ))
+            problems.append(f"this CLI is {__version__}")
+            hints.append(
+                f"kill {pid}  (the next session starts a daemon on the new code)"
+            )
+        if agent == agent_id and daemon_root is not None and daemon_root != topics.root:
+            problems.append(f"this run uses root {_root_label(topics.root)}")
+            hints.append(
+                f"swarmbus doctor --agent-id {agent_id} --topic-root "
+                f"{shlex.quote(daemon_root)}, or kill {pid} if that daemon "
+                f"belongs on root {_root_label(topics.root)}"
+            )
+        if problems:
+            rows.append((f"{label} ({'; '.join(problems)})", "warn", "; ".join(hints)))
         else:
             rows.append((label, "ok", None))
     return rows
+
+
+def _doctor_unrooted_leftovers(
+    state_dir: str, agent_id: str, topics: TopicMap
+) -> list[tuple[str, str, str | None]]:
+    """Messages stranded in the unrooted state db of a rooted run.
+
+    Returns no row for an unrooted run, an absent db or an empty inbox, and
+    never creates the db.
+    """
+    if not topics.root:
+        return []
+    try:
+        # An unvalidated id is not a file name: it could name a path
+        # outside the state dir.
+        _validate_agent_id(agent_id)
+    except ValueError:
+        return []
+    db = state_db_path(state_dir, agent_id)
+    if not db.exists():
+        return []
+    prefix = "unrooted state db......."
+    try:
+        pending = asyncio.run(SQLiteMessageStore(db).pending_inbox_count())
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        return [(f"{prefix} cannot read {db}: {sanitize_field(exc)}", "warn", None)]
+    if not pending:
+        return []
+    return [(
+        f"{prefix} {pending} unacknowledged message(s) in {db}",
+        "warn",
+        f"they were delivered under the unrooted layout and {agent_id} on "
+        f"root {topics.root} cannot see them; an MCP sidecar for "
+        f"{agent_id} started with --topic-root '' reads and acknowledges "
+        f"them, or delete the file if they are not wanted",
+    )]
 
 
 def _doctor_claude_registration() -> tuple[str, str, str | None]:
@@ -1222,6 +1305,7 @@ def doctor(
     port: int,
     state_dir: str,
     window: int,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1231,8 +1315,11 @@ def doctor(
 ) -> None:
     """Run a self-diagnosis of the local swarmbus install + daemon state.
 
-    Prints a checklist of 10 probes plus one line per daemon socket in
-    --state-dir: CLI version, broker reachability, my
+    Prints a checklist of 10 probes, one line per daemon socket in
+    --state-dir (with the topic root each daemon runs on), and, on a
+    rooted run, one line for messages left unacknowledged in the unrooted
+    state db of the same agent id. The probes: CLI version, broker
+    reachability, my
     systemd unit state, daemon library freshness (catches stale in-memory
     Python — the root cause of the 2026-04-14 priority-field incident),
     --invoke wired, outbox env resolvable, peer discovery, tripped senders
@@ -1259,6 +1346,7 @@ def doctor(
         click.echo("[doctor] pass --agent-id <me> to proceed.", err=True)
         sys.exit(2)
 
+    topics = TopicMap(root=topic_root)
     results: list[tuple[str, str, str | None]] = []
     # Each tuple: (label, status, fix_hint). status ∈ {"ok","warn","fail","skip"}
 
@@ -1282,7 +1370,7 @@ def doctor(
             username=username, password=password,
             tls=tls, ca_cert=ca_cert,
             client_cert=client_cert, client_key=client_key,
-            topics=_configured_topics(),
+            topics=topics,
         )
 
         async def _probe_broker():
@@ -1461,7 +1549,7 @@ def doctor(
             ca_cert=ca_cert,
             client_cert=client_cert,
             client_key=client_key,
-            topics=_configured_topics(),
+            topics=topics,
         )
         peers = asyncio.run(bus.list_agents())
         if agent_id_resolved in peers:
@@ -1492,7 +1580,8 @@ def doctor(
         ))
     else:
         results.append(_doctor_holds(
-            _state_db_path(state_dir, agent_id_resolved), agent_id_resolved,
+            state_db_path(state_dir, agent_id_resolved, topics),
+            agent_id_resolved,
         ))
 
     # 9. Channel traffic
@@ -1505,14 +1594,18 @@ def doctor(
         ))
     else:
         results.append(_doctor_channel(
-            _state_db_path(state_dir, agent_id_resolved), agent_id_resolved, window,
+            state_db_path(state_dir, agent_id_resolved, topics),
+            agent_id_resolved, window,
         ))
 
     # 10. Claude Code registration
     results.append(_doctor_claude_registration())
 
     # Local mcp-daemon sockets, one line each (after 1-10 so those keep their numbers)
-    results.extend(_doctor_local_daemons(state_dir))
+    results.extend(_doctor_local_daemons(state_dir, agent_id_resolved, topics))
+    results.extend(
+        _doctor_unrooted_leftovers(state_dir, agent_id_resolved, topics)
+    )
 
     # Render
     click.echo(f"\n[doctor] swarmbus health check for agent-id={agent_id_resolved}\n")
@@ -1647,6 +1740,7 @@ def registry_list(
     stale_after_seconds: float,
     snapshot_seconds: float,
     password_file: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1666,7 +1760,7 @@ def registry_list(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        topics=_configured_topics(),
+        topics=TopicMap(root=topic_root),
         snapshot_seconds=snapshot_seconds,
     )
     report = asyncio.run(
@@ -1727,6 +1821,7 @@ def registry_gc(
     snapshot_seconds: float,
     delete: bool,
     password_file: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1746,7 +1841,7 @@ def registry_gc(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        topics=_configured_topics(),
+        topics=TopicMap(root=topic_root),
         snapshot_seconds=snapshot_seconds,
     )
     report = asyncio.run(
@@ -1814,6 +1909,7 @@ def registry_forget(
     dry_run: bool,
     yes: bool,
     password_file: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -1839,7 +1935,7 @@ def registry_forget(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        topics=_configured_topics(),
+        topics=TopicMap(root=topic_root),
         snapshot_seconds=snapshot_seconds,
     )
     result = asyncio.run(
@@ -1931,11 +2027,12 @@ def _mcp_runtime_options(func):
         default=False,
         show_default=True,
         help="Use an MQTT persistent session so queued QoS1 messages survive "
-             "between runtime restarts. Only one client per agent-id can hold "
-             "the session -- do not run more than one of `mcp-daemon "
-             "--persistent`, `mcp-server --persistent`, `start` or `watch "
-             "--persistent` for one id; the broker evicts whichever connected "
-             "first. Requires --presence, so the queued identity stays "
+             "between runtime restarts. Only one client per agent id on a "
+             "topic root can hold the session -- do not run more than one of "
+             "`mcp-daemon --persistent`, `mcp-server --persistent`, `start` or "
+             "`watch --persistent` for one id and root; the broker evicts "
+             "whichever connected first. Requires --presence, so the queued "
+             "identity stays "
              "discoverable and retirable. Independent of --lifecycle, which "
              "governs the directory record rather than the MQTT session.",
     )(func)
@@ -1986,6 +2083,7 @@ def mcp_server(
     rate_limit: int,
     rate_cooldown: float,
     on_trip: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -2023,7 +2121,7 @@ def mcp_server(
         ca_cert=ca_cert,
         client_cert=client_cert,
         client_key=client_key,
-        topics=_configured_topics(),
+        topics=TopicMap(root=topic_root),
     )
 
 
@@ -2053,6 +2151,7 @@ def mcp_daemon(
     rate_limit: int,
     rate_cooldown: float,
     on_trip: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -2090,7 +2189,7 @@ def mcp_daemon(
             rate_limit=rate_limit,
             rate_cooldown=rate_cooldown,
             on_trip=shlex.split(on_trip) if on_trip and on_trip.strip() else None,
-            topics=_configured_topics(),
+            topics=TopicMap(root=topic_root),
         )
     except LocalRPCOwnershipError as exc:
         raise click.UsageError(str(exc)) from exc
@@ -2137,8 +2236,9 @@ def _mcp_daemon_argv(
 
     Never carries the broker password: it reaches the daemon through its
     environment only. `sys.executable` runs the daemon on this attach's
-    swarmbus version. The topic root is always passed, empty included, so
-    the daemon's own environment or config file cannot give it another one.
+    swarmbus version. The topic root is always passed, empty included and as
+    one `--topic-root=<root>` token, so the daemon's own environment or
+    config file cannot give it another one.
     """
     argv = [
         sys.executable, "-c", "from swarmbus.cli import main; main()",
@@ -2157,7 +2257,7 @@ def _mcp_daemon_argv(
         "--rate-limit", str(rate_limit),
         "--rate-cooldown", str(rate_cooldown),
         "--tls" if tls else "--no-tls",
-        "--topic-root", topic_root,
+        f"--topic-root={topic_root}",
     ]
     for capability in capabilities:
         argv += ["--capability", capability]
@@ -2181,8 +2281,9 @@ def _mcp_daemon_argv(
     "socket_path",
     default=None,
     type=click.Path(dir_okay=False, path_type=str),
-    help="Private AF_UNIX socket of the shared mcp-daemon. "
-         "Default: <state-dir>/<agent-id>.sock",
+    help="Private AF_UNIX socket of the shared mcp-daemon. Used as given. "
+         "Default: <state-dir>/<agent-id>.sock, or "
+         "<state-dir>/<agent-id>@<topic-root>.sock under a root",
 )
 @_mcp_runtime_options
 def mcp_attach(
@@ -2202,6 +2303,7 @@ def mcp_attach(
     rate_limit: int,
     rate_cooldown: float,
     on_trip: str | None,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -2209,13 +2311,19 @@ def mcp_attach(
     client_key: str | None,
     tls: bool,
 ) -> None:
-    """Attach this session to the shared mcp-daemon for --agent-id, starting it if needed.
+    """Attach this session to the shared mcp-daemon for --agent-id on --topic-root, starting it if needed.
+
+    One daemon per agent id and topic root: the default socket and the
+    daemon log are named for both (<state-dir>/<agent-id>.sock and
+    .daemon.log unrooted, <agent-id>@<root>.sock and .daemon.log under a
+    root), so a session on another root starts its own daemon rather than
+    finding one in a namespace it did not ask for. An explicit --socket is
+    used as given.
 
     If no daemon answers, this starts `mcp-daemon` detached with these
-    settings and logs to <state-dir>/<agent-id>.daemon.log. It refuses a
-    running daemon whose settings or swarmbus version differ, naming the
-    fields and `kill <pid>`. Broker credentials are used only to start a
-    daemon.
+    settings. It refuses a running daemon whose settings or swarmbus
+    version differ, naming the fields and `kill <pid>`. Broker credentials
+    are used only to start a daemon.
     """
     _validate_mcp_runtime_mode(
         persistent=persistent,
@@ -2233,13 +2341,13 @@ def mcp_attach(
         )
 
     state_root = Path(state_dir).expanduser().absolute()
+    scope = TopicMap(root=topic_root).agent_scope(agent_id)
     socket = (
         Path(socket_path).expanduser().absolute()
         if socket_path
-        else state_root / f"{agent_id}.sock"
+        else state_root / f"{scope}.sock"
     )
-    log_path = state_root / f"{agent_id}.daemon.log"
-    topic_root = _configured_topics().root
+    log_path = state_root / f"{scope}.daemon.log"
     settings = daemon_settings(
         agent_id=agent_id,
         broker=broker,
@@ -2310,12 +2418,14 @@ def mcp_attach(
     help="Clear the trip or cool-down for this sender so its new messages are admitted again.",
 )
 @click.option("--reset-all", is_flag=True, help="Clear every trip.")
+@_topic_root_option
 def held(
     agent_id: str,
     state_dir: str,
     as_json: bool,
     reset_sender: str | None,
     reset_all: bool,
+    topic_root: str,
 ) -> None:
     """List senders tripped by the hop limit or cooling off after the rate limit, and the held messages, or clear a trip or cool-down.
 
@@ -2323,6 +2433,9 @@ def held(
     own; a hop-limit trip stays until a person resets it. Held messages stay
     held either way; only new messages from that sender are admitted again.
     A running daemon, sidecar or watch picks the reset up without a restart.
+
+    Reads and resets the state db of this agent on --topic-root; the same
+    agent id under another root has its own trips and held messages.
 
     \b
     swarmbus held --agent-id planner
@@ -2337,7 +2450,7 @@ def held(
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="--agent-id")
 
-    db = _state_db_path(state_dir, agent_id)
+    db = state_db_path(state_dir, agent_id, TopicMap(root=topic_root))
     if not db.exists():
         if reset_sender is not None:
             click.echo(f"[swarmbus] {sanitize_field(reset_sender)} is not tripped or cooling")
@@ -2562,6 +2675,7 @@ def _step_systemd(
     broker_addr: str,
     inbox: str,
     invoke: str | None,
+    topic_root: str,
     scripts_dir: str,
     dry_run: bool,
     *,
@@ -2579,9 +2693,13 @@ def _step_systemd(
     don't crowd the unit's ExecStart line.
     """
     label = "Systemd unit"
+    # The root is passed even when empty: the unit is pinned to what init
+    # resolved, so a later config-file edit cannot move the daemon's namespace
+    # out from under the agents already talking to it.
     cmd = [f"{scripts_dir}/install-systemd.sh", agent_id,
            "--broker", broker_addr,
-           "--inbox", inbox]
+           "--inbox", inbox,
+           "--topic-root", topic_root]
     if invoke:
         cmd += ["--invoke", invoke]
     if username:
@@ -2645,6 +2763,7 @@ def _step_plugin(
     agent_id: str,
     host_type: str,
     broker: str,
+    topic_root: str,
     scripts_dir: str,
     skip_plugin: bool,
     dry_run: bool,
@@ -2660,17 +2779,25 @@ def _step_plugin(
         return True
 
     if host_type == "cc":
-        # positional args: <agent-id> [broker-host]
-        return _run_step(label, [f"{scripts_dir}/setup-cc-plugin.sh", agent_id, broker], dry_run)
+        # positional args: <agent-id> [broker-host] [topic-root]
+        return _run_step(
+            label,
+            [f"{scripts_dir}/setup-cc-plugin.sh", agent_id, broker, topic_root],
+            dry_run,
+        )
     if host_type == "openclaw":
-        return _run_step(label, [f"{scripts_dir}/setup-openclaw-plugin.sh", agent_id, broker], dry_run)
+        return _run_step(
+            label,
+            [f"{scripts_dir}/setup-openclaw-plugin.sh", agent_id, broker, topic_root],
+            dry_run,
+        )
 
     click.echo(f"  {label} {dots} ", nl=False)
     click.echo(click.style("· skipped", fg=None))
     return True
 
 
-def _step_doctor(agent_id: str, dry_run: bool) -> bool:
+def _step_doctor(agent_id: str, topic_root: str, dry_run: bool) -> bool:
     """Step 6: run swarmbus doctor and surface the result."""
     label = "Doctor"
     swarmbus_on_path = shutil.which("swarmbus")
@@ -2680,6 +2807,9 @@ def _step_doctor(agent_id: str, dry_run: bool) -> bool:
         # Fallback: run as a Python module. sys.executable is always a single
         # path, never a compound string, so it's safe as a list element.
         cmd = [sys.executable, "-m", "swarmbus", "doctor", "--agent-id", agent_id]
+    # One token, so an empty root reaches doctor as the unrooted layout rather
+    # than swallowing the next argument.
+    cmd.append(f"--topic-root={topic_root}")
     return _run_step(label, cmd, dry_run)
 
 
@@ -2703,6 +2833,7 @@ def _step_doctor(agent_id: str, dry_run: bool) -> bool:
 @click.option("--skip-plugin", is_flag=True, help="Skip host plugin install.")
 @click.option("--dry-run", is_flag=True, help="Print what would run without executing.")
 @click.option("--yes", is_flag=True, help="Non-interactive; accept all prompts.")
+@_topic_root_option
 @_broker_auth_options
 def init(
     agent_id: str,
@@ -2714,6 +2845,7 @@ def init(
     skip_plugin: bool,
     dry_run: bool,
     yes: bool,
+    topic_root: str,
     username: str | None,
     password: str | None,
     ca_cert: str | None,
@@ -2778,7 +2910,10 @@ def init(
         invoke = _derive_invoke(host_type, agent_id, repo_root)
 
     # --- Header
-    click.echo(f"\n[swarmbus init] agent-id={agent_id} host-type={host_type} broker={broker_addr}")
+    click.echo(
+        f"\n[swarmbus init] agent-id={agent_id} host-type={host_type} "
+        f"broker={broker_addr} topic-root={topic_root}"
+    )
     if dry_run:
         click.echo(click.style("  (dry run — no changes will be made)\n", fg="cyan"))
     else:
@@ -2823,7 +2958,7 @@ def init(
         systemd_ok = True
     else:
         systemd_ok = _step_systemd(
-            agent_id, broker_addr, resolved_inbox, invoke, scripts_dir, dry_run,
+            agent_id, broker_addr, resolved_inbox, invoke, topic_root, scripts_dir, dry_run,
             username=username, password=password,
             ca_cert=ca_cert, client_cert=client_cert, client_key=client_key,
             tls=tls,
@@ -2842,11 +2977,14 @@ def init(
         click.echo(click.style("⚠ skipped (no scripts dir; PyPI install)", fg="yellow"))
         plugin_ok = True
     else:
-        plugin_ok = _step_plugin(agent_id, host_type, broker_addr, scripts_dir or "", skip_plugin, dry_run)
+        plugin_ok = _step_plugin(
+            agent_id, host_type, broker_addr, topic_root,
+            scripts_dir or "", skip_plugin, dry_run,
+        )
     results.append(("Host plugin", plugin_ok))
 
     # --- Step 6: Doctor
-    doctor_ok = _step_doctor(agent_id, dry_run)
+    doctor_ok = _step_doctor(agent_id, topic_root, dry_run)
     results.append(("Doctor", doctor_ok))
 
     # --- Summary

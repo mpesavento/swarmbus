@@ -263,7 +263,7 @@ class ManagedMCPRuntime:
         if self._tls_context is not None:
             kwargs["tls_context"] = self._tls_context
         if self.persistent:
-            kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            kwargs["identifier"] = self.topics.session_client_id(self.agent_id)
             kwargs["clean_session"] = False
         return kwargs
 

@@ -26,12 +26,26 @@ from .message import (
     AgentMessage,
     sanitize_field,
 )
-from .topics import BROADCAST_TOPIC
+from .topics import BROADCAST_TOPIC, DEFAULT_TOPICS, TopicMap
 
 logger = logging.getLogger(__name__)
 
 _SQLITE_MAX_INTEGER = 2**63 - 1
 _MAX_PENDING_TRIPS = 256
+
+
+def state_db_path(
+    state_dir: str | Path,
+    agent_id: str,
+    topics: TopicMap = DEFAULT_TOPICS,
+) -> Path:
+    """Path of one agent's SQLite state db (inbox, holds, admitted ids).
+
+    Named for the agent scope rather than the agent id alone: the same id
+    under two roots is two agents on one broker, and one file would merge
+    their inboxes, holds and rate-limit state.
+    """
+    return Path(state_dir).expanduser() / f"{topics.agent_scope(agent_id)}.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -1301,6 +1315,25 @@ class SQLiteMessageStore:
             location = ".".join(str(part) for part in error["loc"])
             details.append(f"{location}: {error['msg']}")
         return "; ".join(details)
+
+    async def pending_inbox_count(self) -> int:
+        """How many delivered inbox rows are still waiting to be acknowledged.
+
+        Counts what `read` would offer, without deserializing a row or
+        quarantining anything, so a caller can report a backlog read-only.
+        """
+        await self._ensure_open()
+        async with self._connect() as db:
+            async with db.execute(
+                """SELECT COUNT(*) FROM inbox_messages
+                   WHERE acknowledged_at IS NULL
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM inbox_message_quarantine
+                         WHERE message_id = inbox_messages.id
+                     )"""
+            ) as cursor:
+                return (await cursor.fetchone())[0]
 
     async def read(self, max_messages: int = 10) -> list[dict]:
         """Read valid unacknowledged rows and quarantine malformed rows."""

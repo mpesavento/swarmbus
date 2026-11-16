@@ -175,7 +175,8 @@ class TestHelpShowsAllFlags:
         runner = CliRunner()
         result = runner.invoke(main, ["init", "--help"])
         for flag in ["--agent-id", "--host-type", "--broker", "--invoke",
-                     "--inbox", "--skip-broker", "--skip-plugin", "--dry-run", "--yes"]:
+                     "--inbox", "--skip-broker", "--skip-plugin", "--dry-run", "--yes",
+                     "--topic-root"]:
             assert flag in result.output, f"Missing {flag} in --help output"
 
 
@@ -411,10 +412,11 @@ class TestStepDoctor:
 
         with patch("swarmbus.cli.shutil.which", return_value="/usr/bin/swarmbus"), \
              patch("swarmbus.cli._run_step", side_effect=fake_run_step):
-            _step_doctor("sparrow", dry_run=True)
+            _step_doctor("sparrow", "fleet", dry_run=True)
 
         assert captured[0][0] == "/usr/bin/swarmbus"
         assert "--agent-id" in captured[0]
+        assert "--topic-root=fleet" in captured[0]
 
     def test_doctor_fallback_is_list_not_string(self):
         """When swarmbus not on PATH, cmd must be a proper list of strings."""
@@ -427,7 +429,7 @@ class TestStepDoctor:
 
         with patch("swarmbus.cli.shutil.which", return_value=None), \
              patch("swarmbus.cli._run_step", side_effect=fake_run_step):
-            _step_doctor("sparrow", dry_run=True)
+            _step_doctor("sparrow", "", dry_run=True)
 
         cmd = captured[0]
         # Must be a proper list — no element should contain spaces
@@ -532,3 +534,214 @@ def test_setup_cc_plugin_refuses_while_the_plugin_is_installed(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     calls = (bin_dir / "claude.calls").read_text()
     assert "mcp add --scope user swarmbus -- swarmbus mcp-server --agent-id planner --broker localhost" in calls
+
+
+# ---------------------------------------------------------------------------
+# topic root: the unit, the plugin registration and the init steps
+# ---------------------------------------------------------------------------
+
+UNIT = ".config/systemd/user/swarmbus-planner.service"
+
+
+def test_install_systemd_pins_the_unit_to_a_given_topic_root(tmp_path):
+    home = tmp_path / "rooted"
+    unit = _render_unit(home, "--topic-root", "fleet")
+    execs = [line for line in unit.splitlines() if line.startswith("ExecStart=")]
+    assert len(execs) == 1, unit
+    assert execs[0].split().count("--topic-root=fleet") == 1, execs[0]
+    doctor = (home / "bin/swarmbus.calls").read_text()
+    assert "doctor --agent-id planner --broker localhost --topic-root=fleet" in doctor
+
+
+def test_install_systemd_renders_an_explicitly_empty_topic_root(tmp_path):
+    unit = _render_unit(tmp_path / "unrooted", "--topic-root", "")
+    [exec_line] = [line for line in unit.splitlines() if line.startswith("ExecStart=")]
+    assert exec_line.split()[-1] == "--topic-root=", exec_line
+
+
+def test_install_systemd_leaves_the_root_to_the_config_file_when_not_given(tmp_path):
+    unit = _render_unit(tmp_path / "default")
+    assert "--topic-root" not in unit
+
+
+@pytest.mark.parametrize("root", ["two words", "fleet|pipe"])
+def test_install_systemd_refuses_a_root_it_cannot_render(tmp_path, root):
+    home = tmp_path / "unsafe"
+    home.mkdir(parents=True)
+    _stub_bin(home, ("swarmbus", "systemctl", "sleep"))
+
+    result = _run_script(home, "install-systemd.sh", "planner", "--topic-root", root)
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert root in result.stderr
+    assert "config.ini" in result.stderr
+    assert not (home / UNIT).exists()
+
+
+def _unit_and_calls(home):
+    """The installed unit and the systemctl stub's call log, byte for byte."""
+    return (
+        (home / UNIT).read_bytes(),
+        (home / "bin/systemctl.calls").read_bytes(),
+    )
+
+
+def test_install_systemd_refuses_to_repin_a_unit_to_another_root(tmp_path):
+    home = tmp_path / "repin"
+    _render_unit(home, "--topic-root", "fleet")
+    before = _unit_and_calls(home)
+
+    result = _run_script(home, "install-systemd.sh", "planner", "--topic-root", "lab")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "fleet" in result.stderr
+    assert "lab" in result.stderr
+    assert str(home / UNIT) in result.stderr
+    assert "one systemd unit per agent id" in result.stderr
+    # Unchanged call log means the refusal landed before any systemctl ran.
+    assert _unit_and_calls(home) == before
+
+
+def test_install_systemd_refuses_to_unpin_a_pinned_unit(tmp_path):
+    home = tmp_path / "unpin"
+    _render_unit(home, "--topic-root", "fleet")
+    before = _unit_and_calls(home)
+
+    result = _run_script(home, "install-systemd.sh", "planner")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "--topic-root fleet" in result.stderr
+    assert "config file" in result.stderr
+    assert _unit_and_calls(home) == before
+
+
+def test_install_systemd_refuses_to_root_a_unit_pinned_unrooted(tmp_path):
+    home = tmp_path / "wasunrooted"
+    _render_unit(home, "--topic-root", "")
+    before = _unit_and_calls(home)
+
+    result = _run_script(home, "install-systemd.sh", "planner", "--topic-root", "fleet")
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "(unrooted)" in result.stderr
+    assert _unit_and_calls(home) == before
+
+
+def test_install_systemd_pins_a_unit_that_carries_no_root(tmp_path):
+    # A unit rendered without a pin carries no --topic-root token at all;
+    # pinning it is the supported upgrade, not a root change to refuse.
+    home = tmp_path / "upgrade"
+    _render_unit(home)
+
+    result = _run_script(home, "install-systemd.sh", "planner", "--topic-root", "fleet")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    [exec_line] = [
+        line for line in (home / UNIT).read_text().splitlines()
+        if line.startswith("ExecStart=")
+    ]
+    assert exec_line.split().count("--topic-root=fleet") == 1, exec_line
+
+
+def test_install_systemd_reinstalls_a_unit_with_the_same_root(tmp_path):
+    home = tmp_path / "idempotent"
+    first = _render_unit(home, "--topic-root", "fleet")
+
+    result = _run_script(home, "install-systemd.sh", "planner", "--topic-root", "fleet")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (home / UNIT).read_text() == first
+
+
+def test_setup_cc_plugin_registers_a_given_topic_root(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = _stub_bin(home, ("claude",))
+
+    result = _run_script(home, "setup-cc-plugin.sh", "planner", "localhost", "fleet")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("mcp add --scope user swarmbus -- swarmbus mcp-server "
+            "--agent-id planner --broker localhost --topic-root=fleet"
+            ) in (bin_dir / "claude.calls").read_text()
+    assert "fleet" in result.stdout
+
+
+def test_setup_cc_plugin_omits_the_topic_root_when_not_given(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    bin_dir = _stub_bin(home, ("claude",))
+
+    result = _run_script(home, "setup-cc-plugin.sh", "planner", "localhost")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--topic-root" not in (bin_dir / "claude.calls").read_text()
+
+
+def _init_steps(*args):
+    """argv of every step `init` would run, with the step runner stubbed out."""
+    captured: list[list[str]] = []
+
+    def fake_run_step(label, cmd, dry_run):
+        captured.append(cmd)
+        return True
+
+    with _patch_platform(), patch("swarmbus.cli._run_step", side_effect=fake_run_step):
+        result = CliRunner().invoke(main, list(args))
+    assert result.exit_code == 0, result.output
+    return captured
+
+
+def _step(commands, needle):
+    [cmd] = [c for c in commands if needle in " ".join(c)]
+    return cmd
+
+
+def test_init_pins_the_unit_and_doctor_to_the_root_it_resolved():
+    commands = _init_steps(
+        "init", "--agent-id", "planner", "--host-type", "cc",
+        "--dry-run", "--skip-broker", "--topic-root", "fleet",
+    )
+
+    systemd = _step(commands, "install-systemd.sh")
+    assert systemd[systemd.index("--topic-root") + 1] == "fleet"
+    assert "--topic-root=fleet" in _step(commands, "doctor")
+    assert _step(commands, "setup-cc-plugin.sh")[1:] == ["planner", "localhost", "fleet"]
+
+
+def test_init_dry_run_prints_the_root_it_would_install():
+    with _patch_platform():
+        result = CliRunner().invoke(main, [
+            "init", "--agent-id", "planner", "--dry-run", "--skip-broker",
+            "--topic-root", "fleet",
+        ])
+
+    assert result.exit_code == 0, result.output
+    assert "broker=localhost topic-root=fleet" in result.output
+    lines = result.output.splitlines()
+    [install] = [line for line in lines if "install-systemd.sh" in line]
+    assert "--topic-root fleet" in install
+    [doctor] = [line for line in lines if " doctor " in line]
+    assert "--topic-root=fleet" in doctor
+
+
+def test_init_takes_the_root_from_the_config_file(tmp_path):
+    config = tmp_path / "config.ini"
+    config.write_text("[broker]\ntopic_root = fleet\n")
+
+    commands = _init_steps(
+        "--config", str(config),
+        "init", "--agent-id", "planner", "--dry-run", "--skip-broker",
+    )
+
+    systemd = _step(commands, "install-systemd.sh")
+    assert systemd[systemd.index("--topic-root") + 1] == "fleet"
+    assert "--topic-root=fleet" in _step(commands, "doctor")
+
+
+def test_init_pins_the_unit_to_the_unrooted_layout_by_default():
+    commands = _init_steps("init", "--agent-id", "planner", "--dry-run", "--skip-broker")
+
+    systemd = _step(commands, "install-systemd.sh")
+    assert systemd[systemd.index("--topic-root") + 1] == ""
+    assert "--topic-root=" in _step(commands, "doctor")

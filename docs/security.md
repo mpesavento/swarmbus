@@ -142,7 +142,7 @@ topic readwrite agents/+/presence
 topic readwrite swarmbus/registry/+
 ```
 
-- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
+- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` (`swarmbus-<id>@<root>` under a topic root) only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
 - **Literal shared rules sit under `user`.** The `%u` `pattern` lines apply to every authenticated user. Literal `topic` lines before the first `user` line apply only to anonymous clients, so the remaining shared permissions are repeated in one `user` block per agent id. Add a block when you add an agent. Mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`.
 
 ### With a topic root

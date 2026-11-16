@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Protocol
 
 import aiomqtt
 
+from .archive import state_db_path
 from .message import DEFAULT_HOP_LIMIT, DEFAULT_RATE_COOLDOWN, DEFAULT_RATE_LIMIT
 from .runtime import ManagedMCPRuntime, TransportUnavailable
 from .topics import DEFAULT_TOPICS, TopicMap
@@ -235,7 +235,6 @@ def create_managed_runtime(
     topics: TopicMap = DEFAULT_TOPICS,
 ) -> ManagedMCPRuntime:
     """Build the managed runtime shared by MCP transports."""
-    state_path = Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
     return ManagedMCPRuntime(
         agent_id=agent_id,
         broker=broker,
@@ -246,7 +245,7 @@ def create_managed_runtime(
         heartbeat_seconds=registry_heartbeat_seconds,
         stale_after_seconds=registry_stale_after_seconds,
         capabilities=capabilities,
-        state_path=state_path,
+        state_path=state_db_path(state_dir, agent_id, topics),
         username=username,
         password=password,
         tls=tls,

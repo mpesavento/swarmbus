@@ -7,10 +7,17 @@ set -euo pipefail
 
 AGENT_ID="${1:-}"
 BROKER="${2:-localhost}"
+TOPIC_ROOT="${3:-}"
+# A given-but-empty root means the unrooted layout, so presence is read from
+# the argument count rather than from the value.
+ROOT_ARG=""
+if [ "$#" -ge 3 ]; then
+  ROOT_ARG=" --topic-root=$TOPIC_ROOT"
+fi
 
 if [ -z "$AGENT_ID" ]; then
-  echo "Usage: $0 <agent-id> [broker-host]"
-  echo "  Example: $0 coder localhost"
+  echo "Usage: $0 <agent-id> [broker-host] [topic-root]"
+  echo "  Example: $0 coder localhost fleet"
   exit 1
 fi
 
@@ -62,16 +69,16 @@ no MCP sidecar needed. The agent can now use:
 To *receive* messages reactively, run the listener daemon in a
 persistent session (byobu, tmux, or systemd-user):
 
-  swarmbus start --agent-id $AGENT_ID --broker $BROKER --inbox $INBOX
+  swarmbus start --agent-id $AGENT_ID --broker $BROKER --inbox $INBOX$ROOT_ARG
 
 The daemon will:
   • announce $AGENT_ID online to the broker (retained presence)
-  • subscribe to agents/$AGENT_ID/inbox and agents/broadcast
+  • subscribe to $AGENT_ID's inbox topic and agents/broadcast
   • append every received message to $INBOX
 
 Quick byobu start:
   byobu new-session -d -s swarmbus-$AGENT_ID \\
-    "swarmbus start --agent-id $AGENT_ID --broker $BROKER --inbox $INBOX"
+    "swarmbus start --agent-id $AGENT_ID --broker $BROKER --inbox $INBOX$ROOT_ARG"
 
 Or persist across reboots with systemd-user:
   systemctl --user enable --now swarmbus-$AGENT_ID.service

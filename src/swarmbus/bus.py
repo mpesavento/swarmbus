@@ -652,7 +652,9 @@ class AgentBus:
             "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
         }
         if self.persistent:
-            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["identifier"] = self.topics.session_client_id(
+                self.agent_id
+            )
             client_kwargs["clean_session"] = False
         if self.hold_store is not None:
             # A failure propagates: better to exit than run unprotected.
@@ -801,8 +803,9 @@ class AgentBus:
         By default, opens a fresh non-persistent MQTT session per call —
         only messages sent with ``retain=True`` are visible.
 
-        When ``self.persistent`` is True, connects with a stable client
-        identifier (``swarmbus-<agent_id>``) and ``clean_session=False``.
+        When ``self.persistent`` is True, connects with the stable client
+        identifier of this agent's session on this topic root and
+        ``clean_session=False``.
         The broker queues QoS1 messages for this agent between calls and
         redelivers them on reconnect — no listener daemon required for
         persistent delivery.  Only one client can hold a persistent session
@@ -825,7 +828,9 @@ class AgentBus:
             await self.hold_store.open()
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
         if self.persistent:
-            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["identifier"] = self.topics.session_client_id(
+                self.agent_id
+            )
             client_kwargs["clean_session"] = False
         messages: list[dict] = []
         async with aiomqtt.Client(
@@ -870,10 +875,11 @@ class AgentBus:
         messages **published while this call is active**, plus any with
         ``retain=True`` on subscribe.
 
-        When ``self.persistent`` is True, connects as ``swarmbus-<agent_id>``
-        with ``clean_session=False`` and acknowledges by hand. The returned
-        message is acknowledged, every skipped malformed payload is
-        acknowledged, and nothing else is. Messages received but not
+        When ``self.persistent`` is True, connects under this agent's session
+        client identifier for this topic root with ``clean_session=False``
+        and acknowledges by hand. The returned message is acknowledged,
+        every skipped malformed payload is acknowledged, and nothing else
+        is. Messages received but not
         returned stay unacknowledged, so the broker redelivers them in
         order to the next call, one message per call. Only one client per
         agent-id can hold the session: do not run a daemon or persistent
@@ -905,7 +911,9 @@ class AgentBus:
         started_at: datetime | None = None
         if self.persistent:
             started_at = datetime.now(timezone.utc)
-            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["identifier"] = self.topics.session_client_id(
+                self.agent_id
+            )
             client_kwargs["clean_session"] = False
             client_kwargs["will"] = aiomqtt.Will(
                 topic=self.topics.presence(self.agent_id),
