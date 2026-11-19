@@ -78,9 +78,9 @@ def mosquitto_broker():
 PER_SESSION_ACL = """\
 topic readwrite #
 
-pattern read agents/%u/%c/inbox
-pattern readwrite agents/%u/%c/presence
-pattern write swarmbus/registry/%u/%c
+pattern read agents/%c/inbox
+pattern readwrite agents/%c/presence
+pattern write swarmbus/registry/%c
 
 user flock
 topic write agents/+/+/inbox

@@ -864,6 +864,7 @@ def test_only_a_two_level_address_names_a_live_session_client_id():
     assert live_session_client_id("wren") is None
     assert live_session_client_id("flock__wren") is None
     assert live_session_client_id("flock__wren", "flock__wren") is None
-    assert live_session_client_id("flock__wren", "flock/wren") == "wren"
+    assert live_session_client_id("flock__wren", "flock/wren") == "flock/wren"
+    assert live_session_client_id("roost__wren", "roost/wren") == "roost/wren"
     with pytest.raises(ValueError, match="does not belong"):
         live_session_client_id("wren", "flock/wren")

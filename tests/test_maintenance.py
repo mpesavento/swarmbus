@@ -1455,6 +1455,46 @@ async def test_forget_refuses_malformed_evidence_after_empty_snapshot():
 
 
 @pytest.mark.asyncio
+async def test_force_forget_clears_both_addresses_when_only_evidence_is_malformed():
+    malformed = _Message(
+        DEFAULT_TOPICS.registry(
+            SPLIT_ID,
+            topic_address=SPLIT_ADDRESS,
+        ),
+        b"{",
+    )
+    factory = _ClientFactory([[malformed], [malformed], []])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    result = await maintenance.forget(SPLIT_ID, force_online=True)
+
+    assert result.deleted is True
+    assert result.session_destroyed is True
+    assert [call.args for call in factory.clients[2].publish.await_args_list] == [
+        (DEFAULT_TOPICS.presence(SPLIT_ID), b""),
+        (DEFAULT_TOPICS.registry(SPLIT_ID), b""),
+        (
+            DEFAULT_TOPICS.presence(
+                SPLIT_ID,
+                topic_address=SPLIT_ADDRESS,
+            ),
+            b"",
+        ),
+        (
+            DEFAULT_TOPICS.registry(
+                SPLIT_ID,
+                topic_address=SPLIT_ADDRESS,
+            ),
+            b"",
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_forget_proceeds_on_unknown_presence_with_force_online():
     """force_online is the operator accepting an unprovable eviction."""
     now = datetime(2026, 10, 1, tzinfo=timezone.utc)
@@ -2077,6 +2117,174 @@ async def test_forget_refuses_an_agent_id_that_moved_between_its_two_reads():
     _assert_nothing_published(factory)
 
 
+def _moved_records(now):
+    old_registry = _registry(
+        SPLIT_ID,
+        now=now,
+        age_seconds=1200,
+        durability="durable",
+    )
+    new_registry = _registry(
+        SPLIT_ID,
+        now=now,
+        age_seconds=0,
+        durability="durable",
+    )
+    return [
+        _message_at(old_registry, SPLIT_ID),
+        _message_at(_presence(SPLIT_ID, "offline"), SPLIT_ID),
+        _message_at(new_registry, SPLIT_ADDRESS),
+        _message_at(_presence(SPLIT_ID, "online"), SPLIT_ADDRESS),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_registry_list_does_not_join_records_across_addresses():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    factory = _ClientFactory([_moved_records(now)])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+    )
+
+    report = await maintenance.list_registry(
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert [
+        (
+            identity.topic_address or identity.agent_id,
+            identity.presence_state,
+            identity.online,
+        )
+        for identity in report.identities
+    ] == [
+        (SPLIT_ID, "offline", False),
+        (SPLIT_ADDRESS, "online", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gc_stale_address_preserves_session_live_at_another_address():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    moved = _moved_records(now)
+    factory = _ClientFactory([moved, moved])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.deleted == 1
+    assert report.sessions_destroyed == 0
+    assert report.sessions_preserved == 1
+    assert len(factory.clients) == 2
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    assert [
+        call.args for call in factory.clients[1].publish.await_args_list
+    ] == [
+        (DEFAULT_TOPICS.presence(SPLIT_ID), b""),
+        (DEFAULT_TOPICS.registry(SPLIT_ID), b""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gc_preserves_session_when_sibling_disappears_during_recheck():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    moved = _moved_records(now)
+    factory = _ClientFactory([moved, moved[:2]])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    report = await maintenance.gc_transient(
+        now=now,
+        stale_after_seconds=60,
+        retention_seconds=300,
+        batch_size=1,
+    )
+
+    assert report.deleted == 1
+    assert report.sessions_destroyed == 0
+    assert report.sessions_preserved == 1
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    assert [
+        call.args for call in factory.clients[1].publish.await_args_list
+    ] == [
+        (DEFAULT_TOPICS.presence(SPLIT_ID), b""),
+        (DEFAULT_TOPICS.registry(SPLIT_ID), b""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forget_can_remove_one_stale_address_without_killing_live_session():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    moved = _moved_records(now)
+    factory = _ClientFactory([moved, moved])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    result = await maintenance.forget(
+        SPLIT_ID,
+        topic_address=SPLIT_ID,
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert result.deleted is True
+    assert result.session_destroyed is False
+    assert len(factory.clients) == 2
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    assert [
+        call.args for call in factory.clients[1].publish.await_args_list
+    ] == [
+        (DEFAULT_TOPICS.presence(SPLIT_ID), b""),
+        (DEFAULT_TOPICS.registry(SPLIT_ID), b""),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_forget_preserves_session_when_sibling_disappears_during_recheck():
+    now = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    moved = _moved_records(now)
+    factory = _ClientFactory([moved, moved[:2]])
+    maintenance = RegistryMaintenance(
+        client_factory=factory,
+        snapshot_seconds=0.001,
+        audit_sink=[].append,
+    )
+
+    result = await maintenance.forget(
+        SPLIT_ID,
+        topic_address=SPLIT_ID,
+        now=now,
+        stale_after_seconds=60,
+    )
+
+    assert result.deleted is True
+    assert result.session_destroyed is False
+    assert all("identifier" not in kwargs for _, kwargs in factory.calls)
+    assert [
+        call.args for call in factory.clients[1].publish.await_args_list
+    ] == [
+        (DEFAULT_TOPICS.presence(SPLIT_ID), b""),
+        (DEFAULT_TOPICS.registry(SPLIT_ID), b""),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_gc_durable_transient_tombstones_on_its_own_client_id():
     """GC retires persistent identities using their stable client ID."""
@@ -2552,6 +2760,31 @@ def test_registry_forget_confirmation_allows_mutation():
     maintenance.return_value.forget.assert_awaited_once()
 
 
+def test_registry_forget_passes_an_exact_topic_address():
+    report = RegistryForgetReport(
+        agent_id=SPLIT_ID,
+        dry_run=True,
+    )
+    with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
+        maintenance.return_value.forget = AsyncMock(return_value=report)
+        result = CliRunner().invoke(
+            main,
+            [
+                "registry-forget",
+                "--agent-id",
+                SPLIT_ID,
+                "--topic-address",
+                SPLIT_ADDRESS,
+                "--dry-run",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert maintenance.return_value.forget.await_args.kwargs[
+        "topic_address"
+    ] == SPLIT_ADDRESS
+
+
 def test_registry_forget_tombstones_exact_agent_with_yes():
     runner = CliRunner()
     with patch("swarmbus.cli.RegistryMaintenance") as maintenance:
@@ -2571,6 +2804,7 @@ def test_registry_forget_tombstones_exact_agent_with_yes():
     assert result.exit_code == 0, result.output
     maintenance.return_value.forget.assert_awaited_once_with(
         "old-session",
+        topic_address=None,
         dry_run=False,
         force_online=False,
         stale_after_seconds=180,

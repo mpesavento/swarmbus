@@ -64,8 +64,8 @@ def _assert_lives_at_the_address(runtime):
     assert runtime._inbox_topic() == DEFAULT_TOPICS.inbox(
         AGENT, topic_address=ADDRESS
     )
-    # The level a broker ACL matches with %c.
-    assert runtime._client_kwargs()["identifier"] == "wren"
+    # The complete address a broker ACL matches with %c.
+    assert runtime._client_kwargs()["identifier"] == ADDRESS
 
 
 # ---------------------------------------------------------------------------

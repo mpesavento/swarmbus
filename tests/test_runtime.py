@@ -1835,7 +1835,7 @@ def test_two_level_session_names_its_client_id_without_persisting():
     """A broker ACL grants the address by client id."""
     kwargs = _runtime(_FakeStore([]), **SPLIT)._client_kwargs()
 
-    assert kwargs["identifier"] == "wren"
+    assert kwargs["identifier"] == "flock/wren"
     assert kwargs["clean_session"] is True
 
 
@@ -1931,14 +1931,34 @@ async def test_send_reaches_a_recipient_observed_at_two_levels():
 
 
 @pytest.mark.asyncio
-async def test_send_addresses_an_unobserved_recipient_at_one_level():
-    """No directory record means no guess, even for an id with a separator."""
+async def test_send_refuses_an_unobserved_recipient_with_two_possible_addresses():
+    """No directory record can distinguish its one- and two-level inboxes."""
     runtime = _runtime(_FakeStore([]), presence=True)
     runtime._client = _FakeClient()
 
-    await runtime.send_message(to="flock__wren", subject="hello", body="ping")
+    with pytest.raises(ValueError, match="topic address"):
+        await runtime.send_message(
+            to="flock__wren",
+            subject="hello",
+            body="ping",
+        )
 
-    assert runtime._client.publish.await_args.args[0] == "agents/flock__wren/inbox"
+    runtime._client.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_without_presence_refuses_a_recipient_with_two_addresses():
+    runtime = _runtime(_FakeStore([]))
+    runtime._client = _FakeClient()
+
+    with pytest.raises(ValueError, match="topic address"):
+        await runtime.send_message(
+            to="flock__wren",
+            subject="hello",
+            body="ping",
+        )
+
+    runtime._client.publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio

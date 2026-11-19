@@ -22,7 +22,12 @@ from .registry import (
     stamp_presence_payload,
     transient_gc_decision,
 )
-from .topics import DEFAULT_TOPICS, TopicMap, two_level_topic_address
+from .topics import (
+    DEFAULT_TOPICS,
+    TopicMap,
+    topic_address_for_agent,
+    two_level_topic_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,20 +160,17 @@ class _RegistrySnapshot:
         # Payload bytes as retained, kept so a stamp can be added to the
         # record that is actually there rather than to a rebuilt one.
         self.presence_payloads: dict[str, bytes] = {}
-        # Every address a record for this agent id arrived on. More than one
-        # means the dicts above hold whichever arrived last.
-        self.addresses: dict[str, set[str]] = {}
         self.invalid_messages = 0
 
     def ingest(self, topic: str, payload: bytes) -> None:
         if self.topics.is_registry_topic(topic):
             if not payload:
                 try:
-                    agent_id = self.topics.registry_agent(topic)
+                    address = self.topics.registry_address(topic)
                 except ValueError:
                     self.invalid_messages += 1
                     return
-                self.records.pop(agent_id, None)
+                self.records.pop(address, None)
                 return
             try:
                 record = RegistryRecord.from_mqtt(
@@ -179,21 +181,18 @@ class _RegistrySnapshot:
             except (ValueError, TypeError):
                 self.invalid_messages += 1
                 return
-            self.records[record.agent_id] = record
-            self.addresses.setdefault(record.agent_id, set()).add(
-                record.resolved_topic_address
-            )
+            self.records[record.resolved_topic_address] = record
             return
 
         if self.topics.is_presence_topic(topic):
             if not payload:
                 try:
-                    agent_id = self.topics.presence_agent(topic)
+                    address = self.topics.presence_address(topic)
                 except ValueError:
                     self.invalid_messages += 1
                     return
-                self.presence.pop(agent_id, None)
-                self.presence_payloads.pop(agent_id, None)
+                self.presence.pop(address, None)
+                self.presence_payloads.pop(address, None)
                 return
             try:
                 record = PresenceRecord.from_mqtt(
@@ -204,15 +203,20 @@ class _RegistrySnapshot:
             except (ValueError, TypeError):
                 self.invalid_messages += 1
                 return
-            self.presence[record.agent_id] = record
-            self.presence_payloads[record.agent_id] = payload
-            self.addresses.setdefault(record.agent_id, set()).add(
-                record.resolved_topic_address
-            )
+            address = record.resolved_topic_address
+            self.presence[address] = record
+            self.presence_payloads[address] = payload
             return
 
         # Neither tree: this map's subscriptions and predicates disagree.
         self.invalid_messages += 1
+
+    def addresses_for(self, agent_id: str) -> set[str]:
+        return {
+            address
+            for address, record in (*self.records.items(), *self.presence.items())
+            if record.agent_id == agent_id
+        }
 
 
 def _orphan_resolved(report: RegistryGCReport) -> int:
@@ -370,7 +374,7 @@ class RegistryMaintenance:
         """Every address a record for this agent id arrived on."""
         seen: set[str] = set()
         for snapshot in snapshots:
-            seen |= snapshot.addresses.get(agent_id, set())
+            seen |= snapshot.addresses_for(agent_id)
         return seen
 
     @staticmethod
@@ -454,8 +458,8 @@ class RegistryMaintenance:
             )
         )
         identities = []
-        for agent_id, record in snapshot.records.items():
-            presence = snapshot.presence.get(agent_id)
+        for address, record in snapshot.records.items():
+            presence = snapshot.presence.get(address)
             evidence = self._presence_evidence(
                 record,
                 presence,
@@ -476,15 +480,23 @@ class RegistryMaintenance:
                     offline_reason=presence.reason if presence else None,
                 )
             )
-        identities.sort(key=lambda identity: identity.agent_id)
-        orphan_ids = sorted(snapshot.presence.keys() - snapshot.records.keys())
+        identities.sort(
+            key=lambda identity: (
+                identity.agent_id,
+                identity.topic_address is not None,
+                identity.topic_address or identity.agent_id,
+            )
+        )
+        orphan_addresses = sorted(
+            snapshot.presence.keys() - snapshot.records.keys()
+        )
         orphans = []
-        for agent_id in orphan_ids:
-            presence = snapshot.presence[agent_id]
+        for address in orphan_addresses:
+            presence = snapshot.presence[address]
             stamp = presence.first_seen_offline
             orphans.append(
                 OrphanPresenceEntry(
-                    agent_id=agent_id,
+                    agent_id=presence.agent_id,
                     presence_state=presence.state,
                     first_seen_offline=stamp,
                     offline_age_seconds=(
@@ -496,11 +508,14 @@ class RegistryMaintenance:
             )
         return RegistryListReport(
             scanned=len(snapshot.records),
-            orphan_presence=len(orphan_ids),
+            orphan_presence=len(orphan_addresses),
             malformed=snapshot.invalid_messages,
             identities=identities,
             orphans=orphans,
-            orphan_presence_agent_ids=orphan_ids,
+            orphan_presence_agent_ids=[
+                snapshot.presence[address].agent_id
+                for address in orphan_addresses
+            ],
         )
 
     async def gc_transient(
@@ -533,35 +548,41 @@ class RegistryMaintenance:
             )
         )
         preserved: Counter[str] = Counter()
-        candidates: list[RegistryRecord] = []
-        for agent_id, record in initial.records.items():
+        candidates: list[tuple[str, RegistryRecord]] = []
+        for address, record in initial.records.items():
             decision = transient_gc_decision(
                 record=record,
-                presence=initial.presence.get(agent_id),
+                presence=initial.presence.get(address),
                 now=current,
                 stale_after_seconds=stale_after_seconds,
                 retention_seconds=retention_seconds,
             )
             if decision.eligible:
-                candidates.append(record)
+                candidates.append((address, record))
             else:
                 preserved[decision.reason.value] += 1
 
         # Presence with no registry record has no last_seen to age against,
         # so it is handled by its own pass below rather than selected here.
-        orphan_ids = sorted(
-            agent_id
-            for agent_id in initial.presence
-            if agent_id not in initial.records
+        orphan_addresses = sorted(
+            address
+            for address in initial.presence
+            if address not in initial.records
         )
 
-        candidates.sort(key=lambda record: (record.last_seen, record.agent_id))
+        candidates.sort(
+            key=lambda candidate: (
+                candidate[1].last_seen,
+                candidate[1].agent_id,
+                candidate[0],
+            )
+        )
         selected = candidates[:batch_size]
         retained = sum(preserved.values())
         report = RegistryGCReport(
             dry_run=dry_run,
             scanned=len(initial.records),
-            orphan_presence=len(orphan_ids),
+            orphan_presence=len(orphan_addresses),
             eligible=len(candidates),
             selected=len(selected),
             online=preserved["online"],
@@ -571,15 +592,32 @@ class RegistryMaintenance:
         )
 
         broker_lost = False
-        for original in selected:
+        for address, original in selected:
             # Read and tombstone at the one address this record was observed
             # on, so evidence and action cannot come from two places.
-            address = original.resolved_topic_address
             registry_topic = self.topics.registry(
                 original.agent_id, topic_address=address
             )
             presence_topic = self.topics.presence(
                 original.agent_id, topic_address=address
+            )
+            recheck_addresses = [original.agent_id]
+            two_level = two_level_topic_address(original.agent_id)
+            if two_level is not None:
+                recheck_addresses.append(two_level)
+            recheck_filters = tuple(
+                topic
+                for candidate_address in recheck_addresses
+                for topic in (
+                    self.topics.registry(
+                        original.agent_id,
+                        topic_address=candidate_address,
+                    ),
+                    self.topics.presence(
+                        original.agent_id,
+                        topic_address=candidate_address,
+                    ),
+                )
             )
             resolved_before = (
                 report.deleted + report.would_delete + report.skipped
@@ -588,11 +626,11 @@ class RegistryMaintenance:
                 async with self._new_client() as client:
                     fresh = await self._snapshot_with_client(
                         client,
-                        (registry_topic, presence_topic),
+                        recheck_filters,
                     )
                     report.malformed += fresh.invalid_messages
-                    record = fresh.records.get(original.agent_id)
-                    presence = fresh.presence.get(original.agent_id)
+                    record = fresh.records.get(address)
+                    presence = fresh.presence.get(address)
                     if record is None:
                         report.disappeared += 1
                         report.skipped += 1
@@ -662,10 +700,30 @@ class RegistryMaintenance:
                         )
                         is False
                     )
-                    destroy_session = (
-                        record.durability == "durable" and confirmed_offline
+                    other_addresses = (
+                        self._observed_addresses(
+                            original.agent_id,
+                            initial,
+                            fresh,
+                        )
+                        - {address}
                     )
-                    if record.durability == "durable" and not confirmed_offline:
+                    sibling_not_confirmed_offline = any(
+                        self._presence_evidence(
+                            fresh.records.get(candidate_address),
+                            fresh.presence.get(candidate_address),
+                            now=current,
+                            stale_after_seconds=stale_after_seconds,
+                        )
+                        is not PresenceEvidence.OFFLINE
+                        for candidate_address in other_addresses
+                    )
+                    destroy_session = (
+                        record.durability == "durable"
+                        and confirmed_offline
+                        and not sibling_not_confirmed_offline
+                    )
+                    if record.durability == "durable" and not destroy_session:
                         report.sessions_preserved += 1
 
                     presence_deleted = False
@@ -742,7 +800,7 @@ class RegistryMaintenance:
 
         await self._stamp_or_collect_orphans(
             report,
-            orphan_ids=orphan_ids,
+            orphan_addresses=orphan_addresses,
             presence=initial.presence,
             now=current,
             retention_seconds=retention_seconds,
@@ -756,7 +814,7 @@ class RegistryMaintenance:
         self,
         report: RegistryGCReport,
         *,
-        orphan_ids: list[str],
+        orphan_addresses: list[str],
         presence: dict[str, PresenceRecord],
         now: datetime,
         retention_seconds: float,
@@ -773,9 +831,9 @@ class RegistryMaintenance:
         """
 
         selected: list[str] = []
-        for agent_id in orphan_ids:
+        for address in orphan_addresses:
             action = orphan_presence_action(
-                presence=presence[agent_id],
+                presence=presence[address],
                 now=now,
                 retention_seconds=retention_seconds,
             )
@@ -784,7 +842,7 @@ class RegistryMaintenance:
             elif action is OrphanPresenceAction.WAIT:
                 report.orphan_waiting += 1
             elif len(selected) < batch_size:
-                selected.append(agent_id)
+                selected.append(address)
             else:
                 report.orphan_deferred += 1
 
@@ -792,13 +850,14 @@ class RegistryMaintenance:
             report.orphan_deferred += len(selected)
             return
 
-        for index, agent_id in enumerate(selected):
+        for index, address in enumerate(selected):
+            agent_id = presence[address].agent_id
             resolved_before = _orphan_resolved(report)
             try:
                 await self._write_orphan_presence(
                     report,
                     agent_id=agent_id,
-                    topic_address=presence[agent_id].resolved_topic_address,
+                    topic_address=address,
                     now=now,
                     retention_seconds=retention_seconds,
                     dry_run=dry_run,
@@ -848,11 +907,15 @@ class RegistryMaintenance:
                 ),
             )
             report.malformed += fresh.invalid_messages
-            presence = fresh.presence.get(agent_id)
-            payload = fresh.presence_payloads.get(agent_id)
+            presence = fresh.presence.get(topic_address)
+            payload = fresh.presence_payloads.get(topic_address)
             # A registry record appearing makes this an ordinary candidate
             # for the next run's main pass, not an orphan.
-            if presence is None or payload is None or agent_id in fresh.records:
+            if (
+                presence is None
+                or payload is None
+                or topic_address in fresh.records
+            ):
                 report.orphan_skipped += 1
                 return
 
@@ -940,14 +1003,20 @@ class RegistryMaintenance:
         self,
         agent_id: str,
         *,
+        topic_address: str | None = None,
         dry_run: bool = False,
         force_online: bool = False,
         stale_after_seconds: float = 180,
         now: datetime | None = None,
     ) -> RegistryForgetReport:
-        """Retire one identity and destroy its stable MQTT session."""
+        """Retire one address and, when safe, its stable MQTT session."""
 
         _validate_registered_agent_id(agent_id)
+        requested_address = (
+            topic_address_for_agent(agent_id, topic_address)
+            if topic_address is not None
+            else None
+        )
         if stale_after_seconds <= 0:
             raise ValueError("stale_after_seconds must be positive")
         current = now or datetime.now(timezone.utc)
@@ -969,10 +1038,12 @@ class RegistryMaintenance:
             )
         )
         snapshot = await self._snapshot(filters)
-        if len(self._observed_addresses(agent_id, snapshot)) > 1:
+        initial_addresses = self._observed_addresses(agent_id, snapshot)
+        if requested_address is None and len(initial_addresses) > 1:
             return self._ambiguous_address_report(agent_id, dry_run=dry_run)
-        record = snapshot.records.get(agent_id)
-        presence = snapshot.presence.get(agent_id)
+        address = requested_address or next(iter(initial_addresses), agent_id)
+        record = snapshot.records.get(address)
+        presence = snapshot.presence.get(address)
         initial_absent = (
             record is None
             and presence is None
@@ -1012,113 +1083,158 @@ class RegistryMaintenance:
         # Two bounded reads distinguish absence from delayed retained state.
         async with self._new_client() as reader:
             fresh = await self._snapshot_with_client(reader, filters)
-        # Across both reads, so records that moved between them count too.
-        addresses = self._observed_addresses(agent_id, snapshot, fresh)
-        if len(addresses) > 1:
-            return self._ambiguous_address_report(
-                agent_id, dry_run=dry_run, rechecked=True
+            # Across both reads, so records that moved between them count too.
+            addresses = self._observed_addresses(agent_id, snapshot, fresh)
+            if requested_address is None and len(addresses) > 1:
+                return self._ambiguous_address_report(
+                    agent_id, dry_run=dry_run, rechecked=True
+                )
+            address = requested_address or next(iter(addresses), agent_id)
+            record = fresh.records.get(address)
+            presence = fresh.presence.get(address)
+            fresh_absent = (
+                record is None
+                and presence is None
+                and fresh.invalid_messages == 0
             )
-        record = fresh.records.get(agent_id)
-        presence = fresh.presence.get(agent_id)
-        fresh_absent = (
-            record is None
-            and presence is None
-            and fresh.invalid_messages == 0
-        )
-        evidence = self._presence_evidence(
-            record,
-            presence,
-            now=current,
-            stale_after_seconds=stale_after_seconds,
-        )
-        online = self._observed_online(
-            record,
-            presence,
-            now=current,
-            stale_after_seconds=stale_after_seconds,
-        )
-        confirmed_absent = initial_absent and fresh_absent
-        report = RegistryForgetReport(
-            agent_id=agent_id,
-            dry_run=dry_run,
-            lifecycle=record.lifecycle if record else "unknown",
-            online=online,
-            presence_evidence=evidence.value,
-            rechecked=True,
-            already_absent=confirmed_absent,
-        )
-        if confirmed_absent:
-            return report
-
-        if not force_online:
-            if initial_absent:
-                report.refused = True
-                report.refused_reason = (
-                    "online" if online is True else "unconfirmed-offline"
-                )
-                return report
-            if evidence is not PresenceEvidence.OFFLINE:
-                report.refused = True
-                report.refused_reason = (
-                    "online"
-                    if evidence is PresenceEvidence.ONLINE
-                    else "unconfirmed-offline"
-                )
+            evidence = self._presence_evidence(
+                record,
+                presence,
+                now=current,
+                stale_after_seconds=stale_after_seconds,
+            )
+            online = self._observed_online(
+                record,
+                presence,
+                now=current,
+                stale_after_seconds=stale_after_seconds,
+            )
+            confirmed_absent = initial_absent and fresh_absent
+            report = RegistryForgetReport(
+                agent_id=agent_id,
+                dry_run=dry_run,
+                lifecycle=record.lifecycle if record else "unknown",
+                online=online,
+                presence_evidence=evidence.value,
+                rechecked=True,
+                already_absent=confirmed_absent,
+            )
+            if confirmed_absent:
                 return report
 
-        if dry_run:
-            return report
+            if not force_online:
+                if initial_absent:
+                    report.refused = True
+                    report.refused_reason = (
+                        "online" if online is True else "unconfirmed-offline"
+                    )
+                    return report
+                if evidence is not PresenceEvidence.OFFLINE:
+                    report.refused = True
+                    report.refused_reason = (
+                        "online"
+                        if evidence is PresenceEvidence.ONLINE
+                        else "unconfirmed-offline"
+                    )
+                    return report
 
-        # Audit the decisive re-read before publishing; audit failure preserves
-        # retained state.
-        event = self._audit_event(
-            operation="explicit-forget",
-            agent_id=agent_id,
-            record=record,
-            presence=presence,
-            now=current,
-            outcome="authorized",
-            retention_seconds=None,
-            online=online,
-            presence_evidence_value=evidence,
-            force_online=force_online,
-        )
-        try:
-            self._audit_sink(event)
-        except Exception as exc:
-            logger.error("registry audit failed for %s: %s", agent_id, exc)
-            report.failed = True
-            return report
+            if dry_run:
+                return report
 
-        # At most one address was observed across both reads. None was only
-        # if neither read held a valid record, which --force-online alone
-        # lets through; the one-level topics are then the ones to clear.
-        address = next(iter(addresses), agent_id)
-        presence_deleted = False
-        try:
-            async with self._new_client(
-                identifier=self.topics.session_client_id(agent_id),
-                clean_session=True,
-            ) as client:
-                await client.publish(
-                    self.topics.presence(agent_id, topic_address=address),
-                    b"",
-                    qos=1,
-                    retain=True,
+            # Audit the decisive re-read before publishing; audit failure
+            # preserves retained state.
+            event = self._audit_event(
+                operation="explicit-forget",
+                agent_id=agent_id,
+                record=record,
+                presence=presence,
+                now=current,
+                outcome="authorized",
+                retention_seconds=None,
+                online=online,
+                presence_evidence_value=evidence,
+                force_online=force_online,
+            )
+            try:
+                self._audit_sink(event)
+            except Exception as exc:
+                logger.error("registry audit failed for %s: %s", agent_id, exc)
+                report.failed = True
+                return report
+
+            other_addresses = addresses - {address}
+            sibling_not_confirmed_offline = any(
+                self._presence_evidence(
+                    fresh.records.get(candidate_address),
+                    fresh.presence.get(candidate_address),
+                    now=current,
+                    stale_after_seconds=stale_after_seconds,
                 )
-                presence_deleted = True
-                await client.publish(
-                    self.topics.registry(agent_id, topic_address=address),
-                    b"",
-                    qos=1,
-                    retain=True,
-                )
-            report.session_destroyed = True
-        except Exception as exc:
-            logger.error("registry forget failed for %s: %s", agent_id, exc)
-            report.failed = True
-            report.partial = presence_deleted
-            return report
+                is not PresenceEvidence.OFFLINE
+                for candidate_address in other_addresses
+            )
+            # Malformed-only state identifies neither address. The emergency
+            # override clears both possible retained pairs.
+            if (
+                requested_address is None
+                and not addresses
+                and (snapshot.invalid_messages or fresh.invalid_messages)
+            ):
+                addresses_to_clear = candidate_addresses
+            else:
+                addresses_to_clear = [address]
 
-        report.deleted = True
-        return report
+            presence_deleted = False
+            try:
+                if sibling_not_confirmed_offline:
+                    client = reader
+                    for target_address in addresses_to_clear:
+                        await client.publish(
+                            self.topics.presence(
+                                agent_id, topic_address=target_address
+                            ),
+                            b"",
+                            qos=1,
+                            retain=True,
+                        )
+                        presence_deleted = True
+                        await client.publish(
+                            self.topics.registry(
+                                agent_id, topic_address=target_address
+                            ),
+                            b"",
+                            qos=1,
+                            retain=True,
+                        )
+                else:
+                    async with self._new_client(
+                        identifier=self.topics.session_client_id(agent_id),
+                        clean_session=True,
+                    ) as client:
+                        for target_address in addresses_to_clear:
+                            await client.publish(
+                                self.topics.presence(
+                                    agent_id, topic_address=target_address
+                                ),
+                                b"",
+                                qos=1,
+                                retain=True,
+                            )
+                            presence_deleted = True
+                            await client.publish(
+                                self.topics.registry(
+                                    agent_id, topic_address=target_address
+                                ),
+                                b"",
+                                qos=1,
+                                retain=True,
+                            )
+                    report.session_destroyed = True
+            except Exception as exc:
+                logger.error("registry forget failed for %s: %s", agent_id, exc)
+                report.failed = True
+                report.partial = presence_deleted
+                return report
+
+            report.deleted = True
+            return report

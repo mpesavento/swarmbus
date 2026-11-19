@@ -640,3 +640,70 @@ def test_two_level_tombstones_remove_the_agent_they_name():
     with pytest.raises(KeyError):
         cache.get_state(SPLIT_ID)
     assert cache.topic_address(SPLIT_ID) == SPLIT_ID
+
+
+def test_tombstone_removes_only_the_address_it_names():
+    cache = RegistryCache(stale_after_seconds=180)
+    cache.update_registry(
+        DEFAULT_TOPICS.registry(SPLIT_ID),
+        _record(SPLIT_ID, age_seconds=30).to_json(),
+    )
+    cache.update_registry(
+        SPLIT_REGISTRY,
+        _record(
+            SPLIT_ID,
+            age_seconds=0,
+            topic_address=SPLIT_ADDRESS,
+        ).to_json(),
+    )
+
+    cache.remove_registry(DEFAULT_TOPICS.registry(SPLIT_ID))
+
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ADDRESS
+    assert cache.get_state(SPLIT_ID)["topic_address"] == SPLIT_ADDRESS
+
+
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_cache_routes_to_the_freshest_address_not_delivery_order(newest_first):
+    cache = RegistryCache(stale_after_seconds=180)
+    old = (
+        DEFAULT_TOPICS.registry(SPLIT_ID),
+        _record(SPLIT_ID, age_seconds=60).to_json(),
+    )
+    new = (
+        SPLIT_REGISTRY,
+        _record(
+            SPLIT_ID,
+            age_seconds=0,
+            topic_address=SPLIT_ADDRESS,
+        ).to_json(),
+    )
+
+    for topic, payload in ((new, old) if newest_first else (old, new)):
+        cache.update_registry(topic, payload)
+
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ADDRESS
+
+
+@pytest.mark.parametrize("offline_first", [False, True])
+def test_cache_keeps_an_identity_online_when_either_address_is_live(
+    offline_first,
+):
+    cache = RegistryCache(stale_after_seconds=180)
+    offline = (
+        DEFAULT_TOPICS.presence(SPLIT_ID),
+        _presence_payload(SPLIT_ID, state="offline"),
+    )
+    online = (
+        SPLIT_PRESENCE,
+        _presence_payload(
+            SPLIT_ID,
+            topic_address=SPLIT_ADDRESS,
+        ),
+    )
+
+    for topic, payload in ((offline, online) if offline_first else (online, offline)):
+        cache.update_presence(topic, payload)
+
+    assert cache.online_agent_ids() == [SPLIT_ID]
+    assert cache.get_state(SPLIT_ID)["online"] is True

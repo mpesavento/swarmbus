@@ -103,8 +103,10 @@ def two_level_topic_address(agent_id: str) -> str | None:
     return "/".join(levels)
 
 
-def _bound_topic_address(agent_id: str, topic_address: str | None) -> str:
-    """The topic levels an agent's topics are built from."""
+def topic_address_for_agent(
+    agent_id: str, topic_address: str | None = None
+) -> str:
+    """Return and validate the topic address owned by an agent."""
     if topic_address is None:
         return agent_id
     if agent_id_for_topic_address(topic_address) != agent_id:
@@ -119,9 +121,9 @@ def live_session_client_id(
     agent_id: str, topic_address: str | None = None
 ) -> str | None:
     """MQTT client identifier a non-persistent session must use, or None."""
-    address = _bound_topic_address(agent_id, topic_address)
+    address = topic_address_for_agent(agent_id, topic_address)
     if "/" in address:
-        return address.rsplit("/", 1)[1]
+        return address
     return None
 
 
@@ -236,21 +238,21 @@ class TopicMap:
         self, agent_id: str, *, topic_address: str | None = None
     ) -> str:
         """Directed-message topic for one agent."""
-        address = _bound_topic_address(agent_id, topic_address)
+        address = topic_address_for_agent(agent_id, topic_address)
         return f"{self.agents_prefix}/{address}/{INBOX_LEAF}"
 
     def presence(
         self, agent_id: str, *, topic_address: str | None = None
     ) -> str:
         """Retained presence topic for one agent (also used as the LWT)."""
-        address = _bound_topic_address(agent_id, topic_address)
+        address = topic_address_for_agent(agent_id, topic_address)
         return f"{self.agents_prefix}/{address}/{PRESENCE_LEAF}"
 
     def registry(
         self, agent_id: str, *, topic_address: str | None = None
     ) -> str:
         """Retained registry/heartbeat topic for one agent."""
-        address = _bound_topic_address(agent_id, topic_address)
+        address = topic_address_for_agent(agent_id, topic_address)
         return f"{self.registry_prefix}/{address}"
 
     @property

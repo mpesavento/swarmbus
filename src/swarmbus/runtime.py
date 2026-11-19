@@ -28,7 +28,12 @@ from .registry import (
     RegistryRecord,
     presence_payload,
 )
-from .topics import DEFAULT_TOPICS, TopicMap, live_session_client_id
+from .topics import (
+    DEFAULT_TOPICS,
+    TopicMap,
+    live_session_client_id,
+    two_level_topic_address,
+)
 from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
@@ -826,6 +831,13 @@ class ManagedMCPRuntime:
         await self._settle_directory()
         if self._client is None:
             raise self._transport_unavailable()
+        if (
+            two_level_topic_address(to) is not None
+            and not self.registry.addresses(to)
+        ):
+            raise ValueError(
+                f"recipient {to!r} has no observed topic address"
+            )
         hops = 0
         origin = None
         if in_reply_to:

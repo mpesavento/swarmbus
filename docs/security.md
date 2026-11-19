@@ -169,14 +169,14 @@ topic readwrite agents/broadcast
 
 ### One login, many sessions
 
-The recipe above needs a login for every agent id. That does not work for short-lived sessions with generated ids. Give those sessions one shared login and a two-level topic address instead (`--topic-address`, see [configuration.md](configuration.md#two-level-topic-address)). An agent `flock__wren` at the address `flock/wren` logs in as `flock` and connects with the MQTT client id `wren`, so `%u/%c` matches its topics and no other session's.
+The recipe above needs a login for every agent id. That does not work for short-lived sessions with generated ids. Give those sessions one shared login and a two-level topic address instead (`--topic-address`, see [configuration.md](configuration.md#two-level-topic-address)). An agent `flock__wren` at the address `flock/wren` logs in as `flock` and connects with the MQTT client id `flock/wren`. The `%c` substitution therefore expands to its complete topic address and no other session's.
 
 ```
 # Each session of a login: read its own inbox; publish/read its own
-# presence and registry record. %u is the login, %c the client id.
-pattern read agents/%u/%c/inbox
-pattern readwrite agents/%u/%c/presence
-pattern write swarmbus/registry/%u/%c
+# presence and registry record. %c is the complete topic address.
+pattern read agents/%c/inbox
+pattern readwrite agents/%c/presence
+pattern write swarmbus/registry/%c
 
 # One block per shared login: send to any session's inbox and see every
 # session's presence and registry record.
@@ -189,8 +189,8 @@ topic read swarmbus/registry/+/+
 Start each session with `--agent-id <login>__<session>`, `--topic-address <login>/<session>` and `--username <login>`.
 
 - **Not with `--persistent`.** A persistent session's client id is always `swarmbus-<agent-id>`, so `%c` does not match it. The broker drops its presence and registry publishes and delivers it nothing. Give a persistent agent its own login, as in the recipe above.
-- **Client ids are broker-wide.** Two sessions with the same second level disconnect each other, even under different logins or roots. Generate session names that cannot collide.
-- **Sessions of one login can impersonate each other.** A client id is whatever the client says it is. A process holding the `flock` login can connect as `wren`, which disconnects the real `wren` and takes over its topics. The ACL keeps cooperating sessions out of each other's way; it does not protect one from another.
+- **Client ids are broker-wide.** The complete address avoids collisions between `flock/wren` and `roost/wren`, but two sessions at the same address still disconnect each other even under different logins or roots.
+- **Sessions of one login can impersonate each other.** A client id is whatever the client says it is. A process holding the `flock` login can connect as `flock/wren`, which disconnects the real session and takes over its topics. The ACL keeps cooperating sessions out of each other's way; it does not protect one from another.
 - **Both layouts on one broker.** For sessions and one-level agents to see and reach each other, add `topic write agents/+/inbox`, `topic read agents/+/presence` and `topic read swarmbus/registry/+` to the shared login's block, and the three `+/+` lines to each one-level agent's block.
 - **Registry maintenance.** Add `topic readwrite agents/+/+/presence` and `topic readwrite swarmbus/registry/+/+` to the `maintenance` block, or `registry-gc` cannot clear a session's records.
 - **With a topic root**, put the root in front of every line, as above.

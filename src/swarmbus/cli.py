@@ -50,7 +50,7 @@ from .topics import (
     UNIT_PREFIX,
     UNIT_SUFFIX,
     TopicMap,
-    live_session_client_id,
+    topic_address_for_agent,
 )
 from .trip_alert import TripAlerter
 
@@ -239,7 +239,7 @@ def _configured_topic_address(agent_id: str) -> str | None:
     if address is None:
         return None
     try:
-        live_session_client_id(agent_id, address)
+        topic_address_for_agent(agent_id, address)
     except ValueError as exc:
         raise click.UsageError(f"--topic-address: {exc}") from exc
     return address if "/" in address else None
@@ -2001,6 +2001,11 @@ def registry_gc(
 
 @main.command("registry-forget")
 @click.option("--agent-id", required=True, help="Exact agent ID to remove")
+@click.option(
+    "--topic-address",
+    default=None,
+    help="Remove only this one- or two-level address owned by the agent.",
+)
 @_broker_address_options
 @click.option(
     "--stale-after-seconds",
@@ -2041,6 +2046,7 @@ def registry_gc(
 @_broker_auth_options
 def registry_forget(
     agent_id: str,
+    topic_address: str | None,
     broker: str,
     port: int,
     stale_after_seconds: float,
@@ -2060,8 +2066,14 @@ def registry_forget(
     """Explicitly remove one agent's retained registry and presence."""
 
     if not dry_run and not yes:
+        target = (
+            f"{agent_id!r} at address {topic_address!r}"
+            if topic_address is not None
+            else repr(agent_id)
+        )
         click.confirm(
-            f"Forget {agent_id!r} and destroy its persistent MQTT session?",
+            f"Forget {target}: retire retained state and destroy its "
+            "persistent MQTT session if no other address is live?",
             abort=True,
         )
 
@@ -2081,6 +2093,7 @@ def registry_forget(
     result = asyncio.run(
         maintenance.forget(
             agent_id,
+            topic_address=topic_address,
             dry_run=dry_run,
             force_online=force_online,
             stale_after_seconds=stale_after_seconds,
