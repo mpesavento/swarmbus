@@ -14,7 +14,6 @@ from pathlib import Path
 
 import aiomqtt
 import click
-from click.core import ParameterSource
 from pydantic import ValidationError
 
 from .archive import SQLiteMessageStore, state_db_path
@@ -46,7 +45,7 @@ from .message import (
     frame_body,
     sanitize_field,
 )
-from .topics import TopicMap
+from .topics import DEFAULT_TOPICS, UNIT_PREFIX, UNIT_SUFFIX, TopicMap
 from .trip_alert import TripAlerter
 
 
@@ -66,8 +65,12 @@ def main(ctx: click.Context, config_path: str | None) -> None:
     for warning in loaded.warnings:
         click.echo(f"[swarmbus] warning: {warning}", err=True)
     ctx.obj = loaded
+    # topic_root is left out: _resolve_topic_root reads the file itself,
+    # because ranking an empty SWARMBUS_TOPIC_ROOT above the file needs the
+    # absent-vs-empty distinction a default_map entry would hide.
+    defaults = {k: v for k, v in loaded.params.items() if k != "topic_root"}
     ctx.default_map = {
-        name: {k: v for k, v in loaded.params.items() if k in {p.name for p in cmd.params}}
+        name: {k: v for k, v in defaults.items() if k in {p.name for p in cmd.params}}
         for name, cmd in main.commands.items()
     }
 
@@ -167,21 +170,28 @@ _TOPIC_ROOT_ENVVAR = "SWARMBUS_TOPIC_ROOT"
 
 
 def _resolve_topic_root(ctx, param, value) -> str:
-    """Normalize the root and hand the command a usable string."""
-    source = ctx.get_parameter_source(param.name)
-    # Click's env lookup treats an empty variable as unset, so an exported
-    # empty root would otherwise lose to one in the config file. Read it as
-    # the request it is -- the unrooted layout -- while the flag still wins.
-    if source is not ParameterSource.COMMANDLINE and (
-        os.environ.get(_TOPIC_ROOT_ENVVAR) == ""
-    ):
-        return ""
-    try:
-        return TopicMap(root=value).root
-    except ValueError as exc:
+    """Resolve the root from the flag, else the env var, else the config file.
+
+    Click supplies none of it. Its env lookup treats an empty variable as
+    unset, while an exported empty root is a request for the unrooted layout
+    that has to beat a root in the config file. Ranking the sources here also
+    leaves `value is None` as the whole test for "no flag was passed":
+    `ctx.get_parameter_source` is not usable for it, because click 8.4.0
+    returns None from it for every source while a callback is running.
+    """
+    if value is not None:
+        raw, hint = value, None
+    elif _TOPIC_ROOT_ENVVAR in os.environ:
         # Name where the value came from: a root out of the environment is
         # not a flag the user can see on the command line.
-        hint = _TOPIC_ROOT_ENVVAR if source is ParameterSource.ENVIRONMENT else None
+        raw, hint = os.environ[_TOPIC_ROOT_ENVVAR], _TOPIC_ROOT_ENVVAR
+    else:
+        # Already normalized by config.py, which reports an unusable root as
+        # the config error it is.
+        return str(_config().params.get("topic_root", ""))
+    try:
+        return TopicMap(root=raw).root
+    except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint=hint) from exc
 
 
@@ -193,11 +203,13 @@ def _topic_root_option(func):
     namespace nobody else is in, and MQTT reports no error for that. An
     explicit empty value selects the unrooted layout, even over a root set
     in the config file, and so does an empty SWARMBUS_TOPIC_ROOT.
+
+    The env var is deliberately not Click's `envvar`: the callback reads it,
+    so an exported empty root stays distinguishable from an absent one.
     """
     return click.option(
         "--topic-root",
-        default="",
-        envvar=_TOPIC_ROOT_ENVVAR,
+        default=None,
         callback=_resolve_topic_root,
         help="Namespace prefix for the agent and registry topics, e.g. "
              "'fleet' gives fleet/agents/<id>/inbox. Empty (the default) "
@@ -884,7 +896,9 @@ def list_agents_cmd(
     "--inbox",
     default=None,
     help="Path to the inbox file written by the listener daemon. "
-         "Defaults to ~/sync/<agent-id>-inbox.md.",
+         "Defaults to the daemon's own default for this topic root: "
+         "~/sync/<agent-id>-inbox.md unrooted, "
+         "~/sync/<agent-id>:<root>-inbox.md under a root.",
 )
 @click.option(
     "--consumer",
@@ -909,6 +923,7 @@ def list_agents_cmd(
     is_flag=True,
     help="Reset cursor to start of file before reading.",
 )
+@_topic_root_option
 def tail(
     agent_id: str,
     inbox: str | None,
@@ -916,6 +931,7 @@ def tail(
     cursor_dir: str | None,
     follow: bool,
     reset: bool,
+    topic_root: str,
 ) -> None:
     """Read new entries from the daemon's inbox file, advancing a cursor.
 
@@ -924,6 +940,10 @@ def tail(
     you read messages when a daemon is already running — avoids the
     race that `swarmbus read` would create by subscribing to the same
     topic as the daemon.
+
+    The default inbox and the cursor are both per topic root, because the
+    daemon writes one inbox file per agent id per root. Pass the root the
+    daemon runs on, or `--inbox` to read a file of your own.
 
     Polling-based --follow (0.5s interval) is intentional: we stay
     zero-dep across Linux/macOS/BSD instead of pulling in inotify/watchdog.
@@ -951,10 +971,17 @@ def tail(
         )
         sys.exit(2)
 
-    inbox_path = Path(inbox).expanduser() if inbox else Path.home() / "sync" / f"{agent_id}-inbox.md"
+    # Both defaults are per topic root, because the daemon's inbox is: one
+    # cursor over two roots' files would re-emit one of them on every switch,
+    # since the inode it stored never matches. Unrooted names are unchanged.
+    topics = TopicMap(root=topic_root)
+    inbox_path = (
+        Path(inbox).expanduser() if inbox
+        else Path.home() / "sync" / topics.default_inbox_name(agent_id)
+    )
     cursors_root = Path(cursor_dir).expanduser() if cursor_dir else Path.home() / ".swarmbus" / "cursors"
     cursors_root.mkdir(parents=True, exist_ok=True)
-    cursor_file = cursors_root / f"{agent_id}--{consumer}.cursor"
+    cursor_file = cursors_root / f"{topics.agent_scope(agent_id)}--{consumer}.cursor"
 
     if not inbox_path.exists():
         click.echo(f"[swarmbus] inbox does not exist: {inbox_path}", err=True)
@@ -1339,14 +1366,17 @@ def doctor(
     from pathlib import Path
     from . import __version__
 
+    topics = TopicMap(root=topic_root)
+
     try:
-        agent_id_resolved = agent_id or _detect_agent_id()
+        # Unit names carry the root, so detection needs it to tell this
+        # swarm's daemon from another swarm's on the same host.
+        agent_id_resolved = agent_id or _detect_agent_id(topics)
     except Exception as exc:
         click.echo(f"[doctor] could not detect agent-id: {exc}", err=True)
         click.echo("[doctor] pass --agent-id <me> to proceed.", err=True)
         sys.exit(2)
 
-    topics = TopicMap(root=topic_root)
     results: list[tuple[str, str, str | None]] = []
     # Each tuple: (label, status, fix_hint). status ∈ {"ok","warn","fail","skip"}
 
@@ -1387,19 +1417,28 @@ def doctor(
                         f"systemctl status mosquitto  (or point --broker at a reachable host)"))
 
     # 3. Systemd daemon state
-    unit_name = f"swarmbus-{agent_id_resolved}.service"
+    unit_name = topics.systemd_unit(agent_id_resolved)
+    install_cmd = f"scripts/install-systemd.sh {agent_id_resolved}"
+    if topics.root:
+        install_cmd += f" --topic-root {topics.root}"
     try:
         env = _systemd_user_env()
-        probe = subprocess.run(
-            ["systemctl", "--user", "show", unit_name,
-             "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecStart"],
-            capture_output=True, text=True, env=env, timeout=3,
-        )
-        if probe.returncode != 0 or not probe.stdout.strip():
+        props = _systemd_unit_properties(unit_name, env)
+        found_name = unit_name
+        if props is None and topics.root:
+            # An install from before unit names carried the root serves this
+            # swarm if its pin says so, and is still the unit to restart.
+            legacy_name = DEFAULT_TOPICS.systemd_unit(agent_id_resolved)
+            legacy = _systemd_unit_properties(legacy_name, env)
+            if legacy is not None and _pinned_root(
+                legacy.get("ExecStart", "")
+            ) == topics.root:
+                props, found_name = legacy, legacy_name
+        if props is None:
             results.append((
                 f"systemd user unit....... {unit_name} NOT FOUND",
                 "warn",
-                f"scripts/install-systemd.sh {agent_id_resolved} "
+                f"{install_cmd} "
                 f"(or leave as-is if you run a bare daemon)",
             ))
             active_state = None
@@ -1407,22 +1446,35 @@ def doctor(
             exec_start = None
             start_ts = None
         else:
-            props = dict(line.split("=", 1) for line in probe.stdout.strip().splitlines() if "=" in line)
             active_state = props.get("ActiveState", "?")
             main_pid = props.get("MainPID", "0")
             start_ts = props.get("ExecMainStartTimestamp", "")
             exec_start = props.get("ExecStart", "")
+            pre_rename = (
+                "" if found_name == unit_name
+                else f" as {found_name}, the name before unit names "
+                     f"carried the root"
+            )
+            rename_hint = None if not pre_rename else (
+                f"systemctl --user disable --now {found_name} && "
+                f"rm ~/.config/systemd/user/{found_name} && {install_cmd}  "
+                f"(the old name blocks a second root for this agent id)"
+            )
             if active_state == "active":
                 results.append((
-                    f"systemd user unit....... active (PID {main_pid}, since {start_ts})",
-                    "ok", None,
+                    f"systemd user unit....... active (PID {main_pid}, "
+                    f"since {start_ts}){pre_rename}",
+                    "warn" if pre_rename else "ok",
+                    rename_hint,
                 ))
             else:
                 results.append((
-                    f"systemd user unit....... {active_state}",
+                    f"systemd user unit....... {active_state}{pre_rename}",
                     "fail",
-                    f"systemctl --user status {unit_name}  (and restart if needed)",
+                    f"systemctl --user status {found_name}  (and restart if needed)",
                 ))
+            # Every later hint points at the unit that actually exists.
+            unit_name = found_name
     except FileNotFoundError:
         results.append(("systemd user unit....... (systemctl not found)", "skip", None))
         main_pid = None
@@ -1648,26 +1700,88 @@ def _systemd_user_env() -> dict[str, str]:
     return env
 
 
-def _detect_agent_id() -> str:
-    """Best-effort agent-id detection: look for an active systemd user
-    unit named swarmbus-*.service. Error out if ambiguous or none."""
-    import subprocess
+def _systemd_unit_properties(
+    unit_name: str, env: dict[str, str]
+) -> dict[str, str] | None:
+    """One unit's properties, or None when systemd reports nothing for it."""
+    probe = subprocess.run(
+        ["systemctl", "--user", "show", unit_name,
+         "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp,ExecStart"],
+        capture_output=True, text=True, env=env, timeout=3,
+    )
+    if probe.returncode != 0 or not probe.stdout.strip():
+        return None
+    return dict(
+        line.split("=", 1)
+        for line in probe.stdout.strip().splitlines()
+        if "=" in line
+    )
+
+
+def _pinned_root(exec_start: str) -> str | None:
+    """Normalized ``--topic-root=`` value pinned in an ExecStart line.
+
+    None when the line carries no pin, or one no TopicMap would accept --
+    either way the unit's namespace cannot be read off it.
+    """
+    match = _re.search(r"--topic-root=(\S*)", exec_start)
+    if match is None:
+        return None
+    try:
+        return TopicMap(root=match.group(1)).root
+    except ValueError:
+        return None
+
+
+def _detect_agent_id(topics: TopicMap = DEFAULT_TOPICS) -> str:
+    """Best-effort agent-id detection from the systemd user units present.
+
+    A rooted unit name carries its root, so only units on ``topics``' root
+    are candidates -- an agent id lifted off another root's unit names a
+    daemon in another swarm. A unit named without a root predates
+    root-aware names and cannot say which root it serves, so a rooted run
+    accepts it only when no unit names that root. Error out if ambiguous
+    or none.
+    """
     env = _systemd_user_env()
     res = subprocess.run(
         ["systemctl", "--user", "list-units", "--type=service", "--no-legend",
-         "--no-pager", "swarmbus-*.service"],
+         "--no-pager", f"{UNIT_PREFIX}*{UNIT_SUFFIX}"],
         capture_output=True, text=True, env=env, timeout=3,
     )
     units = [line.split()[0] for line in res.stdout.strip().splitlines() if line.strip()]
     candidates = []
-    for u in units:
-        if u.startswith("swarmbus-") and u.endswith(".service"):
-            candidates.append(u[len("swarmbus-"):-len(".service")])
+    pre_rename = []
+    for unit in units:
+        try:
+            candidates.append(topics.unit_agent(unit))
+        except ValueError:
+            pass
+        try:
+            legacy_agent = DEFAULT_TOPICS.unit_agent(unit)
+        except ValueError:
+            continue
+        if topics.root:
+            props = _systemd_unit_properties(unit, env)
+            pin = (
+                _pinned_root(props.get("ExecStart", ""))
+                if props is not None
+                else None
+            )
+            if pin is not None and pin != topics.root:
+                continue
+        pre_rename.append(legacy_agent)
+    if not candidates and topics.root:
+        candidates = pre_rename
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
         raise RuntimeError(f"multiple swarmbus units running ({candidates}); pass --agent-id")
-    raise RuntimeError("no swarmbus-*.service unit detected")
+    seen = f" (saw {', '.join(units)})" if units else ""
+    raise RuntimeError(
+        f"no swarmbus unit detected for topic root "
+        f"{topics.root or '(none)'!r}{seen}"
+    )
 
 
 def _maintenance_password(
@@ -2541,8 +2655,17 @@ def held(
 from .platform import detect_platform, find_repo_root, resolve_broker_addr
 
 
-_AGENT_ID_RE = _re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
-_RESERVED_AGENT_IDS = frozenset({"broadcast", "system"})
+_SYSTEMD_TOPIC_ROOT_RE = _re.compile(r"^[A-Za-z0-9._/-]*$")
+
+
+def _validate_systemd_topic_root(topic_root: str) -> str:
+    """Return a root the systemd renderer can round-trip safely."""
+    if not _SYSTEMD_TOPIC_ROOT_RE.fullmatch(topic_root):
+        raise ValueError(
+            f"topic root {topic_root!r} cannot be installed as a systemd unit; "
+            "use only letters, digits, '.', '_', '/' and '-'"
+        )
+    return topic_root
 
 
 def _derive_invoke(host_type: str, agent_id: str, repo_root: str | None) -> str | None:
@@ -2828,7 +2951,8 @@ def _step_doctor(agent_id: str, topic_root: str, dry_run: bool) -> bool:
 @click.option("--invoke", "invoke_override", default=None,
               help="Override the invoke wrapper path passed to install-systemd.")
 @click.option("--inbox", default=None,
-              help="Inbox file path. Defaults to ~/sync/<agent-id>-inbox.md.")
+              help="Inbox file path. Defaults to ~/sync/<agent-id>-inbox.md, "
+                   "or ~/sync/<agent-id>:<root>-inbox.md under a topic root.")
 @click.option("--skip-broker", is_flag=True, help="Skip broker install.")
 @click.option("--skip-plugin", is_flag=True, help="Skip host plugin install.")
 @click.option("--dry-run", is_flag=True, help="Print what would run without executing.")
@@ -2863,18 +2987,15 @@ def init(
     """
     from pathlib import Path as _Path
 
-    # --- Validate agent-id
-    if not _AGENT_ID_RE.match(agent_id):
-        raise click.BadParameter(
-            f"{agent_id!r} is not valid. Use lowercase letters, digits, hyphens, "
-            "underscores (1–63 chars); must start with a letter or digit.",
-            param_hint="--agent-id",
-        )
-    if agent_id in _RESERVED_AGENT_IDS:
-        raise click.BadParameter(
-            f"{agent_id!r} is reserved and cannot be used as an agent id.",
-            param_hint="--agent-id",
-        )
+    # --- Validate values used by the setup scripts before any step runs
+    try:
+        _validate_registered_agent_id(agent_id)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--agent-id") from exc
+    try:
+        _validate_systemd_topic_root(topic_root)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--topic-root") from exc
 
     # --- Resolve broker address (may shell out for tailscale)
     try:
@@ -2901,7 +3022,13 @@ def init(
         # Don't hard-fail — let the steps surface individual warnings
 
     # --- Resolve inbox
-    resolved_inbox = inbox or str(_Path.home() / "sync" / f"{agent_id}-inbox.md")
+    # init always passes --inbox to the installer, so this default is the one
+    # that decides. It carries the root for the same reason the unit name
+    # does: two daemons for one agent id must not write one file. An --inbox
+    # given here is passed through as given.
+    resolved_inbox = inbox or str(
+        _Path.home() / "sync" / TopicMap(root=topic_root).default_inbox_name(agent_id)
+    )
 
     # --- Derive invoke wrapper
     if invoke_override:

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # scripts/install-systemd.sh
-# Render systemd/swarmbus-agent.service.template for <agent-id> and
-# install it at ~/.config/systemd/user/swarmbus-<agent-id>.service.
+# Render systemd/swarmbus-agent.service.template for <agent-id> and install
+# it at ~/.config/systemd/user/swarmbus-<agent-id>.service, or, under a
+# topic root, swarmbus-<agent-id>:<root>.service — one unit per agent id per
+# root, so two swarms can run the same agent id on one host.
 #
 # Usage:
 #   install-systemd.sh <agent-id> [--invoke <path>] [--broker <host>] [--inbox <path>]
@@ -9,7 +11,10 @@
 #
 # Defaults:
 #   --broker localhost
-#   --inbox  ~/sync/<agent-id>-inbox.md
+#   --inbox  ~/sync/<agent-id>-inbox.md, or ~/sync/<agent-id>:<root>-inbox.md
+#            under a topic root — one inbox per agent id per root, so two
+#            daemons never write one file. An --inbox given here is used as
+#            given. The unit's log is split the same way.
 #   --invoke (none — bare file-bridge daemon; no reactive wake)
 #   --topic-root (not given — the daemon reads [broker] topic_root from its
 #                config file; given, including given empty, pins the unit to
@@ -23,8 +28,22 @@ set -euo pipefail
 AGENT_ID="${1:?Usage: install-systemd.sh <agent-id> [--invoke <wake-wrapper> [args]] [--broker <h>] [--inbox <p>] [--topic-root <root>] [--username <u>] [--password <p>] [--ca-cert <path>] [--client-cert <path>] [--client-key <path>] [--tls]}"
 shift
 
+case "$AGENT_ID" in
+  ""|*[!a-z0-9_-]*|broadcast|system)
+    echo "ERROR: agent id '$AGENT_ID' must match [a-z0-9_-]{1,64} and may not be broadcast or system." >&2
+    exit 2
+    ;;
+esac
+if [ "${#AGENT_ID}" -gt 64 ]; then
+  echo "ERROR: agent id '$AGENT_ID' must match [a-z0-9_-]{1,64}." >&2
+  exit 2
+fi
+
 BROKER="localhost"
-INBOX="$HOME/sync/${AGENT_ID}-inbox.md"
+# Defaulted after the root is normalised, because the default carries the
+# root. An --inbox the operator passes is used exactly as given.
+INBOX=""
+INBOX_GIVEN=""
 INVOKE=""
 TOPIC_ROOT=""
 TOPIC_ROOT_GIVEN=""
@@ -38,7 +57,7 @@ BROKER_TLS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --broker) BROKER="$2"; shift 2 ;;
-    --inbox) INBOX="$2"; shift 2 ;;
+    --inbox) INBOX="$2"; INBOX_GIVEN="1"; shift 2 ;;
     --invoke) INVOKE="$2"; shift 2 ;;
     --topic-root) TOPIC_ROOT="$2"; TOPIC_ROOT_GIVEN="1"; shift 2 ;;
     --username) BROKER_USERNAME="$2"; shift 2 ;;
@@ -65,59 +84,128 @@ if [ -n "$TOPIC_ROOT_GIVEN" ]; then
   esac
 fi
 
+normalize_root() {
+  local root="$1"
+  while [ "${root#/}" != "$root" ]; do
+    root="${root#/}"
+  done
+  while [ "${root%/}" != "$root" ]; do
+    root="${root%/}"
+  done
+  printf '%s' "$root"
+}
+
+NORMALIZED_ROOT="$(normalize_root "$TOPIC_ROOT")"
+case "$NORMALIZED_ROOT" in
+  *//*)
+    echo "ERROR: topic root '$TOPIC_ROOT' contains an empty segment ('//')." >&2
+    echo "       Remove the repeated slash; nothing was changed." >&2
+    exit 2
+    ;;
+esac
+
 TOPIC_ROOT_ARG=""
 if [ -n "$TOPIC_ROOT_GIVEN" ]; then
-  TOPIC_ROOT_ARG=" --topic-root=$TOPIC_ROOT"
+  TOPIC_ROOT_ARG=" --topic-root=$NORMALIZED_ROOT"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATE="$REPO_ROOT/systemd/swarmbus-agent.service.template"
 UNIT_DIR="$HOME/.config/systemd/user"
-UNIT_PATH="$UNIT_DIR/swarmbus-${AGENT_ID}.service"
 
-# A host runs one unit per agent id, so an existing unit's --topic-root pin
-# is what decides which swarm its daemon belongs to. Read the pin before
-# anything is created: replacing it, or dropping it so the config file
-# decides, would move a running daemon to another swarm unannounced.
-if [ -f "$UNIT_PATH" ]; then
-  EXEC_LINE=$(grep -m1 '^ExecStart=' "$UNIT_PATH" || true)
-  EXISTING_PIN_GIVEN=""
-  EXISTING_ROOT=""
+# One root-specific token keys the unit, log and default inbox. With the
+# installer charset, only '/' needs escaping.
+UNIT_SCOPE="$AGENT_ID"
+if [ -n "$NORMALIZED_ROOT" ]; then
+  UNIT_SCOPE="${AGENT_ID}:${NORMALIZED_ROOT//\//:2f}"
+fi
+UNIT_WITHOUT_ROOT="swarmbus-${AGENT_ID}.service"
+UNIT="swarmbus-${UNIT_SCOPE}.service"
+UNIT_PATH="$UNIT_DIR/$UNIT"
+PATH_WITHOUT_ROOT="$UNIT_DIR/$UNIT_WITHOUT_ROOT"
+
+# Refuse overlong names before creating directories; this charset is ASCII.
+if [ "${#UNIT}" -gt 255 ]; then
+  echo "ERROR: unit name '$UNIT' is ${#UNIT} bytes, past systemd's maximum unit name length of 255 bytes." >&2
+  echo "       Shorten the agent id or the topic root. Nothing was changed." >&2
+  exit 2
+fi
+
+if [ -z "$INBOX_GIVEN" ]; then
+  INBOX="$HOME/sync/${UNIT_SCOPE}-inbox.md"
+fi
+
+PIN_GIVEN=""
+PIN_ROOT=""
+read_pin() {
+  PIN_GIVEN=""
+  PIN_ROOT=""
+  EXEC_LINE=$(grep -m1 '^ExecStart=' "$1" || true)
   case "$EXEC_LINE" in
     *" --topic-root="*)
-      EXISTING_PIN_GIVEN="1"
+      PIN_GIVEN="1"
       # The root charset stops at a space, so the pin's value is the text
       # after the token up to the next space or the end of the line.
-      EXISTING_ROOT="${EXEC_LINE#* --topic-root=}"
-      EXISTING_ROOT="${EXISTING_ROOT%% *}"
+      PIN_ROOT="${EXEC_LINE#* --topic-root=}"
+      PIN_ROOT="${PIN_ROOT%% *}"
+      PIN_ROOT="$(normalize_root "$PIN_ROOT")"
       ;;
   esac
+}
 
-  if [ -n "$EXISTING_PIN_GIVEN" ] && { [ -z "$TOPIC_ROOT_GIVEN" ] || [ "$EXISTING_ROOT" != "$TOPIC_ROOT" ]; }; then
-    if [ -n "$EXISTING_ROOT" ]; then
-      EXISTING_DISPLAY="'$EXISTING_ROOT'"
-      KEEP_ARG="--topic-root $EXISTING_ROOT"
+# Refuse a rooted unit beside an older unit that may serve the same root.
+if [ "$UNIT" != "$UNIT_WITHOUT_ROOT" ] && [ -f "$PATH_WITHOUT_ROOT" ]; then
+  read_pin "$PATH_WITHOUT_ROOT"
+  if [ -z "$PIN_GIVEN" ] || [ "$PIN_ROOT" = "$NORMALIZED_ROOT" ]; then
+    if [ -n "$PIN_GIVEN" ]; then
+      echo "ERROR: $PATH_WITHOUT_ROOT is already installed for topic root '$PIN_ROOT'." >&2
+    else
+      echo "ERROR: $PATH_WITHOUT_ROOT carries no --topic-root, so its daemon takes its" >&2
+      echo "       root from the config file and may already be on '$NORMALIZED_ROOT'." >&2
+    fi
+    echo "       Installing $UNIT beside it would leave two daemons for agent id" >&2
+    echo "       ${AGENT_ID} on one root, sharing one broker session and disconnecting" >&2
+    echo "       each other. Nothing was changed." >&2
+    echo "       Retire the older unit, then re-run this command:" >&2
+    echo "         systemctl --user disable --now $UNIT_WITHOUT_ROOT" >&2
+    echo "         rm $PATH_WITHOUT_ROOT" >&2
+    if [ -z "$PIN_GIVEN" ]; then
+      echo "       Or pin that unit to the root it really serves first, and this one can" >&2
+      echo "       then run beside it: $0 ${AGENT_ID} --topic-root <its-root>" >&2
+    fi
+    exit 2
+  fi
+fi
+
+# Never rewrite an existing unit's root pin in place.
+if [ -f "$UNIT_PATH" ]; then
+  read_pin "$UNIT_PATH"
+  if [ -n "$PIN_GIVEN" ] && { [ -z "$TOPIC_ROOT_GIVEN" ] || [ "$PIN_ROOT" != "$NORMALIZED_ROOT" ]; }; then
+    if [ -n "$PIN_ROOT" ]; then
+      EXISTING_DISPLAY="'$PIN_ROOT'"
+      KEEP_ARG="--topic-root $PIN_ROOT"
     else
       EXISTING_DISPLAY="(unrooted)"
       KEEP_ARG="--topic-root ''"
     fi
     if [ -z "$TOPIC_ROOT_GIVEN" ]; then
       ASKED="no --topic-root, so the config file's root"
-    elif [ -n "$TOPIC_ROOT" ]; then
-      ASKED="topic root '$TOPIC_ROOT'"
+    elif [ -n "$NORMALIZED_ROOT" ]; then
+      ASKED="topic root '$NORMALIZED_ROOT'"
     else
       ASKED="(unrooted)"
     fi
     echo "ERROR: $UNIT_PATH is installed for topic root $EXISTING_DISPLAY." >&2
     echo "       This run asked for: $ASKED." >&2
-    echo "       A host runs one systemd unit per agent id, so writing this unit would move" >&2
-    echo "       the swarmbus-${AGENT_ID} daemon to a different swarm. Nothing was changed." >&2
+    echo "       This unit's name cannot carry a root, so writing it would move the" >&2
+    echo "       swarmbus-${AGENT_ID} daemon to a different swarm. Nothing was changed." >&2
     echo "       To keep the unit as it is, pass $KEEP_ARG." >&2
     echo "       To replace it, remove the existing unit first:" >&2
-    echo "         systemctl --user disable --now swarmbus-${AGENT_ID}.service" >&2
+    echo "         systemctl --user disable --now $UNIT" >&2
     echo "         rm $UNIT_PATH" >&2
-    echo "       To run both swarms here, give the second swarm's agent a different agent id." >&2
+    echo "       To run this agent id in a second swarm, install that one with" >&2
+    echo "       --topic-root <root>: a rooted unit has a name of its own." >&2
     exit 2
   fi
 fi
@@ -138,6 +226,7 @@ AGENT_ID_UPPER=$(printf '%s' "$AGENT_ID" | tr 'a-z-' 'A-Z_')
 if [ -z "$INVOKE" ]; then
   sed -e "s|@AGENT_ID@|$AGENT_ID|g" \
       -e "s|@AGENT_ID_UPPER@|$AGENT_ID_UPPER|g" \
+      -e "s|@UNIT_SCOPE@|$UNIT_SCOPE|g" \
       -e "s|@HOME@|$HOME|g" \
       -e "s|@BROKER@|$BROKER|g" \
       -e "s|@INBOX@|$INBOX|g" \
@@ -148,6 +237,7 @@ if [ -z "$INVOKE" ]; then
 else
   sed -e "s|@AGENT_ID@|$AGENT_ID|g" \
       -e "s|@AGENT_ID_UPPER@|$AGENT_ID_UPPER|g" \
+      -e "s|@UNIT_SCOPE@|$UNIT_SCOPE|g" \
       -e "s|@HOME@|$HOME|g" \
       -e "s|@BROKER@|$BROKER|g" \
       -e "s|@INBOX@|$INBOX|g" \
@@ -165,14 +255,16 @@ echo "[install-systemd] wrote $UNIT_PATH"
 # at daemon-reload time, so the main template stays clean and a later
 # re-render of the template doesn't clobber the credentials. The file is
 # written 0600 because it contains plaintext secrets.
-DROPIN_DIR="$UNIT_DIR/swarmbus-${AGENT_ID}.service.d"
+# The directory name must match the unit name exactly or systemd ignores
+# it, and the daemon then starts without the credentials.
+DROPIN_DIR="$UNIT_DIR/${UNIT}.d"
 DROPIN_PATH="$DROPIN_DIR/auth.conf"
 
 if [ -n "$BROKER_USERNAME$BROKER_PASSWORD$BROKER_CA_CERT$BROKER_CLIENT_CERT$BROKER_CLIENT_KEY$BROKER_TLS" ]; then
   mkdir -p "$DROPIN_DIR"
   {
     echo "# Generated by install-systemd.sh — broker credentials for $AGENT_ID."
-    echo "# Hand-edit with \`systemctl --user edit swarmbus-${AGENT_ID}.service\`"
+    echo "# Hand-edit with \`systemctl --user edit ${UNIT}\`"
     echo "# rather than this file directly; that prompt-edits an override.conf"
     echo "# in the same directory and survives re-runs of install-systemd.sh."
     echo "[Service]"
@@ -198,18 +290,18 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
 
 systemctl --user daemon-reload
-systemctl --user enable "swarmbus-${AGENT_ID}.service"
-systemctl --user restart "swarmbus-${AGENT_ID}.service"
+systemctl --user enable "$UNIT"
+systemctl --user restart "$UNIT"
 
 sleep 2
 echo ""
 echo "[install-systemd] status:"
-systemctl --user --no-pager --lines=3 status "swarmbus-${AGENT_ID}.service" | head -8
+systemctl --user --no-pager --lines=3 status "$UNIT" | head -8
 echo ""
 echo "[install-systemd] running doctor:"
 DOCTOR_ARGS=(--agent-id "$AGENT_ID" --broker "$BROKER")
 if [ -n "$TOPIC_ROOT_GIVEN" ]; then
-  DOCTOR_ARGS+=("--topic-root=$TOPIC_ROOT")
+  DOCTOR_ARGS+=("--topic-root=$NORMALIZED_ROOT")
 fi
 swarmbus doctor "${DOCTOR_ARGS[@]}" || true
 

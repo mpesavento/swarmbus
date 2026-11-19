@@ -1,9 +1,11 @@
 import json
 import os
 from unittest.mock import patch, AsyncMock, MagicMock
+import pytest
 from click.testing import CliRunner
 import aiomqtt
-from swarmbus.cli import main
+from swarmbus.cli import _detect_agent_id, main
+from swarmbus.topics import TopicMap
 
 
 def test_send_inline_body(tmp_path):
@@ -1463,3 +1465,72 @@ def test_detect_agent_id_keeps_callers_env_and_defaults_when_unset(monkeypatch):
     assert (envs[1]["XDG_RUNTIME_DIR"], envs[1]["DBUS_SESSION_BUS_ADDRESS"]) == (
         f"/run/user/{uid}", f"unix:path=/run/user/{uid}/bus",
     )
+
+
+def _listed_units(*names):
+    """What `systemctl --user list-units --no-legend` prints for `names`."""
+    return MagicMock(
+        returncode=0,
+        stdout="".join(f"{name} loaded active running x\n" for name in names),
+    )
+
+
+def test_detect_agent_id_reads_the_agent_out_of_a_rooted_unit_name():
+    """A rooted unit name is agent id AND root; only the agent id is one."""
+    units = _listed_units(
+        "swarmbus-rx:fleet.service", "swarmbus-tx:lab.service"
+    )
+    with patch("subprocess.run", return_value=units):
+        assert _detect_agent_id(TopicMap(root="fleet")) == "rx"
+        assert _detect_agent_id(TopicMap(root="lab")) == "tx"
+
+
+def test_detect_agent_id_refuses_units_from_another_root():
+    """Two swarms on one host: the agent id is per root, not per host."""
+    units = _listed_units(
+        "swarmbus-rx:fleet.service", "swarmbus-tx:fleet.service"
+    )
+    with patch("subprocess.run", return_value=units):
+        with pytest.raises(RuntimeError, match="multiple"):
+            _detect_agent_id(TopicMap(root="fleet"))
+
+    with patch("subprocess.run", return_value=_listed_units("swarmbus-rx:lab.service")):
+        with pytest.raises(RuntimeError) as excinfo:
+            _detect_agent_id()
+    # The message names what it did see, or the operator has no idea why a
+    # unit that is plainly running was not detected.
+    assert "swarmbus-rx:lab.service" in str(excinfo.value)
+
+
+def test_detect_agent_id_falls_back_to_the_unit_name_without_a_root():
+    """An install from before unit names carried the root is still running.
+
+    Its name cannot say which root it serves, so a rooted run accepts it
+    rather than claiming no daemon exists.
+    """
+    with patch("subprocess.run", return_value=_listed_units("swarmbus-planner.service")):
+        assert _detect_agent_id(TopicMap(root="fleet")) == "planner"
+        assert _detect_agent_id() == "planner"
+
+
+def test_detect_agent_id_filters_legacy_units_by_their_root_pin():
+    fleet_unit = TopicMap().systemd_unit("rx")
+    lab_unit = TopicMap().systemd_unit("tx")
+    pins = {fleet_unit: "/fleet/", lab_unit: "lab"}
+
+    def systemctl(argv, **_kwargs):
+        if "list-units" in argv:
+            return _listed_units(fleet_unit, lab_unit)
+        unit = argv[argv.index("show") + 1]
+        return MagicMock(
+            returncode=0,
+            stdout=(
+                "ActiveState=active\n"
+                "ExecStart=/usr/bin/swarmbus start "
+                f"--agent-id {unit} --topic-root={pins[unit]}\n"
+            ),
+        )
+
+    with patch("subprocess.run", side_effect=systemctl):
+        assert _detect_agent_id(TopicMap(root="fleet")) == "rx"
+        assert _detect_agent_id(TopicMap(root="lab")) == "tx"

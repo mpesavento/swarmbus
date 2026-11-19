@@ -1,7 +1,8 @@
 """Optional INI config file of defaults for the `swarmbus` CLI's host settings.
 
 Precedence is flag > env var > config file > built-in default. Most of that is
-Click's own `default_map` order; the outbox path is resolved by hand in cli.py.
+Click's own `default_map` order; the outbox path and the topic root are
+resolved by hand in cli.py.
 
 No message raised or warned from here ever contains a value from the file:
 configparser quotes the offending line in its own messages, and a line may hold

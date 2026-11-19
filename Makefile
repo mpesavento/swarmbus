@@ -10,7 +10,7 @@ test: test-matrix
 test-one: build
 	PYTHON_VERSION=$(PYTHON_VERSION) docker compose run --rm test
 
-test-dev:
+test-dev: build
 	PYTHON_VERSION=$(PYTHON_VERSION) docker compose run --rm -v "$$(pwd):/app" test
 
 test-matrix:

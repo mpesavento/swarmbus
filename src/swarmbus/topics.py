@@ -1,40 +1,7 @@
-"""Single source of truth for swarmbus MQTT topic strings.
+"""Build and parse swarmbus topics and per-root runtime names.
 
-Every topic the bus publishes to, subscribes to, or parses is built and
-parsed here.
-
-Layout (with the default empty root):
-
-    agents/<agent_id>/inbox        directed messages
-    agents/<agent_id>/presence     retained online/offline, also the LWT
-    agents/broadcast               bus-wide fan-out
-    swarmbus/registry/<agent_id>   retained registry record + heartbeat
-
-A non-empty ``root`` prefixes the agent and registry trees, e.g.
-``TopicMap(root="foo")`` yields ``foo/agents/alice/inbox`` and
-``foo/swarmbus/registry/alice``.
-
-The map also names the agent itself: ``agent_scope`` is an agent's name on
-this bus (``alice`` unrooted, ``alice@foo`` under ``foo``) and
-``session_client_id`` is the MQTT client identifier of its persistent
-session. Both carry the root, so one agent id can hold a persistent session
-under each of two roots on the same broker.
-
-``broadcast`` is DELIBERATELY NOT ROOTED. Broadcasts are bus-wide by
-design: every agent on the broker sees them regardless of which namespace
-it lives under. Do not "fix" this asymmetry.
-
-Parsing rules
--------------
-Every parser here RAISES ``ValueError`` on a topic that does not match the
-expected shape. This is not defensive padding -- it is the whole point of
-the module. The code this replaced used
-``topic.removeprefix("agents/").removesuffix("/presence")``, and
-``str.removeprefix`` returns the string UNCHANGED when the prefix is
-absent, so a non-matching topic yielded a plausible-looking wrong agent id
-instead of an error. With a root in play, ``foo/agents/x/presence`` would
-have parsed to an agent id of ``foo/agents/x`` -- silently, forever.
-See the comments on the parsers below before touching them.
+A non-empty root prefixes the agent and registry trees. Broadcast remains
+bus-wide. Parsers raise ``ValueError`` when a topic has the wrong shape.
 """
 
 from __future__ import annotations
@@ -55,6 +22,28 @@ PRESENCE_LEAF = "presence"
 #: Separates an agent id from its root in an agent scope. Cannot occur in a
 #: valid agent id, so a scope splits back into its two parts one way only.
 SCOPE_SEPARATOR = "@"
+#: Prefix of a swarmbus systemd user unit name.
+UNIT_PREFIX = "swarmbus-"
+#: Suffix of a swarmbus systemd user unit name.
+UNIT_SUFFIX = ".service"
+#: Separates agent id from escaped root in a systemd-safe token. Unlike
+#: ``@`` and ``%``, it has no special meaning in a unit or its directives.
+UNIT_SEPARATOR = ":"
+#: systemd's maximum computed unit-name length, in bytes.
+SYSTEMD_UNIT_NAME_MAX_BYTES = 255
+#: swarmbus's own MQTT client-id bound; separate from systemd's limit.
+SWARMBUS_CLIENT_ID_MAX_BYTES = 255
+#: Suffix of the file a swarmbus systemd unit appends its output to.
+LOG_SUFFIX = ".log"
+#: Suffix of the default inbox file the listener daemon file-bridges to.
+INBOX_SUFFIX = "-inbox.md"
+#: What a root keeps verbatim in a unit name. Everything else is escaped.
+_UNIT_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    "._-"
+)
 #: The ``to`` sentinel on a message envelope that means "everyone".
 BROADCAST_AGENT_ID = "broadcast"
 #: Bus-wide broadcast topic. Never carries a root -- see the module docstring.
@@ -69,6 +58,19 @@ RESERVED_PREFIX = "$"
 EMPTY_SEGMENT = "//"
 
 _MQTT_WILDCARDS = (SINGLE_LEVEL_WILDCARD, "#")
+
+
+def _unit_escape(root: str) -> str:
+    """Encode ``root`` injectively as one systemd-safe token."""
+    out: list[str] = []
+    for char in root:
+        if char in _UNIT_SAFE:
+            out.append(char)
+        else:
+            out.extend(
+                f"{UNIT_SEPARATOR}{byte:02x}" for byte in char.encode("utf-8")
+            )
+    return "".join(out)
 
 
 def _one_agent_segment(candidate: str, *, prefix: str, topic: str) -> str:
@@ -224,8 +226,78 @@ class TopicMap:
         One identifier is one broker session: without the root, the same
         agent id persistent under two roots would be a single session, and
         each receiver would disconnect the other.
+
+        Raises ValueError past ``SWARMBUS_CLIENT_ID_MAX_BYTES``. That bound
+        is swarmbus's own, not something MQTT or a broker imposes, so the
+        error says so -- a message blaming the protocol would send a reader
+        looking for a rule that is not in it.
         """
-        return f"swarmbus-{self.agent_scope(agent_id)}"
+        client_id = f"swarmbus-{self.agent_scope(agent_id)}"
+        encoded = len(client_id.encode("utf-8"))
+        if encoded > SWARMBUS_CLIENT_ID_MAX_BYTES:
+            raise ValueError(
+                f"client id for agent {agent_id!r} under topic root "
+                f"{self.root!r} is {encoded} bytes, past swarmbus's own "
+                f"limit of {SWARMBUS_CLIENT_ID_MAX_BYTES} bytes for a client "
+                f"id: {client_id}"
+            )
+        return client_id
+
+    def unit_scope(self, agent_id: str) -> str:
+        """Name of one agent on this root, as one systemd-safe token.
+
+        The bare ``agent_id`` under the empty root; otherwise the escaped
+        root after ``UNIT_SEPARATOR``, which no agent id can contain. The
+        unit name, the unit's log file and the default inbox file are all
+        built from this one token, so each splits back into (agent id, root)
+        the same way and none of them carries a character systemd expands.
+        """
+        if not self.root:
+            return agent_id
+        return f"{agent_id}{UNIT_SEPARATOR}{_unit_escape(self.root)}"
+
+    def systemd_unit(self, agent_id: str) -> str:
+        """Return the root-specific unit name, refusing names systemd cannot hold."""
+        name = f"{UNIT_PREFIX}{self.unit_scope(agent_id)}{UNIT_SUFFIX}"
+        encoded = len(name.encode("utf-8"))
+        if encoded > SYSTEMD_UNIT_NAME_MAX_BYTES:
+            raise ValueError(
+                f"systemd unit name for agent {agent_id!r} under topic root "
+                f"{self.root!r} is {encoded} bytes, past systemd's maximum "
+                f"unit name length of {SYSTEMD_UNIT_NAME_MAX_BYTES} bytes, "
+                f"which systemd itself refuses: {name}"
+            )
+        return name
+
+    def unit_log_name(self, agent_id: str) -> str:
+        """Return the log file name keyed to this root's unit."""
+        return f"{UNIT_PREFIX}{self.unit_scope(agent_id)}{LOG_SUFFIX}"
+
+    def default_inbox_name(self, agent_id: str) -> str:
+        """Return the default inbox file name keyed to this root."""
+        return f"{self.unit_scope(agent_id)}{INBOX_SUFFIX}"
+
+    def unit_agent(self, unit_name: str) -> str:
+        """Agent id owning ``unit_name``, which must be a unit on this root.
+
+        Raises ValueError for a unit of another root or another program. A
+        daemon on another root is another swarm's daemon, and an agent id
+        taken out of its unit name says nothing about which swarm that is.
+        """
+        if not unit_name.startswith(UNIT_PREFIX) or not unit_name.endswith(
+            UNIT_SUFFIX
+        ):
+            raise ValueError(f"unit {unit_name!r} is not a swarmbus unit")
+        body = unit_name[len(UNIT_PREFIX): -len(UNIT_SUFFIX)]
+        agent_id, separator, root_token = body.partition(UNIT_SEPARATOR)
+        if bool(separator) != bool(self.root) or root_token != (
+            _unit_escape(self.root) if self.root else ""
+        ):
+            raise ValueError(
+                f"unit {unit_name!r} is not under topic root "
+                f"{self.root or '(none)'!r}"
+            )
+        return _validate_agent_id(agent_id)
 
     # ------------------------------------------------------------------
     # subscribe filters

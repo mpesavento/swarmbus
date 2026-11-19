@@ -327,6 +327,102 @@ def test_doctor_roots_both_of_its_probes(tmp_path):
     assert log.subscribed == [FLEET.any_presence_filter()]
 
 
+def _doctor_with_systemctl(tmp_path, extra, systemctl):
+    """doctor with `systemctl` answered by `systemctl(cmd)`, broker faked."""
+    asked: list[str] = []
+
+    def fake_run(cmd, **_kwargs):
+        asked.extend(arg for arg in cmd if arg.endswith(".service"))
+        return systemctl(cmd)
+
+    with _fake_broker(), patch("subprocess.run", side_effect=fake_run):
+        result = CliRunner().invoke(
+            main,
+            ["doctor", "--agent-id", "rx", "--state-dir", str(tmp_path / "state"),
+             *extra],
+            env={"CLAUDE_CONFIG_DIR": str(tmp_path / "claude")},
+        )
+    assert result.exit_code in (0, 1), result.output
+    return result, asked
+
+
+def _no_unit(cmd):
+    return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+
+
+def test_doctor_probes_the_unit_name_of_its_root(tmp_path):
+    """The unit a rooted install writes is the unit doctor must ask about.
+
+    Probing the unrooted name on a rooted host reports a running daemon
+    as missing and sends the operator to install one that is already
+    there.
+    """
+    result, asked = _doctor_with_systemctl(
+        tmp_path, ["--topic-root", ROOT], _no_unit
+    )
+
+    unit = FLEET.systemd_unit("rx")
+    assert unit == "swarmbus-rx:fleet.service"
+    assert unit in asked
+    assert f"{unit} NOT FOUND" in result.output
+    assert f"install-systemd.sh rx --topic-root {ROOT}" in result.output
+
+
+def test_doctor_keeps_probing_the_unrooted_unit_name(tmp_path):
+    """The literal: an unrooted host keeps the unit name it has."""
+    result, asked = _doctor_with_systemctl(tmp_path, [], _no_unit)
+
+    assert "swarmbus-rx.service" in asked
+    assert "swarmbus-rx.service NOT FOUND" in result.output
+    assert "swarmbus-rx:" not in result.output
+
+
+def test_doctor_finds_a_rooted_daemon_under_the_unit_name_without_a_root(tmp_path):
+    """An install from before unit names carried the root still runs.
+
+    Calling it NOT FOUND sends the operator to install a second unit for
+    the same agent id and root, which is two daemons on one persistent
+    session, each disconnecting the other.
+    """
+    legacy = PLAIN.systemd_unit("rx")
+    props = (
+        "ActiveState=active\nSubState=running\nMainPID=0\n"
+        "ExecMainStartTimestamp=Mon 2026-11-16 09:00:00 PST\n"
+        "ExecStart=/usr/bin/swarmbus start --agent-id rx --topic-root=fleet\n"
+    )
+
+    def systemctl(cmd):
+        if legacy in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=props)
+        return _no_unit(cmd)
+
+    result, _ = _doctor_with_systemctl(tmp_path, ["--topic-root", ROOT], systemctl)
+
+    assert "systemd user unit....... active" in result.output
+    assert legacy in result.output
+    assert "before unit names carried the root" in result.output
+    assert f"install-systemd.sh rx --topic-root {ROOT}" in result.output
+
+
+def test_doctor_does_not_claim_a_unit_pinned_to_another_root(tmp_path):
+    """Without a root in its name, only the pin says which swarm it serves."""
+    legacy = PLAIN.systemd_unit("rx")
+    props = (
+        "ActiveState=active\nSubState=running\nMainPID=0\n"
+        "ExecStart=/usr/bin/swarmbus start --agent-id rx --topic-root=lab\n"
+    )
+
+    def systemctl(cmd):
+        if legacy in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=props)
+        return _no_unit(cmd)
+
+    result, _ = _doctor_with_systemctl(tmp_path, ["--topic-root", ROOT], systemctl)
+
+    assert f"{FLEET.systemd_unit('rx')} NOT FOUND" in result.output
+    assert "systemd user unit....... active" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # registry maintenance
 # ---------------------------------------------------------------------------
@@ -609,6 +705,61 @@ def test_mcp_attach_uses_an_explicit_socket_as_given(tmp_path):
     assert ensure.call_args.args == (chosen,)
     assert ensure.call_args.kwargs["log_path"] == state / "rx@fleet.daemon.log"
     proxy.assert_called_once_with(str(chosen))
+
+
+@ROOTED_AND_NOT
+def test_tail_reads_the_default_inbox_of_its_root(tmp_path, monkeypatch, root, topics):
+    """`tail` reads the file the daemon writes, so their defaults must agree.
+
+    A rooted tail must not read the unrooted deployment's inbox, and an
+    unrooted one must keep reading exactly the file it always has.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sync = tmp_path / "sync"
+    sync.mkdir()
+    (sync / PLAIN.default_inbox_name("rx")).write_text("unrooted entry\n")
+    (sync / FLEET.default_inbox_name("rx")).write_text("fleet entry\n")
+
+    result = CliRunner().invoke(main, [
+        "tail", "--agent-id", "rx",
+        "--cursor-dir", str(tmp_path / "cursors"),
+        *_root_args(root),
+    ])
+
+    assert result.exit_code == 0, result.output
+    mine, theirs = ("fleet entry", "unrooted entry") if root else (
+        "unrooted entry", "fleet entry"
+    )
+    assert mine in result.output, result.output
+    assert theirs not in result.output, result.output
+    assert (sync / topics.default_inbox_name("rx")).read_text() == f"{mine}\n"
+
+
+@ROOTED_AND_NOT
+def test_tail_keeps_a_cursor_per_root(tmp_path, monkeypatch, root, topics):
+    """Two roots are two inbox files. One cursor over both re-emits one of
+    them on every switch, because the stored inode never matches."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    sync = tmp_path / "sync"
+    sync.mkdir()
+    (sync / PLAIN.default_inbox_name("rx")).write_text("unrooted entry\n")
+    (sync / FLEET.default_inbox_name("rx")).write_text("fleet entry\n")
+    cursors = tmp_path / "cursors"
+
+    result = CliRunner().invoke(main, [
+        "tail", "--agent-id", "rx", "--cursor-dir", str(cursors),
+        *_root_args(root),
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert (cursors / f"{topics.agent_scope('rx')}--default.cursor").exists(), (
+        sorted(p.name for p in cursors.iterdir())
+    )
+    unused = {"rx--default.cursor", "rx@fleet--default.cursor"} - {
+        f"{topics.agent_scope('rx')}--default.cursor"
+    }
+    for name in unused:
+        assert not (cursors / name).exists()
 
 
 def test_managed_runtime_opens_the_state_db_of_its_root(tmp_path):

@@ -86,6 +86,8 @@ The same `SWARMBUS_BROKER_*` vars work for the MCP sidecar registered with Claud
 
 `swarmbus init` accepts the same six broker auth flags. When any are supplied (or read from the matching `SWARMBUS_BROKER_*` env var), they're written into a systemd drop-in at `~/.config/systemd/user/swarmbus-<agent-id>.service.d/auth.conf` (mode 0600), which systemd merges with the main unit at daemon-reload time. The main `ExecStart` line stays clean.
 
+Under a topic root the unit carries the root, and the drop-in directory follows it: `swarmbus-<agent-id>:<root>.service.d/auth.conf`. systemd silently ignores a drop-in whose directory does not match its unit, so credentials left in the unrooted path never reach a rooted daemon. The root is escaped here rather than spelled as it is in the MQTT client id (`swarmbus-<id>@<root>`), because systemd reads `@` as a template-instance separator; characters outside `A-Za-z0-9._-` become `:` followed by two hex digits.
+
 ```bash
 swarmbus init --agent-id laptop-cc \
   --broker mqtt.example.com \

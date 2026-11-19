@@ -85,7 +85,7 @@ swarmbus send --agent-id coder --topic-root fleet --to planner --subject hi --bo
 
 `mcp-attach` passes its root to the daemon it starts. Its default socket and daemon log are named for the agent id and the root, so a session on another root starts its own daemon. Given an explicit `--socket`, it refuses a running daemon on a different root.
 
-`swarmbus init` takes the root too. It writes the root it resolved into the systemd unit's `ExecStart` as `--topic-root=<root>`, empty included, and passes it to its doctor and host-plugin steps. The unit is then pinned: a later change to `[broker] topic_root` does not move that daemon until you run `init` again or edit the unit. `scripts/install-systemd.sh` run by hand takes an optional `--topic-root <root>`; without it the unit carries no root and the daemon reads the config file. It refuses a root with characters other than letters, digits, `.`, `_`, `/` and `-`, because the root is written into the unit file; set such a root in the config file instead.
+`swarmbus init` takes the root too. It writes the root it resolved into the systemd unit's `ExecStart` as `--topic-root=<root>`, empty included, and passes it to its doctor and host-plugin steps. The unit is then pinned: a later change to `[broker] topic_root` does not move that daemon until you run `init` again or edit the unit. Because the root is rendered into a systemd unit, `init`, `scripts/install-systemd.sh --topic-root`, and the OpenClaw setup script accept only letters, digits, `.`, `_`, `/` and `-`. Other swarmbus commands still accept the broader MQTT-safe root syntax. To use one of those roots with a hand-installed unit, omit `--topic-root` and set `[broker] topic_root` in the config file.
 
 `swarmbus held` takes the root because it reads the state db, which is named for it (see "What a root separates").
 
@@ -108,13 +108,33 @@ An agent's name on one bus is its agent id when unrooted, and `<agent-id>@<root>
 | `mcp-attach` default socket | `<state-dir>/planner.sock` | `<state-dir>/planner@fleet.sock` |
 | `mcp-attach` daemon log | `<state-dir>/planner.daemon.log` | `<state-dir>/planner@fleet.daemon.log` |
 | persistent MQTT session | `swarmbus-planner` | `swarmbus-planner@fleet` |
+| systemd user unit | `swarmbus-planner.service` | `swarmbus-planner:fleet.service` |
+| that unit's log | `~/logs/swarmbus-planner.log` | `~/logs/swarmbus-planner:fleet.log` |
+| the installer's default inbox | `~/sync/planner-inbox.md` | `~/sync/planner:fleet-inbox.md` |
+| `tail` cursor | `~/.swarmbus/cursors/planner--<consumer>.cursor` | `~/.swarmbus/cursors/planner@fleet--<consumer>.cursor` |
 
 So one agent id can run under two roots on one host and one broker. Each has its own inbox, holds and rate-limit state, its own shared daemon and its own broker session, and `registry-forget` under one root does not touch the session under the other. The unrooted names are the ones an unrooted deployment has always had.
+
+The unit's log and the installer's default inbox carry the same escaped token the unit name does, so two units for one agent id neither interleave into one log nor write one inbox file. An `--inbox` you pass the installer, or `swarmbus init`, is used exactly as given — only the default carries the root.
+
+### The persistent session's client id
+
+The client identifier is `swarmbus-<agent-id>` unrooted and `swarmbus-<agent-id>@<root>` under a root, percent-encoded into one token. It deliberately goes past MQTT 3.1.1's portability floor for client ids — `[MQTT-3.1.3-5]` requires a server to allow 1 to 23 bytes of `0-9A-Za-z`, and swarmbus exceeds that on two counts: `swarmbus-<agent-id>` is longer than 23 bytes for most agent ids, and `-` is not in that character set at all. The clause is a floor on what a server must accept, not a ceiling on what one may accept, and mosquitto accepts these ids, which is why this has always worked. Treat it as a known constraint on broker choice rather than an oversight: a broker that implements only the minimum will reject swarmbus sessions. swarmbus refuses a client id past 255 bytes itself — that is swarmbus's own sanity bound, not a protocol rule (MQTT's own ceiling is 65535 bytes) and not tunable.
 
 A root does not separate two things:
 
 - **Broadcast.** `agents/broadcast` is one topic for every root on the broker.
-- **The systemd unit.** The unit is named `swarmbus-<agent-id>.service`, so a host has one unit per agent id. Rather than move a running daemon to a different swarm, `scripts/install-systemd.sh` refuses to replace a unit pinned to another root, and refuses to unpin one. Running one agent id under two roots on one host therefore means a different agent id for the second, or a daemon started some other way than this unit.
+- **The unit's outbox variable.** It is named for the agent id alone (`SWARMBUS_OUTBOX_PLANNER`), because an environment variable name cannot hold a `/`, a `%`, a `:` or an `@` and a root can. `swarmbus doctor` computes the same name independently, so a root in one place and not the other would resolve to an unset variable. Point the outbox at a per-root path by hand if a swarm needs its own file.
+
+### The systemd unit name
+
+The unit name carries the root: `swarmbus-<agent-id>.service` unrooted — byte for byte the name already installed, so nothing needs renaming — and `swarmbus-<agent-id>:<root>.service` under a root, with the root escaped into the characters systemd allows in a unit name (`fleet/prod` becomes `fleet:2fprod`). `:` separates the two because it cannot occur in an agent id and means nothing to systemd; `@` would make the name an instance of a template that does not exist, and `%` would expand as a specifier inside `ExecStart`. So two roots are two units, and installing the second cannot touch the first one's daemon.
+
+systemd's maximum unit name length is 255 bytes, and a computed name past it is refused — by `TopicMap.systemd_unit` with its real byte count beside the limit, and by `scripts/install-systemd.sh` before anything is created. It is never truncated or hashed: either would let two roots land on one unit name, which is what carrying the root exists to prevent. `swarmbus-` (9) + the longest agent id (64) + `:` (1) + `.service` (8) is 82 bytes, leaving 173 for the escaped root — about 57 characters of a root that escapes in full, at 3 bytes per source byte.
+
+A unit installed before unit names carried the root keeps the unrooted name whatever root it is pinned to. `scripts/install-systemd.sh` refuses to install a rooted unit beside one serving that same root, or beside one with no `--topic-root` pin at all (whose root only the config file knows): both would leave two daemons for one agent id on one root, sharing one broker session and disconnecting each other. Retire the old unit, or pin it to the root it really serves, and the rooted install goes through. A unit pinned to a *different* root is another swarm and is left alone. The installer still refuses to unpin or re-root the unrooted-named unit itself, since that name cannot say which swarm its daemon belongs to.
+
+`swarmbus doctor` probes the unit name for the root it is given, and falls back to the unrooted name when that unit's pin matches the root, so an install from before the rename still reports as found — with a hint to rename it.
 
 ### Moving an agent onto a root
 
@@ -245,7 +265,7 @@ A key sets the default of the CLI option in the table, on the commands that have
 | `[broker] client_cert` | path | `--client-cert` | `SWARMBUS_BROKER_CLIENT_CERT` | the `[broker] host` commands |
 | `[broker] client_key` | path | `--client-key` | `SWARMBUS_BROKER_CLIENT_KEY` | the `[broker] host` commands |
 | `[broker] tls` | boolean | `--tls` | `SWARMBUS_BROKER_TLS` | the `[broker] host` commands |
-| `[broker] topic_root` | topic root | `--topic-root` | `SWARMBUS_TOPIC_ROOT` | `send`, `start`, `read`, `watch`, `list`, `doctor`, `held`, `init`, `mcp-server`, `mcp-daemon`, `mcp-attach`, `registry-list`, `registry-gc`, `registry-forget` |
+| `[broker] topic_root` | topic root | `--topic-root` | `SWARMBUS_TOPIC_ROOT` | `send`, `start`, `read`, `watch`, `list`, `doctor`, `held`, `tail`, `init`, `mcp-server`, `mcp-daemon`, `mcp-attach`, `registry-list`, `registry-gc`, `registry-forget` |
 | `[agent] id` | string | `--agent-id` | none | every command that takes `--agent-id` |
 | `[agent] state_dir` | path | `--state-dir` | `SWARMBUS_STATE_DIR` | `send`, `start`, `read`, `watch`, `doctor`, `mcp-server`, `held` |
 | `[agent] inbox` | path | `--inbox` | none | `start`, `tail`, `init` |
