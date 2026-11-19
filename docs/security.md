@@ -144,7 +144,7 @@ topic readwrite agents/+/presence
 topic readwrite swarmbus/registry/+
 ```
 
-- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` (`swarmbus-<id>@<root>` under a topic root) only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
+- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` (`swarmbus-<id>@<root>` under a topic root) only in persistent mode. Every other one-level connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id. Two-level sessions are the exception; see "One login, many sessions" below.
 - **Literal shared rules sit under `user`.** The `%u` `pattern` lines apply to every authenticated user. Literal `topic` lines before the first `user` line apply only to anonymous clients, so the remaining shared permissions are repeated in one `user` block per agent id. Add a block when you add an agent. Mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`.
 
 ### With a topic root
@@ -166,6 +166,34 @@ topic readwrite agents/broadcast
 - **A root is a namespace, not a secret.** Anyone who can read a process's flags, environment or config file knows it. The login and the ACL are what keep one swarm out of another's topics.
 - **A wrong root fails silently.** A process started without the root, or with another one, connects without error. The broker drops what it publishes and delivers it nothing, as under "Silent denials" below.
 - **Broadcast crosses roots.** `agents/broadcast` is one topic for every swarm on the broker. Leave that line out for a swarm that must not exchange broadcasts with the others.
+
+### One login, many sessions
+
+The recipe above needs a login for every agent id. That does not work for short-lived sessions with generated ids. Give those sessions one shared login and a two-level topic address instead (`--topic-address`, see [configuration.md](configuration.md#two-level-topic-address)). An agent `flock__wren` at the address `flock/wren` logs in as `flock` and connects with the MQTT client id `flock/wren`. The `%c` substitution therefore expands to its complete topic address and no other session's.
+
+```
+# Each session of a login: read its own inbox; publish/read its own
+# presence and registry record. %c is the complete topic address.
+pattern read agents/%c/inbox
+pattern readwrite agents/%c/presence
+pattern write swarmbus/registry/%c
+
+# One block per shared login: send to any session's inbox and see every
+# session's presence and registry record.
+user flock
+topic write agents/+/+/inbox
+topic read agents/+/+/presence
+topic read swarmbus/registry/+/+
+```
+
+Start each session with `--agent-id <login>__<session>`, `--topic-address <login>/<session>` and `--username <login>`.
+
+- **Not with `--persistent`.** A persistent session's client id is always `swarmbus-<agent-id>`, so `%c` does not match it. The broker drops its presence and registry publishes and delivers it nothing. Give a persistent agent its own login, as in the recipe above.
+- **Client ids are broker-wide.** The complete address avoids collisions between `flock/wren` and `roost/wren`, but two sessions at the same address still disconnect each other even under different logins or roots.
+- **Sessions of one login can impersonate each other.** A client id is whatever the client says it is. A process holding the `flock` login can connect as `flock/wren`, which disconnects the real session and takes over its topics. The ACL keeps cooperating sessions out of each other's way; it does not protect one from another.
+- **Both layouts on one broker.** For sessions and one-level agents to see and reach each other, add `topic write agents/+/inbox`, `topic read agents/+/presence` and `topic read swarmbus/registry/+` to the shared login's block, and the three `+/+` lines to each one-level agent's block.
+- **Registry maintenance.** Add `topic readwrite agents/+/+/presence` and `topic readwrite swarmbus/registry/+/+` to the `maintenance` block, or `registry-gc` cannot clear a session's records.
+- **With a topic root**, put the root in front of every line, as above.
 
 ### Broker config
 
@@ -220,5 +248,6 @@ mosquitto 2.x warns about a password or ACL file it does not own or that others 
 | `ssl.SSLCertVerificationError: …Hostname mismatch`  | Broker cert's CN/SAN doesn't match the hostname you're connecting to. Re-issue with the right SAN.           |
 | Connect succeeds, all SUBSCRIBE return SUBACK, no messages arrive | Mosquitto 2.1+ grants SUBACK at the protocol level; ACLs filter at message **delivery**. Check the broker ACL file. |
 | Connects without error, but `read`/`watch` never receive anything, or the agent is missing from `swarmbus list` | The broker login is not the agent id, so the ACL drops its deliveries and its presence publishes without telling the client. Use the agent id as the username. |
+| A sidecar at a two-level topic address connects without error, but is missing from `agent_state` and receives nothing | The ACL matches its topics as `<login>/<client id>`. The login is not the first level of the address, or the sidecar runs with `--persistent` and so connects as `swarmbus-<agent-id>`. See "One login, many sessions". |
 | `swarmbus start` exits immediately with `ValueError: client_cert and client_key must be set together` | mTLS half-configured. Either set both or set neither.                                                       |
 | Broker rate-limits / drops your connection     | Out of scope of swarmbus today; tracked in #26. See "Broker limits" in the README for the queue and size caps mosquitto does have. |

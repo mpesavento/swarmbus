@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -20,10 +21,12 @@ def _presence_payload(
     *,
     state: str = "online",
     reason: str | None = None,
+    topic_address: str | None = None,
 ) -> str:
     """Presence payload as ManagedMCPRuntime._publish_presence emits it."""
     return PresenceRecord(
         agent_id=agent_id,
+        topic_address=topic_address,
         state=state,
         connected_at=(
             datetime.now(timezone.utc) if state == "online" else None
@@ -32,10 +35,16 @@ def _presence_payload(
     ).to_json()
 
 
-def _record(agent_id: str, *, age_seconds: float = 0) -> RegistryRecord:
+def _record(
+    agent_id: str,
+    *,
+    age_seconds: float = 0,
+    topic_address: str | None = None,
+) -> RegistryRecord:
     now = datetime.now(timezone.utc)
     return RegistryRecord(
         agent_id=agent_id,
+        topic_address=topic_address,
         status="building the weird little bus 🚌",
         working_set=[" repo ", "broker ACLs", "repo"],
         capabilities=["messaging", "agent-state"],
@@ -507,3 +516,194 @@ def test_transient_gc_requires_retention_longer_than_stale_threshold():
             stale_after_seconds=180,
             retention_seconds=180,
         )
+
+
+# ---------------------------------------------------------------------------
+# two-level addresses
+# ---------------------------------------------------------------------------
+
+SPLIT_ID = "flock__wren"
+SPLIT_ADDRESS = "flock/wren"
+SPLIT_REGISTRY = DEFAULT_TOPICS.registry(SPLIT_ID, topic_address=SPLIT_ADDRESS)
+SPLIT_PRESENCE = DEFAULT_TOPICS.presence(SPLIT_ID, topic_address=SPLIT_ADDRESS)
+
+
+def test_a_record_without_an_address_serialises_as_it_always_did():
+    """Older runtimes publish no ``topic_address`` key; neither may we."""
+    assert "topic_address" not in json.loads(_record("foo").to_json())
+    assert "topic_address" not in json.loads(_presence_payload("foo"))
+
+
+def test_a_two_level_record_carries_its_address():
+    record = _record(SPLIT_ID, topic_address=SPLIT_ADDRESS)
+    presence = _presence_payload(SPLIT_ID, topic_address=SPLIT_ADDRESS)
+
+    assert json.loads(record.to_json())["topic_address"] == SPLIT_ADDRESS
+    assert json.loads(presence)["topic_address"] == SPLIT_ADDRESS
+    assert (
+        RegistryRecord.from_mqtt(
+            SPLIT_REGISTRY, record.to_json()
+        ).resolved_topic_address
+        == SPLIT_ADDRESS
+    )
+    assert (
+        PresenceRecord.from_mqtt(SPLIT_PRESENCE, presence).resolved_topic_address
+        == SPLIT_ADDRESS
+    )
+
+
+def test_a_record_cannot_claim_an_address_that_is_not_its_own():
+    with pytest.raises(ValidationError, match="does not belong"):
+        _record("wren", topic_address=SPLIT_ADDRESS)
+    with pytest.raises(ValidationError, match="does not belong"):
+        _presence_payload("wren", topic_address=SPLIT_ADDRESS)
+
+
+def test_the_topic_decides_the_address_when_the_payload_omits_it():
+    """A publisher that does not send the field is still found where it is."""
+    record = RegistryRecord.from_mqtt(SPLIT_REGISTRY, _record(SPLIT_ID).to_json())
+    presence = PresenceRecord.from_mqtt(SPLIT_PRESENCE, _presence_payload(SPLIT_ID))
+    legacy = PresenceRecord.from_mqtt(
+        SPLIT_PRESENCE, _legacy_presence_payload(SPLIT_ID, "online")
+    )
+
+    for observed in (record, presence, legacy):
+        assert observed.resolved_topic_address == SPLIT_ADDRESS
+        # The address was set after validation; it must still be a legal one.
+        type(observed).model_validate(observed.model_dump())
+
+
+@pytest.mark.parametrize(
+    "payload_address, topic_address",
+    [
+        # Claims two levels, published at one.
+        (SPLIT_ADDRESS, None),
+        # Claims one level, published at two.
+        (SPLIT_ID, SPLIT_ADDRESS),
+    ],
+)
+def test_a_payload_address_must_match_its_topic(payload_address, topic_address):
+    registry_topic = DEFAULT_TOPICS.registry(SPLIT_ID, topic_address=topic_address)
+    presence_topic = DEFAULT_TOPICS.presence(SPLIT_ID, topic_address=topic_address)
+
+    with pytest.raises(ValueError, match="topic address"):
+        RegistryRecord.from_mqtt(
+            registry_topic,
+            _record(SPLIT_ID, topic_address=payload_address).to_json(),
+        )
+    with pytest.raises(ValueError, match="topic address"):
+        PresenceRecord.from_mqtt(
+            presence_topic,
+            _presence_payload(SPLIT_ID, topic_address=payload_address),
+        )
+
+
+def test_cache_reports_where_an_agent_was_observed():
+    cache = RegistryCache(stale_after_seconds=180)
+    cache.update_registry(
+        SPLIT_REGISTRY, _record(SPLIT_ID, topic_address=SPLIT_ADDRESS).to_json()
+    )
+    cache.update_registry(DEFAULT_TOPICS.registry("foo"), _record("foo").to_json())
+
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ADDRESS
+    assert cache.get_state(SPLIT_ID)["topic_address"] == SPLIT_ADDRESS
+    assert cache.topic_address("foo") == "foo"
+    assert "topic_address" not in cache.get_state("foo")
+
+
+def test_cache_learns_an_address_from_presence_alone():
+    cache = RegistryCache(stale_after_seconds=180)
+    cache.update_presence(
+        SPLIT_PRESENCE, _presence_payload(SPLIT_ID, topic_address=SPLIT_ADDRESS)
+    )
+
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ADDRESS
+
+
+def test_cache_addresses_an_unseen_agent_at_one_level():
+    """No record, no guess: ``a__b`` is an ordinary id unless seen otherwise."""
+    assert RegistryCache(stale_after_seconds=180).topic_address(SPLIT_ID) == SPLIT_ID
+
+
+def test_two_level_tombstones_remove_the_agent_they_name():
+    cache = RegistryCache(stale_after_seconds=180)
+    cache.update_registry(
+        SPLIT_REGISTRY, _record(SPLIT_ID, topic_address=SPLIT_ADDRESS).to_json()
+    )
+    cache.update_presence(
+        SPLIT_PRESENCE, _presence_payload(SPLIT_ID, topic_address=SPLIT_ADDRESS)
+    )
+
+    cache.remove_registry(SPLIT_REGISTRY)
+    cache.remove_presence(SPLIT_PRESENCE)
+
+    with pytest.raises(KeyError):
+        cache.get_state(SPLIT_ID)
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ID
+
+
+def test_tombstone_removes_only_the_address_it_names():
+    cache = RegistryCache(stale_after_seconds=180)
+    cache.update_registry(
+        DEFAULT_TOPICS.registry(SPLIT_ID),
+        _record(SPLIT_ID, age_seconds=30).to_json(),
+    )
+    cache.update_registry(
+        SPLIT_REGISTRY,
+        _record(
+            SPLIT_ID,
+            age_seconds=0,
+            topic_address=SPLIT_ADDRESS,
+        ).to_json(),
+    )
+
+    cache.remove_registry(DEFAULT_TOPICS.registry(SPLIT_ID))
+
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ADDRESS
+    assert cache.get_state(SPLIT_ID)["topic_address"] == SPLIT_ADDRESS
+
+
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_cache_routes_to_the_freshest_address_not_delivery_order(newest_first):
+    cache = RegistryCache(stale_after_seconds=180)
+    old = (
+        DEFAULT_TOPICS.registry(SPLIT_ID),
+        _record(SPLIT_ID, age_seconds=60).to_json(),
+    )
+    new = (
+        SPLIT_REGISTRY,
+        _record(
+            SPLIT_ID,
+            age_seconds=0,
+            topic_address=SPLIT_ADDRESS,
+        ).to_json(),
+    )
+
+    for topic, payload in ((new, old) if newest_first else (old, new)):
+        cache.update_registry(topic, payload)
+
+    assert cache.topic_address(SPLIT_ID) == SPLIT_ADDRESS
+
+
+@pytest.mark.parametrize("offline_first", [False, True])
+def test_cache_keeps_an_identity_online_when_either_address_is_live(
+    offline_first,
+):
+    cache = RegistryCache(stale_after_seconds=180)
+    offline = (
+        DEFAULT_TOPICS.presence(SPLIT_ID),
+        _presence_payload(SPLIT_ID, state="offline"),
+    )
+    online = (
+        SPLIT_PRESENCE,
+        _presence_payload(
+            SPLIT_ID,
+            topic_address=SPLIT_ADDRESS,
+        ),
+    )
+
+    for topic, payload in ((offline, online) if offline_first else (online, offline)):
+        cache.update_presence(topic, payload)
+
+    assert cache.online_agent_ids() == [SPLIT_ID]
+    assert cache.get_state(SPLIT_ID)["online"] is True

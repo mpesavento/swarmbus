@@ -23,7 +23,7 @@ from .message import AgentMessage, _validate_registered_agent_id, sanitize_field
 from .registry import RegistryRecord, presence_payload
 from .handlers.base import BaseHandler
 from .handlers.file_bridge import FileBridgeHandler
-from .topics import DEFAULT_TOPICS, TopicMap
+from .topics import DEFAULT_TOPICS, TopicMap, two_level_topic_address
 from ._compat import asyncio_timeout
 
 if TYPE_CHECKING:
@@ -570,6 +570,11 @@ class AgentBus:
         """
         if outbox_max_bytes < 0 or outbox_keep < 0:
             raise ValueError("outbox_max_bytes and outbox_keep must be >= 0")
+        if two_level_topic_address(to) is not None:
+            raise ValueError(
+                f"recipient {to!r} has no known topic address; "
+                "use a presence-enabled managed runtime"
+            )
         msg = AgentMessage.create(
             from_=self.agent_id,
             to=to,
@@ -993,11 +998,12 @@ class AgentBus:
         Raises `aiomqtt.MqttError` on broker failure; callers that want the
         graceful empty-list fallback must catch it.
         """
-        online: set[str] = set()
+        presence_by_address: dict[str, tuple[str, bool]] = {}
         async with aiomqtt.Client(
             self.broker, port=self.port, **self._aiomqtt_kwargs()
         ) as client:
-            await client.subscribe(self.topics.any_presence_filter(), qos=0)
+            for presence_filter in self.topics.presence_filters():
+                await client.subscribe(presence_filter, qos=0)
             try:
                 async with asyncio_timeout(collect_window):
                     async for mqtt_msg in client.messages:
@@ -1009,9 +1015,9 @@ class AgentBus:
                             continue
                         # Presence topics, not payload claims, define identity.
                         try:
-                            name = self.topics.presence_agent(
-                                str(mqtt_msg.topic)
-                            )
+                            topic = str(mqtt_msg.topic)
+                            address = self.topics.presence_address(topic)
+                            name = self.topics.presence_agent(topic)
                         except ValueError as exc:
                             logger.warning(
                                 "list_agents: skipping unattributable "
@@ -1029,13 +1035,17 @@ class AgentBus:
                             )
                         # Accept both legacy and registry presence shapes.
                         status = payload.get("state") or payload.get("status")
-                        if status == "online":
-                            online.add(name)
-                        else:
-                            online.discard(name)
+                        presence_by_address[address] = (
+                            name,
+                            status == "online",
+                        )
             except asyncio.TimeoutError:
                 pass
-        return sorted(online)
+        return sorted({
+            name
+            for name, is_online in presence_by_address.values()
+            if is_online
+        })
 
     async def disconnect(self) -> None:
         """Publish offline presence (retained). Call before process exit if

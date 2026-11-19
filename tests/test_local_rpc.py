@@ -700,6 +700,7 @@ def test_mcp_daemon_cli_threads_runtime_configuration(monkeypatch):
         "rate_cooldown": DEFAULT_RATE_COOLDOWN,
         "on_trip": None,
         "topics": TopicMap(),
+        "topic_address": None,
     }
 
 
@@ -1276,6 +1277,38 @@ async def test_ensure_refuses_a_daemon_on_another_topic_root(tmp_path):
             )
 
     assert "topic_root" in str(caught.value)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_refuses_a_daemon_at_another_topic_address(tmp_path):
+    # The daemon serves one agent id at one address. A session that asked
+    # for the other would send and listen where it did not ask to be.
+    socket_path = tmp_path / "run" / "a.sock"
+    socket_path.parent.mkdir(mode=0o700)
+    marker = tmp_path / "marker"
+    argv = [
+        sys.executable,
+        "-c",
+        f"open({str(marker)!r}, 'w').write('ran')",
+    ]
+
+    async with LocalRuntimeDaemon(
+        _FakeRuntime(), socket_path, settings=_settings(agent_id="flock__wren")
+    ):
+        with pytest.raises(LocalRPCDaemonMismatch) as caught:
+            await asyncio.to_thread(
+                ensure_daemon,
+                socket_path,
+                settings=_settings(
+                    agent_id="flock__wren", topic_address="flock/wren"
+                ),
+                daemon_argv=argv,
+                env=dict(os.environ),
+                log_path=tmp_path / "a.daemon.log",
+            )
+
+    assert "topic_address" in str(caught.value)
     assert not marker.exists()
 
 

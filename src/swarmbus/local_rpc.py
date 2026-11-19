@@ -746,6 +746,7 @@ def daemon_settings(
     presence: bool,
     lifecycle: str,
     topic_root: str = "",
+    topic_address: str | None = None,
 ) -> dict[str, Any]:
     """The settings fingerprint a daemon reports and an attaching session compares.
 
@@ -753,9 +754,9 @@ def daemon_settings(
     hash or other derivation of it, because the fingerprint crosses the socket
     in every ping reply and appears in error messages.
 
-    The topic root is part of it because a session attached to a daemon on
-    another root would send and receive in a namespace it did not ask for,
-    with no error from the broker.
+    The topic root and topic address are part of it because a session
+    attached to a daemon on other topics would send and receive somewhere it
+    did not ask for, with no error from the broker.
     """
     return {
         "agent_id": agent_id,
@@ -771,6 +772,7 @@ def daemon_settings(
         "presence": presence,
         "lifecycle": lifecycle,
         "topic_root": topic_root,
+        "topic_address": topic_address,
     }
 
 
@@ -953,6 +955,7 @@ def run_mcp_daemon(
     rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     on_trip: list[str] | None = None,
     topics: TopicMap = DEFAULT_TOPICS,
+    topic_address: str | None = None,
 ) -> None:
     """Run one managed runtime until a signal or local shutdown request."""
     runtime = create_managed_runtime(
@@ -978,6 +981,7 @@ def run_mcp_daemon(
         on_trip=on_trip,
         trip_listener="mcp-daemon",
         topics=topics,
+        topic_address=topic_address,
     )
 
     settings = daemon_settings(
@@ -994,6 +998,7 @@ def run_mcp_daemon(
         presence=presence,
         lifecycle=lifecycle,
         topic_root=topics.root,
+        topic_address=topic_address,
     )
 
     async def serve() -> None:

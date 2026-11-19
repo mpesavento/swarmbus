@@ -110,9 +110,9 @@ class _RecordingAck:
         self.messages.append(message)
 
 
-def _runtime(store, **kwargs):
+def _runtime(store, *, agent_id="foo", **kwargs):
     return ManagedMCPRuntime(
-        agent_id="foo",
+        agent_id=agent_id,
         broker="localhost",
         state_path="unused.sqlite3",
         store=store,
@@ -1799,6 +1799,212 @@ async def test_disconnected_shutdown_destroys_no_session(monkeypatch):
     assert events == []
     assert connects == []
     assert runtime.state is RuntimeState.STOPPED
+
+# ---------------------------------------------------------------------------
+# two-level addresses
+# ---------------------------------------------------------------------------
+
+SPLIT = {"agent_id": "flock__wren", "topic_address": "flock/wren"}
+
+
+def _observe(runtime, agent_id, topic_address=None):
+    """Put one agent's registry record into the runtime's directory cache."""
+    now = datetime.now(timezone.utc)
+    record = RegistryRecord(
+        agent_id=agent_id,
+        topic_address=topic_address,
+        started_at=now,
+        last_seen=now,
+    )
+    runtime.registry.update_registry(
+        runtime.topics.registry(agent_id, topic_address=topic_address),
+        record.to_json(),
+    )
+
+
+def _delivery(topic, msg):
+    delivery = MagicMock()
+    delivery.topic = topic
+    delivery.payload = msg.to_json().encode()
+    delivery.mid = 7
+    delivery.qos = 1
+    return delivery
+
+
+def test_two_level_session_names_its_client_id_without_persisting():
+    """A broker ACL grants the address by client id."""
+    kwargs = _runtime(_FakeStore([]), **SPLIT)._client_kwargs()
+
+    assert kwargs["identifier"] == "flock/wren"
+    assert kwargs["clean_session"] is True
+
+
+def test_two_level_persistent_session_keeps_the_canonical_client_id():
+    """An address never renames a persistent session.
+
+    Maintenance destroys persistent sessions by client id, and may only do
+    that under an id it derived from the agent id itself.
+    """
+    kwargs = _runtime(
+        _FakeStore([]), persistent=True, presence=True, **SPLIT
+    )._client_kwargs()
+
+    assert kwargs["identifier"] == "swarmbus-flock__wren"
+    assert kwargs["clean_session"] is False
+
+
+def test_one_level_session_still_leaves_its_client_id_to_the_library():
+    for runtime in (
+        _runtime(_FakeStore([])),
+        # An address equal to the agent id is the one-level layout.
+        _runtime(_FakeStore([]), topic_address="foo"),
+        # The separator alone does not opt an id into two levels.
+        _runtime(_FakeStore([]), agent_id="flock__wren"),
+    ):
+        kwargs = runtime._client_kwargs()
+        assert "identifier" not in kwargs
+        assert "clean_session" not in kwargs
+        assert runtime.topic_address is None
+
+
+def test_runtime_refuses_an_address_that_is_not_its_own():
+    with pytest.raises(ValueError, match="does not belong"):
+        _runtime(_FakeStore([]), topic_address="flock/wren")
+
+
+def test_two_level_last_will_is_published_at_the_address():
+    will = _runtime(_FakeStore([]), presence=True, **SPLIT)._client_kwargs()["will"]
+
+    assert str(will.topic) == "agents/flock/wren/presence"
+    assert json.loads(will.payload)["topic_address"] == "flock/wren"
+
+
+@pytest.mark.asyncio
+async def test_two_level_runtime_publishes_its_directory_records_at_the_address():
+    runtime = _runtime(_FakeStore([]), presence=True, **SPLIT)
+    runtime._client = _FakeClient()
+
+    await runtime._publish_registry()
+    await runtime._publish_presence("online")
+
+    published = {
+        call.args[0]: json.loads(call.args[1])
+        for call in runtime._client.publish.await_args_list
+    }
+    assert set(published) == {
+        "swarmbus/registry/flock/wren",
+        "agents/flock/wren/presence",
+    }
+    for payload in published.values():
+        assert payload["agent_id"] == "flock__wren"
+        assert payload["topic_address"] == "flock/wren"
+    # Its own cache took both records, so payload and topic agree.
+    assert runtime.registry.get_state("flock__wren")["topic_address"] == "flock/wren"
+
+
+@pytest.mark.asyncio
+async def test_two_level_runtime_receives_at_its_address_only():
+    store = _FakeStore([])
+    runtime = _runtime(store, **SPLIT)
+    ack = _RecordingAck()
+    msg = AgentMessage.create(
+        from_="robin", to="flock__wren", subject="hey", body="yo"
+    )
+
+    await runtime._handle_message(_delivery("agents/flock__wren/inbox", msg), ack)
+    assert store.messages == []
+
+    await runtime._handle_message(_delivery("agents/flock/wren/inbox", msg), ack)
+    assert [stored.id for stored in store.messages] == [msg.id]
+    assert len(ack.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_reaches_a_recipient_observed_at_two_levels():
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._client = _FakeClient()
+    _observe(runtime, "flock__wren", "flock/wren")
+
+    await runtime.send_message(to="flock__wren", subject="hello", body="ping")
+
+    assert runtime._client.publish.await_args.args[0] == "agents/flock/wren/inbox"
+
+
+@pytest.mark.asyncio
+async def test_send_refuses_an_unobserved_recipient_with_two_possible_addresses():
+    """No directory record can distinguish its one- and two-level inboxes."""
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._client = _FakeClient()
+
+    with pytest.raises(ValueError, match="topic address"):
+        await runtime.send_message(
+            to="flock__wren",
+            subject="hello",
+            body="ping",
+        )
+
+    runtime._client.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_without_presence_refuses_a_recipient_with_two_addresses():
+    runtime = _runtime(_FakeStore([]))
+    runtime._client = _FakeClient()
+
+    with pytest.raises(ValueError, match="topic address"):
+        await runtime.send_message(
+            to="flock__wren",
+            subject="hello",
+            body="ping",
+        )
+
+    runtime._client.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_follows_a_recipient_observed_at_one_level():
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._client = _FakeClient()
+    _observe(runtime, "flock__wren")
+
+    await runtime.send_message(to="flock__wren", subject="hello", body="ping")
+
+    assert runtime._client.publish.await_args.args[0] == "agents/flock__wren/inbox"
+
+
+@pytest.mark.asyncio
+async def test_send_waits_out_the_directory_settling_window():
+    """A send just after connect must not miss a record still arriving."""
+    runtime = _runtime(_FakeStore([]), presence=True)
+    runtime._client = _FakeClient()
+    loop = asyncio.get_running_loop()
+    runtime._directory_state = DirectoryState.SYNCING
+    runtime._directory_sync_deadline = loop.time() + 0.2
+    loop.call_later(0.02, _observe, runtime, "flock__wren", "flock/wren")
+
+    await runtime.send_message(to="flock__wren", subject="hello", body="ping")
+
+    assert runtime._client.publish.await_args.args[0] == "agents/flock/wren/inbox"
+
+
+@pytest.mark.asyncio
+async def test_two_level_transient_shutdown_retires_its_address(monkeypatch):
+    events = []
+    runtime = _shutdown_runtime(
+        events, persistent=True, lifecycle="transient", **SPLIT
+    )
+    connects = _capture_session_destroy(monkeypatch, events)
+
+    await runtime.stop()
+
+    assert events == [
+        ("agents/flock/wren/presence", b""),
+        ("swarmbus/registry/flock/wren", b""),
+        ("destroy-session", None),
+    ]
+    assert connects[0]["identifier"] == "swarmbus-flock__wren"
+    assert connects[0]["clean_session"] is True
+
 
 def _inbox_delivery(msg, agent):
     delivery = MagicMock()

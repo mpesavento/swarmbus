@@ -5,10 +5,15 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .message import _validate_agent_id, sanitize_field
-from .topics import DEFAULT_TOPICS, TopicMap
+from .topics import (
+    DEFAULT_TOPICS,
+    TopicMap,
+    agent_id_for_topic_address,
+    topic_address_for_agent,
+)
 
 MAX_STATUS_LENGTH = 280
 MAX_CAPABILITY_LENGTH = 128
@@ -48,6 +53,9 @@ def _normalize_string_list(
 class RegistryRecord(BaseModel):
     schema_version: Literal[1] = 1
     agent_id: str
+    #: Set only by an agent at a two-level address. Readers take the address
+    #: from the topic; this is the same value for whoever reads the payload.
+    topic_address: str | None = None
     status: str = ""
     working_set: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
@@ -98,8 +106,21 @@ class RegistryRecord(BaseModel):
             max_item_length=MAX_CAPABILITY_LENGTH,
         )
 
+    @model_validator(mode="after")
+    def validate_topic_address(self) -> "RegistryRecord":
+        topic_address_for_agent(self.agent_id, self.topic_address)
+        return self
+
+    @property
+    def resolved_topic_address(self) -> str:
+        return self.topic_address or self.agent_id
+
     def to_json(self) -> str:
-        return self.model_dump_json()
+        # A record without an address stays byte-identical to the ones older
+        # runtimes publish.
+        return self.model_dump_json(
+            exclude={"topic_address"} if self.topic_address is None else None
+        )
 
     @classmethod
     def from_mqtt(
@@ -110,19 +131,28 @@ class RegistryRecord(BaseModel):
         topics: TopicMap = DEFAULT_TOPICS,
     ) -> "RegistryRecord":
         # Topic ownership is authoritative; reject conflicting payload identity.
-        topic_agent = topics.registry_agent(topic)
+        topic_address = topics.registry_address(topic)
+        topic_agent = agent_id_for_topic_address(topic_address)
         record = cls.model_validate_json(payload)
         if record.agent_id != topic_agent:
             raise ValueError(
                 f"registry agent_id {record.agent_id!r} does not match "
                 f"topic agent {topic_agent!r}"
             )
+        if record.topic_address not in (None, topic_address):
+            raise ValueError(
+                f"registry topic_address {record.topic_address!r} does not "
+                f"match topic address {topic_address!r}"
+            )
+        if topic_address != record.agent_id:
+            record = record.model_copy(update={"topic_address": topic_address})
         return record
 
 
 class PresenceRecord(BaseModel):
     schema_version: Literal[1] = 1
     agent_id: str
+    topic_address: str | None = None
     state: Literal["online", "offline"]
     connected_at: datetime | None = None
     reason: str | None = None
@@ -158,6 +188,15 @@ class PresenceRecord(BaseModel):
             raise ValueError("first_seen_offline must be timezone-aware")
         return value
 
+    @model_validator(mode="after")
+    def validate_topic_address(self) -> "PresenceRecord":
+        topic_address_for_agent(self.agent_id, self.topic_address)
+        return self
+
+    @property
+    def resolved_topic_address(self) -> str:
+        return self.topic_address or self.agent_id
+
     def to_json(self) -> str:
         return self.model_dump_json(exclude_none=True)
 
@@ -170,7 +209,8 @@ class PresenceRecord(BaseModel):
         topics: TopicMap = DEFAULT_TOPICS,
     ) -> "PresenceRecord":
         # Apply the same topic-identity check as RegistryRecord.
-        topic_agent = topics.presence_agent(topic)
+        topic_address = topics.presence_address(topic)
+        topic_agent = agent_id_for_topic_address(topic_address)
 
         data = json.loads(payload)
         if "agent_id" not in data and "agent" in data:
@@ -180,6 +220,7 @@ class PresenceRecord(BaseModel):
             data = {
                 "schema_version": 1,
                 "agent_id": data["agent"],
+                "topic_address": data.get("topic_address"),
                 "state": data.get("status"),
                 "connected_at": data.get("connected_at"),
                 "reason": data.get("reason"),
@@ -193,6 +234,13 @@ class PresenceRecord(BaseModel):
                 f"presence agent_id {record.agent_id!r} does not match "
                 f"topic agent {topic_agent!r}"
             )
+        if record.topic_address not in (None, topic_address):
+            raise ValueError(
+                f"presence topic_address {record.topic_address!r} does not "
+                f"match topic address {topic_address!r}"
+            )
+        if topic_address != record.agent_id:
+            record = record.model_copy(update={"topic_address": topic_address})
         return record
 
 
@@ -201,10 +249,12 @@ def presence_payload(
     state: Literal["online", "offline"],
     *,
     reason: str | None = None,
+    topic_address: str | None = None,
 ) -> str:
     """Serialize the current presence payload."""
     return PresenceRecord(
         agent_id=agent_id,
+        topic_address=topic_address,
         state=state,
         connected_at=(
             datetime.now(timezone.utc) if state == "online" else None
@@ -417,7 +467,7 @@ def transient_gc_decision(
 
 
 class RegistryCache:
-    """In-memory view of retained registry and presence topics."""
+    """In-memory view of retained directory records, keyed by topic address."""
 
     def __init__(
         self,
@@ -438,52 +488,112 @@ class RegistryCache:
 
     def update_registry(self, topic: str, payload: str | bytes) -> RegistryRecord:
         record = RegistryRecord.from_mqtt(topic, payload, topics=self.topics)
-        self._registry[record.agent_id] = record
+        self._registry[record.resolved_topic_address] = record
         return record
 
     def update_presence(self, topic: str, payload: str | bytes) -> PresenceRecord:
         record = PresenceRecord.from_mqtt(topic, payload, topics=self.topics)
-        self._presence[record.agent_id] = record
+        self._presence[record.resolved_topic_address] = record
         return record
 
     def remove_registry(self, topic: str) -> None:
-        self._registry.pop(self.topics.registry_agent(topic), None)
+        self._registry.pop(self.topics.registry_address(topic), None)
 
     def remove_presence(self, topic: str) -> None:
-        self._presence.pop(self.topics.presence_agent(topic), None)
+        self._presence.pop(self.topics.presence_address(topic), None)
 
-    def _presence_evidence(
+    def addresses(self, agent_id: str) -> tuple[str, ...]:
+        addresses = {
+            address
+            for address, record in self._registry.items()
+            if record.agent_id == agent_id
+        }
+        addresses.update(
+            address
+            for address, record in self._presence.items()
+            if record.agent_id == agent_id
+        )
+        return tuple(sorted(addresses))
+
+    def _presence_evidence_at(
+        self,
+        address: str,
+        *,
+        now: datetime,
+    ) -> PresenceEvidence:
+        return presence_evidence(
+            record=self._registry.get(address),
+            presence=self._presence.get(address),
+            now=now,
+            stale_after_seconds=self.stale_after_seconds,
+        )
+
+    def _preferred_address(
         self,
         agent_id: str,
         *,
         now: datetime | None = None,
-    ) -> PresenceEvidence:
-        return presence_evidence(
-            record=self._registry.get(agent_id),
-            presence=self._presence.get(agent_id),
-            now=now or datetime.now(timezone.utc),
-            stale_after_seconds=self.stale_after_seconds,
-        )
+    ) -> str:
+        addresses = self.addresses(agent_id)
+        if not addresses:
+            raise KeyError(agent_id)
+        current = now or datetime.now(timezone.utc)
+        earliest = datetime.min.replace(tzinfo=timezone.utc)
+
+        def rank(address: str) -> tuple[bool, datetime, datetime, str]:
+            record = self._registry.get(address)
+            presence = self._presence.get(address)
+            return (
+                self._presence_evidence_at(address, now=current)
+                is PresenceEvidence.ONLINE,
+                record.last_seen if record else earliest,
+                (
+                    presence.connected_at
+                    if presence and presence.connected_at
+                    else earliest
+                ),
+                address,
+            )
+
+        return max(addresses, key=rank)
+
+    def topic_address(self, agent_id: str) -> str:
+        """Where to reach an agent: its live, freshest observed address.
+
+        An unseen agent falls back to one level. Callers that cannot distinguish
+        an opted-in two-level address must refuse that route.
+        """
+        try:
+            return self._preferred_address(agent_id)
+        except KeyError:
+            return agent_id
 
     def _is_online(self, agent_id: str, *, now: datetime | None = None) -> bool:
-        return (
-            self._presence_evidence(agent_id, now=now)
+        current = now or datetime.now(timezone.utc)
+        return any(
+            self._presence_evidence_at(address, now=current)
             is PresenceEvidence.ONLINE
+            for address in self.addresses(agent_id)
         )
 
     def online_agent_ids(self) -> list[str]:
-        agent_ids = set(self._presence) | set(self._registry)
-        return sorted(agent_id for agent_id in agent_ids if self._is_online(agent_id))
+        agent_ids = {
+            record.agent_id
+            for record in (*self._registry.values(), *self._presence.values())
+        }
+        return sorted(
+            agent_id for agent_id in agent_ids if self._is_online(agent_id)
+        )
 
     def get_state(self, agent_id: str) -> dict:
-        if agent_id not in self._registry and agent_id not in self._presence:
-            raise KeyError(agent_id)
-        record = self._registry.get(agent_id)
-        presence = self._presence.get(agent_id)
-        evidence = self._presence_evidence(agent_id)
+        current = datetime.now(timezone.utc)
+        address = self._preferred_address(agent_id, now=current)
+        record = self._registry.get(address)
+        presence = self._presence.get(address)
+        evidence = self._presence_evidence_at(address, now=current)
         state = {
             "agent_id": agent_id,
-            "online": evidence is PresenceEvidence.ONLINE,
+            "online": self._is_online(agent_id, now=current),
             "presence_evidence": evidence.value,
             "untrusted": True,
             "status": record.status if record else "",
@@ -499,6 +609,8 @@ class RegistryCache:
             ),
             "last_seen": record.last_seen.isoformat() if record else None,
         }
+        if address != agent_id:
+            state["topic_address"] = address
         if presence and presence.state == "offline" and presence.reason:
             state["offline_reason"] = presence.reason
         return state
@@ -509,7 +621,10 @@ class RegistryCache:
         include_offline: bool = False,
         lifecycle: AgentLifecycle | None = None,
     ) -> list[dict]:
-        agent_ids = sorted(set(self._registry) | set(self._presence))
+        agent_ids = sorted({
+            record.agent_id
+            for record in (*self._registry.values(), *self._presence.values())
+        })
         states = [self.get_state(agent_id) for agent_id in agent_ids]
         if lifecycle is not None:
             states = [

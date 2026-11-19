@@ -291,9 +291,18 @@ async def test_list_agents_trusts_topic_owner_not_payload_claim():
 async def test_list_agents_skips_unattributable_presence_topic():
     """Unattributable presence topics do not abort listing."""
     assert await _listed([
-        _record_presence("imposter", "online", topic_owner="outer/inner"),
+        _record_presence("imposter", "online", topic_owner="outer/inner/deep"),
         _legacy_presence("sparrow", "online"),
     ]) == ["sparrow"]
+
+
+@pytest.mark.asyncio
+async def test_list_agents_names_an_agent_at_a_two_level_address():
+    """A two-level presence topic belongs to the id its two levels join to."""
+    assert await _listed([
+        _record_presence("flock__wren", "online", topic_owner="flock/wren"),
+        _legacy_presence("sparrow", "online"),
+    ]) == ["flock__wren", "sparrow"]
 
 
 @pytest.mark.parametrize("junk", [b"[]", b"null", b"3"])
@@ -319,6 +328,27 @@ async def test_list_agents_applies_last_presence_write_per_agent():
     ]) == []
 
 
+@pytest.mark.parametrize("offline_first", [False, True])
+@pytest.mark.asyncio
+async def test_list_agents_keeps_an_identity_live_at_either_address(
+    offline_first,
+):
+    offline = _record_presence(
+        "flock__wren",
+        "offline",
+        topic_owner="flock__wren",
+    )
+    online = _record_presence(
+        "flock__wren",
+        "online",
+        topic_owner="flock/wren",
+    )
+
+    assert await _listed(
+        [offline, online] if offline_first else [online, offline]
+    ) == ["flock__wren"]
+
+
 @pytest.mark.asyncio
 async def test_probe_bypasses_agent_id_validation():
     """AgentBus.probe() must not raise even though `_probe` starts with _."""
@@ -342,6 +372,20 @@ class _NullPublishClient:
 
     async def publish(self, *args, **kwargs):
         pass
+
+
+@pytest.mark.asyncio
+async def test_send_refuses_an_ambiguous_recipient_without_a_directory():
+    with patch("swarmbus.bus.aiomqtt.Client") as client:
+        bus = AgentBus(agent_id="sparrow")
+        with pytest.raises(ValueError, match="topic address"):
+            await bus.send(
+                to="flock__wren",
+                subject="hello",
+                body="hi wren",
+            )
+
+    client.assert_not_called()
 
 
 @pytest.mark.asyncio

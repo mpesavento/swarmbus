@@ -28,7 +28,12 @@ from .registry import (
     RegistryRecord,
     presence_payload,
 )
-from .topics import DEFAULT_TOPICS, TopicMap
+from .topics import (
+    DEFAULT_TOPICS,
+    TopicMap,
+    live_session_client_id,
+    two_level_topic_address,
+)
 from .trip_alert import TripAlerter
 
 logger = logging.getLogger(__name__)
@@ -138,8 +143,15 @@ class ManagedMCPRuntime:
         on_trip: list[str] | None = None,
         trip_listener: str = "mcp-server",
         topics: TopicMap = DEFAULT_TOPICS,
+        topic_address: str | None = None,
     ) -> None:
         _validate_registered_agent_id(agent_id)
+        # Raises unless the address is this agent id's own.
+        self._live_client_id = live_session_client_id(agent_id, topic_address)
+        #: Set only for a two-level address; None means the agent id itself.
+        self.topic_address = (
+            topic_address if topic_address and "/" in topic_address else None
+        )
         if lifecycle not in {"named", "transient"}:
             raise ValueError("lifecycle must be named or transient")
         if lifecycle == "transient" and not presence:
@@ -241,17 +253,33 @@ class ManagedMCPRuntime:
         self._directory_sync_deadline: float | None = None
         self._directory_generation = 0
 
+    def _inbox_topic(self) -> str:
+        return self.topics.inbox(
+            self.agent_id, topic_address=self.topic_address
+        )
+
+    def _presence_topic(self) -> str:
+        return self.topics.presence(
+            self.agent_id, topic_address=self.topic_address
+        )
+
+    def _registry_topic(self) -> str:
+        return self.topics.registry(
+            self.agent_id, topic_address=self.topic_address
+        )
+
     def _client_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
         }
         if self.presence:
             kwargs["will"] = aiomqtt.Will(
-                topic=self.topics.presence(self.agent_id),
+                topic=self._presence_topic(),
                 payload=presence_payload(
                     self.agent_id,
                     "offline",
                     reason="connection-lost",
+                    topic_address=self.topic_address,
                 ),
                 qos=1,
                 retain=True,
@@ -265,6 +293,10 @@ class ManagedMCPRuntime:
         if self.persistent:
             kwargs["identifier"] = self.topics.session_client_id(self.agent_id)
             kwargs["clean_session"] = False
+        elif self._live_client_id is not None:
+            # A broker ACL grants a two-level address by client id.
+            kwargs["identifier"] = self._live_client_id
+            kwargs["clean_session"] = True
         return kwargs
 
     def _new_client(self) -> aiomqtt.Client:
@@ -313,6 +345,15 @@ class ManagedMCPRuntime:
     def _end_directory_sync(self) -> None:
         self._directory_state = DirectoryState.DISCONNECTED
         self._directory_sync_deadline = None
+
+    async def _settle_directory(self) -> None:
+        """Wait out what is left of the post-connect settling window."""
+        deadline = self._directory_sync_deadline
+        if self._directory_state is not DirectoryState.SYNCING or deadline is None:
+            return
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
 
     async def _await_directory_ready(self) -> None:
         if not self.presence:
@@ -516,18 +557,15 @@ class ManagedMCPRuntime:
             try:
                 async with client:
                     connected_at = asyncio.get_running_loop().time()
-                    await client.subscribe(
-                        self.topics.inbox(self.agent_id), qos=1
-                    )
+                    await client.subscribe(self._inbox_topic(), qos=1)
                     await client.subscribe(self.topics.broadcast, qos=1)
                     if self.presence:
                         self._begin_directory_sync()
-                        await client.subscribe(
-                            self.topics.any_presence_filter(), qos=0
-                        )
-                        await client.subscribe(
-                            self.topics.any_registry_filter(), qos=0
-                        )
+                        for directory_filter in (
+                            *self.topics.presence_filters(),
+                            *self.topics.registry_filters(),
+                        ):
+                            await client.subscribe(directory_filter, qos=0)
                     self._client = client
                     if self.persistent:
                         self._replay_activity_at = (
@@ -718,7 +756,11 @@ class ManagedMCPRuntime:
         ack_adapter: _ManualAckAdapter | Any,
     ) -> None:
         topic = str(mqtt_message.topic)
-        if self.topics.is_message_topic(topic, agent_id=self.agent_id):
+        if self.topics.is_message_topic(
+            topic,
+            agent_id=self.agent_id,
+            topic_address=self.topic_address,
+        ):
             try:
                 message = AgentMessage.from_json(mqtt_message.payload)
             except (TypeError, ValueError, UnicodeDecodeError) as exc:
@@ -784,8 +826,18 @@ class ManagedMCPRuntime:
         content_type: str = "text/plain",
         in_reply_to: str | None = None,
     ) -> None:
+        # A two-level recipient is found through the directory, which is
+        # still filling just after a connect.
+        await self._settle_directory()
         if self._client is None:
             raise self._transport_unavailable()
+        if (
+            two_level_topic_address(to) is not None
+            and not self.registry.addresses(to)
+        ):
+            raise ValueError(
+                f"recipient {to!r} has no observed topic address"
+            )
         hops = 0
         origin = None
         if in_reply_to:
@@ -806,7 +858,9 @@ class ManagedMCPRuntime:
             origin=origin,
         )
         await self._client.publish(
-            self.topics.route(to),
+            self.topics.route(
+                to, topic_address=self.registry.topic_address(to)
+            ),
             message.to_json(),
             qos=1,
             retain=False,
@@ -1000,6 +1054,7 @@ class ManagedMCPRuntime:
         )
         candidate = RegistryRecord(
             agent_id=self.agent_id,
+            topic_address=self.topic_address,
             status=self.status if status is None else status,
             working_set=self.working_set if working_set is None else working_set,
             capabilities=[*self.runtime_capabilities, *declared],
@@ -1041,8 +1096,13 @@ class ManagedMCPRuntime:
     ) -> None:
         if self._client is None:
             raise self._transport_unavailable()
-        topic = self.topics.presence(self.agent_id)
-        payload = presence_payload(self.agent_id, state, reason=reason)
+        topic = self._presence_topic()
+        payload = presence_payload(
+            self.agent_id,
+            state,
+            reason=reason,
+            topic_address=self.topic_address,
+        )
         await self._client.publish(
             topic,
             payload,
@@ -1059,6 +1119,7 @@ class ManagedMCPRuntime:
             raise self._transport_unavailable()
         record = record or RegistryRecord(
             agent_id=self.agent_id,
+            topic_address=self.topic_address,
             status=self.status,
             working_set=self.working_set,
             capabilities=[
@@ -1071,7 +1132,7 @@ class ManagedMCPRuntime:
             state_updated_at=self.state_updated_at,
             last_seen=datetime.now(timezone.utc),
         )
-        topic = self.topics.registry(self.agent_id)
+        topic = self._registry_topic()
         payload = record.to_json()
         await self._client.publish(
             topic,
@@ -1085,8 +1146,8 @@ class ManagedMCPRuntime:
         """Tombstone retained state; report whether a session destroy is owed."""
         if self._client is None:
             raise self._transport_unavailable()
-        registry_topic = self.topics.registry(self.agent_id)
-        presence_topic = self.topics.presence(self.agent_id)
+        registry_topic = self._registry_topic()
+        presence_topic = self._presence_topic()
         # Remove presence first so interruption leaves a GC-eligible registry
         # orphan rather than an uncollectable presence orphan.
         await self._client.publish(
