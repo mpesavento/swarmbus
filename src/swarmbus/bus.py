@@ -191,7 +191,8 @@ class AgentBus:
     # builds an instance via cls.__new__ and never runs __init__, so an
     # instance-only attribute would leave probe buses unable to build a
     # topic. Root-less by default, which keeps the wire format unchanged;
-    # a rooted deployment overrides this with TopicMap(root=...).
+    # a rooted deployment passes topics=TopicMap(root=...) to __init__ or
+    # probe().
     topics: TopicMap = DEFAULT_TOPICS
     # Same reasoning: a probe bus never runs __init__ and holds nothing.
     hold_store: "SQLiteMessageStore | None" = None
@@ -214,6 +215,7 @@ class AgentBus:
         hold_store: "SQLiteMessageStore | None" = None,
         trip_alerter: "TripAlerter | None" = None,
         registry_heartbeat_seconds: float = 60.0,
+        topics: TopicMap = DEFAULT_TOPICS,
     ) -> None:
         """Construct an AgentBus.
 
@@ -256,6 +258,11 @@ class AgentBus:
 
         trip_alerter: runs once per sender newly tripped by ``hold_store``;
         closed when ``listen()`` or ``watch_inbox()`` returns.
+
+        topics: the MQTT topic layout. Pass ``TopicMap(root=...)`` to put
+        this agent's inbox, presence and registry topics under a namespace.
+        Every process on the broker that should reach it needs the same
+        root; a mismatch delivers nothing and raises nothing.
         """
         _validate_registered_agent_id(agent_id)
         if registry_heartbeat_seconds <= 0:
@@ -283,6 +290,7 @@ class AgentBus:
         self.hold_store = hold_store
         self.trip_alerter = trip_alerter
         self.registry_heartbeat_seconds = registry_heartbeat_seconds
+        self.topics = topics
         self._handlers: List[BaseHandler] = []
         # Persistent-client state (used when AgentBus is entered as an async
         # context manager, or when connect()/close() are called explicitly).
@@ -433,6 +441,7 @@ class AgentBus:
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        topics: TopicMap = DEFAULT_TOPICS,
     ) -> "AgentBus":
         """Construct a broker-only instance for operations that don't need a
         registered agent identity (e.g. `list_agents`).
@@ -443,6 +452,8 @@ class AgentBus:
 
         Auth + TLS kwargs mirror ``__init__``: a probe bus must connect with
         the same credentials as a regular bus on a hardened broker.
+        ``topics`` mirrors it too: a probe sees only the agents under its
+        own root.
         """
         self = cls.__new__(cls)
         self.agent_id = "_probe"
@@ -466,6 +477,7 @@ class AgentBus:
         self.hold_store = None
         self.trip_alerter = None
         self.registry_heartbeat_seconds = 60.0
+        self.topics = topics
         self._client = None
         self._client_cm = None
         return self
@@ -640,7 +652,9 @@ class AgentBus:
             "max_queued_incoming_messages": MAX_QUEUED_INCOMING_MESSAGES,
         }
         if self.persistent:
-            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["identifier"] = self.topics.session_client_id(
+                self.agent_id
+            )
             client_kwargs["clean_session"] = False
         if self.hold_store is not None:
             # A failure propagates: better to exit than run unprotected.
@@ -789,8 +803,9 @@ class AgentBus:
         By default, opens a fresh non-persistent MQTT session per call —
         only messages sent with ``retain=True`` are visible.
 
-        When ``self.persistent`` is True, connects with a stable client
-        identifier (``swarmbus-<agent_id>``) and ``clean_session=False``.
+        When ``self.persistent`` is True, connects with the stable client
+        identifier of this agent's session on this topic root and
+        ``clean_session=False``.
         The broker queues QoS1 messages for this agent between calls and
         redelivers them on reconnect — no listener daemon required for
         persistent delivery.  Only one client can hold a persistent session
@@ -813,7 +828,9 @@ class AgentBus:
             await self.hold_store.open()
         client_kwargs: dict[str, Any] = {**self._aiomqtt_kwargs()}
         if self.persistent:
-            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["identifier"] = self.topics.session_client_id(
+                self.agent_id
+            )
             client_kwargs["clean_session"] = False
         messages: list[dict] = []
         async with aiomqtt.Client(
@@ -858,10 +875,11 @@ class AgentBus:
         messages **published while this call is active**, plus any with
         ``retain=True`` on subscribe.
 
-        When ``self.persistent`` is True, connects as ``swarmbus-<agent_id>``
-        with ``clean_session=False`` and acknowledges by hand. The returned
-        message is acknowledged, every skipped malformed payload is
-        acknowledged, and nothing else is. Messages received but not
+        When ``self.persistent`` is True, connects under this agent's session
+        client identifier for this topic root with ``clean_session=False``
+        and acknowledges by hand. The returned message is acknowledged,
+        every skipped malformed payload is acknowledged, and nothing else
+        is. Messages received but not
         returned stay unacknowledged, so the broker redelivers them in
         order to the next call, one message per call. Only one client per
         agent-id can hold the session: do not run a daemon or persistent
@@ -893,7 +911,9 @@ class AgentBus:
         started_at: datetime | None = None
         if self.persistent:
             started_at = datetime.now(timezone.utc)
-            client_kwargs["identifier"] = f"swarmbus-{self.agent_id}"
+            client_kwargs["identifier"] = self.topics.session_client_id(
+                self.agent_id
+            )
             client_kwargs["clean_session"] = False
             client_kwargs["will"] = aiomqtt.Will(
                 topic=self.topics.presence(self.agent_id),

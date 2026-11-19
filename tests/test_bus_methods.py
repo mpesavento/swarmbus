@@ -18,7 +18,7 @@ import aiomqtt
 from swarmbus.bus import AgentBus, _legacy_presence_payload
 from swarmbus.message import AgentMessage
 from swarmbus.registry import PresenceRecord
-from swarmbus.topics import DEFAULT_TOPICS
+from swarmbus.topics import DEFAULT_TOPICS, TopicMap
 
 #: Topic the inbox fixtures arrive on; every inbox test uses agent_id "me".
 _INBOX_TOPIC = DEFAULT_TOPICS.inbox("me")
@@ -511,6 +511,24 @@ async def test_listen_durable_passes_stable_identifier_and_clean_session():
 
 
 @pytest.mark.asyncio
+async def test_listen_durable_identifier_carries_the_topic_root():
+    """Two roots on one broker are two sessions, not one evicting the other."""
+    captured_kwargs = {}
+    fleet = TopicMap(root="fleet")
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__([])
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=True, topics=fleet)
+        await bus.listen()
+    assert captured_kwargs.get("identifier") == fleet.session_client_id("sparrow")
+    assert captured_kwargs.get("clean_session") is False
+
+
+@pytest.mark.asyncio
 async def test_listen_non_durable_omits_identifier():
     captured_kwargs = {}
 
@@ -580,6 +598,26 @@ async def test_read_inbox_durable_passes_identifier_and_clean_session():
 
 
 @pytest.mark.asyncio
+async def test_read_inbox_durable_identifier_carries_the_topic_root():
+    """A rooted read drains its own session's queue, not the unrooted one's."""
+    captured_kwargs = {}
+    fleet = TopicMap(root="fleet")
+    payloads = [_envelope(subject="queued")]
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__(payloads, topic=fleet.inbox("sparrow"))
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=True, topics=fleet)
+        result = await bus.read_inbox(drain_timeout=0.1)
+    assert captured_kwargs.get("identifier") == fleet.session_client_id("sparrow")
+    assert captured_kwargs.get("clean_session") is False
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
 async def test_read_inbox_non_durable_omits_identifier():
     """persistent=False (default) → no identifier or clean_session set."""
     captured_kwargs = {}
@@ -611,6 +649,26 @@ async def test_watch_inbox_durable_passes_identifier_and_clean_session():
         bus = AgentBus(agent_id="sparrow", persistent=True)
         result = await bus.watch_inbox(timeout=0.1)
     assert captured_kwargs.get("identifier") == "swarmbus-sparrow"
+    assert captured_kwargs.get("clean_session") is False
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_watch_inbox_durable_identifier_carries_the_topic_root():
+    """A rooted watch holds its own session, so the other root keeps its."""
+    captured_kwargs = {}
+    fleet = TopicMap(root="fleet")
+    payloads = [_envelope(subject="live")]
+
+    class _CapturingClient(_FakeClient):
+        def __init__(self, *args, **kwargs):
+            captured_kwargs.update(kwargs)
+            super().__init__(payloads, topic=fleet.inbox("sparrow"))
+
+    with patch("swarmbus.bus.aiomqtt.Client", _CapturingClient):
+        bus = AgentBus(agent_id="sparrow", persistent=True, topics=fleet)
+        result = await bus.watch_inbox(timeout=0.1)
+    assert captured_kwargs.get("identifier") == fleet.session_client_id("sparrow")
     assert captured_kwargs.get("clean_session") is False
     assert result is not None
 

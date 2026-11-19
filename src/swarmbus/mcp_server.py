@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, AsyncIterator, Literal, Protocol
 
 import aiomqtt
 
+from .archive import state_db_path
 from .message import DEFAULT_HOP_LIMIT, DEFAULT_RATE_COOLDOWN, DEFAULT_RATE_LIMIT
 from .runtime import ManagedMCPRuntime, TransportUnavailable
+from .topics import DEFAULT_TOPICS, TopicMap
 
 logger = logging.getLogger(__name__)
 
@@ -231,9 +232,9 @@ def create_managed_runtime(
     rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     on_trip: list[str] | None = None,
     trip_listener: str = "mcp-server",
+    topics: TopicMap = DEFAULT_TOPICS,
 ) -> ManagedMCPRuntime:
     """Build the managed runtime shared by MCP transports."""
-    state_path = Path(state_dir).expanduser() / f"{agent_id}.sqlite3"
     return ManagedMCPRuntime(
         agent_id=agent_id,
         broker=broker,
@@ -244,7 +245,7 @@ def create_managed_runtime(
         heartbeat_seconds=registry_heartbeat_seconds,
         stale_after_seconds=registry_stale_after_seconds,
         capabilities=capabilities,
-        state_path=state_path,
+        state_path=state_db_path(state_dir, agent_id, topics),
         username=username,
         password=password,
         tls=tls,
@@ -256,6 +257,7 @@ def create_managed_runtime(
         rate_cooldown=rate_cooldown,
         on_trip=on_trip,
         trip_listener=trip_listener,
+        topics=topics,
     )
 
 def run_mcp_server(
@@ -280,6 +282,7 @@ def run_mcp_server(
     rate_limit: int = DEFAULT_RATE_LIMIT,
     rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     on_trip: list[str] | None = None,
+    topics: TopicMap = DEFAULT_TOPICS,
 ) -> None:
     """Start the MCP sidecar with one managed MQTT connection."""
     if not _MCP_AVAILABLE:
@@ -310,6 +313,7 @@ def run_mcp_server(
         rate_limit=rate_limit,
         rate_cooldown=rate_cooldown,
         on_trip=on_trip,
+        topics=topics,
     )
 
     @asynccontextmanager

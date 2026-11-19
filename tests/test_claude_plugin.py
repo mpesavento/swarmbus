@@ -20,6 +20,7 @@ INSTALL = 'uv tool install "swarmbus-py[mcp]"'
 LAUNCHER = (
     "command -v swarmbus >/dev/null 2>&1 || { echo 'swarmbus is not installed (no swarmbus command on PATH). "
     "Install it with: uv tool install \"swarmbus-py[mcp]\" and restart Claude Code.' >&2; exit 127; }; "
+    '[ -n "$SWARMBUS_PLUGIN_TOPIC_ROOT" ] && set -- "$@" "--topic-root=$SWARMBUS_PLUGIN_TOPIC_ROOT"; '
     'exec swarmbus "$@"'
 )
 
@@ -108,6 +109,43 @@ def test_launcher_names_the_install_command_when_swarmbus_is_missing(tmp_path):
     assert calls.read_text().split("\n")[:-1] == ["mcp-server", "--agent-id", "planner", "--broker", "", "--presence"]
 
 
+def test_launcher_appends_the_topic_root_only_when_the_plugin_setting_is_set(tmp_path):
+    sh = shutil.which("sh")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "calls"
+    stub = bin_dir / "swarmbus"
+    stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {calls}\n")
+    stub.chmod(0o755)
+    args = ["swarmbus", "mcp-attach", "--agent-id", "planner", "--presence"]
+
+    def argv(**env):
+        proc = subprocess.run(
+            [sh, "-c", LAUNCHER, *args],
+            env={"PATH": str(bin_dir), **env}, capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        return calls.read_text().split("\n")[:-1]
+
+    assert argv(SWARMBUS_PLUGIN_TOPIC_ROOT="fleet") == [*args[1:], "--topic-root=fleet"]
+    # An empty or absent setting defers to [broker] topic_root in the config
+    # file; an explicit --topic-root= would force the unrooted layout instead.
+    assert argv(SWARMBUS_PLUGIN_TOPIC_ROOT="") == args[1:]
+    assert argv() == args[1:]
+
+
+def test_plugin_topic_root_reaches_the_launcher_through_the_environment():
+    setting = _json(MANIFEST)["userConfig"]["topic_root"]
+    assert setting["type"] == "string"
+    assert setting["title"] == "Topic root"
+    assert setting["default"] == ""
+    assert not setting.get("required", False)
+
+    [server] = _json(MCP_CONFIG)["mcpServers"].values()
+    assert server["env"]["SWARMBUS_PLUGIN_TOPIC_ROOT"] == "${user_config.topic_root}"
+    assert not [arg for arg in _sidecar_argv(server) if "--topic-root" in arg]
+
+
 def test_plugin_broker_settings_default_to_empty():
     config = _json(MANIFEST)["userConfig"]
     for key in ("broker", "port"):
@@ -142,6 +180,12 @@ def test_plugin_passes_persistent_only_to_the_shared_daemon():
 def test_plugin_readme_describes_the_shared_daemon():
     readme = (PLUGIN_DIR / "README.md").read_text()
     for text in ("swarmbus mcp-attach", "--persistent", "kill <pid>", ".daemon.log", "swarmbus doctor"):
+        assert text in readme, text
+
+
+def test_plugin_readme_documents_the_topic_root_setting():
+    readme = (PLUGIN_DIR / "README.md").read_text()
+    for text in ("topic root", "[broker] topic_root", "@<root>.daemon.log"):
         assert text in readme, text
 
 

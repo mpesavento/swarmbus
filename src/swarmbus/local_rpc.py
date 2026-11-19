@@ -37,6 +37,7 @@ from .runtime import (
     StoreUnavailable,
     TransportUnavailable,
 )
+from .topics import DEFAULT_TOPICS, TopicMap
 
 SCHEMA_VERSION = 1
 MAX_FRAME_BYTES = 1024 * 1024
@@ -744,12 +745,17 @@ def daemon_settings(
     persistent: bool,
     presence: bool,
     lifecycle: str,
+    topic_root: str = "",
 ) -> dict[str, Any]:
     """The settings fingerprint a daemon reports and an attaching session compares.
 
     It holds only whether a password is set. There is no password key and no
     hash or other derivation of it, because the fingerprint crosses the socket
     in every ping reply and appears in error messages.
+
+    The topic root is part of it because a session attached to a daemon on
+    another root would send and receive in a namespace it did not ask for,
+    with no error from the broker.
     """
     return {
         "agent_id": agent_id,
@@ -764,6 +770,7 @@ def daemon_settings(
         "persistent": persistent,
         "presence": presence,
         "lifecycle": lifecycle,
+        "topic_root": topic_root,
     }
 
 
@@ -945,6 +952,7 @@ def run_mcp_daemon(
     rate_limit: int = DEFAULT_RATE_LIMIT,
     rate_cooldown: float = DEFAULT_RATE_COOLDOWN,
     on_trip: list[str] | None = None,
+    topics: TopicMap = DEFAULT_TOPICS,
 ) -> None:
     """Run one managed runtime until a signal or local shutdown request."""
     runtime = create_managed_runtime(
@@ -969,6 +977,7 @@ def run_mcp_daemon(
         rate_cooldown=rate_cooldown,
         on_trip=on_trip,
         trip_listener="mcp-daemon",
+        topics=topics,
     )
 
     settings = daemon_settings(
@@ -984,6 +993,7 @@ def run_mcp_daemon(
         persistent=persistent,
         presence=presence,
         lifecycle=lifecycle,
+        topic_root=topics.root,
     )
 
     async def serve() -> None:

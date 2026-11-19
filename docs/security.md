@@ -86,6 +86,8 @@ The same `SWARMBUS_BROKER_*` vars work for the MCP sidecar registered with Claud
 
 `swarmbus init` accepts the same six broker auth flags. When any are supplied (or read from the matching `SWARMBUS_BROKER_*` env var), they're written into a systemd drop-in at `~/.config/systemd/user/swarmbus-<agent-id>.service.d/auth.conf` (mode 0600), which systemd merges with the main unit at daemon-reload time. The main `ExecStart` line stays clean.
 
+Under a topic root the unit carries the root, and the drop-in directory follows it: `swarmbus-<agent-id>:<root>.service.d/auth.conf`. systemd silently ignores a drop-in whose directory does not match its unit, so credentials left in the unrooted path never reach a rooted daemon. The root is escaped here rather than spelled as it is in the MQTT client id (`swarmbus-<id>@<root>`), because systemd reads `@` as a template-instance separator; characters outside `A-Za-z0-9._-` become `:` followed by two hex digits.
+
 ```bash
 swarmbus init --agent-id laptop-cc \
   --broker mqtt.example.com \
@@ -142,8 +144,28 @@ topic readwrite agents/+/presence
 topic readwrite swarmbus/registry/+
 ```
 
-- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
+- **`%u`, not `%c`.** swarmbus sets the client id to `swarmbus-<id>` (`swarmbus-<id>@<root>` under a topic root) only in persistent mode. Every other connection gets a random client id from the MQTT library, so a `%c` pattern would match nothing. The username is the one thing every connection carries, which is why it must equal the agent id.
 - **Literal shared rules sit under `user`.** The `%u` `pattern` lines apply to every authenticated user. Literal `topic` lines before the first `user` line apply only to anonymous clients, so the remaining shared permissions are repeated in one `user` block per agent id. Add a block when you add an agent. Mosquitto 2.1 logs a startup warning for every `pattern` line that has no `%u` or `%c`.
+
+### With a topic root
+
+When the swarm runs under a topic root (`--topic-root fleet`, see [configuration.md](configuration.md#topic-root)), put the root in front of every agent and registry line. Broadcast stays unrooted:
+
+```
+pattern read fleet/agents/%u/inbox
+pattern readwrite fleet/agents/%u/presence
+pattern write fleet/swarmbus/registry/%u
+
+user planner
+topic write fleet/agents/+/inbox
+topic read fleet/agents/+/presence
+topic read fleet/swarmbus/registry/+
+topic readwrite agents/broadcast
+```
+
+- **A root is a namespace, not a secret.** Anyone who can read a process's flags, environment or config file knows it. The login and the ACL are what keep one swarm out of another's topics.
+- **A wrong root fails silently.** A process started without the root, or with another one, connects without error. The broker drops what it publishes and delivers it nothing, as under "Silent denials" below.
+- **Broadcast crosses roots.** `agents/broadcast` is one topic for every swarm on the broker. Leave that line out for a swarm that must not exchange broadcasts with the others.
 
 ### Broker config
 

@@ -12,8 +12,10 @@ from swarmbus.archive import (
     MessageConflictError,
     SQLiteArchive,
     SQLiteMessageStore,
+    state_db_path,
 )
 from swarmbus.message import AgentMessage
+from swarmbus.topics import TopicMap
 
 
 @pytest.fixture
@@ -1105,3 +1107,36 @@ async def test_channel_metrics_counts_one_window_per_sender_and_caps_the_listing
 
     with pytest.raises(ValueError):
         await store.channel_metrics(window=0)
+
+
+def test_state_db_path_is_named_for_the_agent_scope(tmp_path):
+    # The unrooted literals: an existing deployment keeps the file it has.
+    assert state_db_path(tmp_path, "rx") == tmp_path / "rx.sqlite3"
+    assert state_db_path(tmp_path, "rx", topics=TopicMap()) == tmp_path / "rx.sqlite3"
+
+    assert (
+        state_db_path(tmp_path, "rx", topics=TopicMap(root="fleet"))
+        == tmp_path / "rx@fleet.sqlite3"
+    )
+    # A multi-level root stays one path segment, so the db is one file in
+    # the state dir rather than a tree under it.
+    assert (
+        state_db_path(tmp_path, "rx", topics=TopicMap(root="fleet/prod"))
+        == tmp_path / "rx@fleet%2Fprod.sqlite3"
+    )
+
+    assert state_db_path("~/state", "rx") == Path.home() / "state" / "rx.sqlite3"
+
+
+@pytest.mark.asyncio
+async def test_pending_inbox_count_reports_unacknowledged_rows(db_path, msg):
+    store = SQLiteMessageStore(db_path)
+    await store.open()
+    try:
+        assert await store.pending_inbox_count() == 0
+        assert await store.store(msg, source_topic="agents/sparrow/inbox") is True
+        assert await store.pending_inbox_count() == 1
+        assert await store.ack([msg.id]) == 1
+        assert await store.pending_inbox_count() == 0
+    finally:
+        await store.close()

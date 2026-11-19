@@ -1,15 +1,26 @@
 # swarmbus systemd user unit — TEMPLATE
 #
 # Render with scripts/install-systemd.sh <agent-id> [<wake-wrapper-path>]
-# or by hand: copy to ~/.config/systemd/user/swarmbus-<agent-id>.service
-# and replace @AGENT_ID@, @HOME@, @BROKER@, @INBOX@, @INVOKE@, @SWARMBUS_PATH@.
+# or by hand: copy to ~/.config/systemd/user/swarmbus-<agent-id>.service,
+# or swarmbus-<agent-id>:<root>.service under a topic root, and replace
+# @AGENT_ID@, @AGENT_ID_UPPER@, @UNIT_SCOPE@, @HOME@, @BROKER@, @INBOX@,
+# @TOPIC_ROOT_ARG@, @INVOKE@, @SWARMBUS_PATH@. @TOPIC_ROOT_ARG@ is the
+# optional topic-root argument, left empty to let the daemon read its root
+# from the config file.
+#
+# @UNIT_SCOPE@ is the agent id unrooted, and '<agent-id>:<root>' with the
+# root escaped under one — the same token the unit name carries. The log
+# path below uses it so two units for one agent id do not interleave into
+# one log; it holds no '%' for systemd to expand. The outbox variable is
+# named for the agent id alone, because an environment variable name cannot
+# hold a '/' or a '%' and the root can.
 #
 # After installing:
 #   export XDG_RUNTIME_DIR=/run/user/$(id -u)
 #   export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
 #   systemctl --user daemon-reload
-#   systemctl --user enable swarmbus-<agent-id>.service
-#   systemctl --user start swarmbus-<agent-id>.service
+#   systemctl --user enable <unit-name>
+#   systemctl --user start <unit-name>
 #   loginctl enable-linger $(whoami)   # survive logout / reboot
 #   swarmbus doctor --agent-id <agent-id>   # verify
 
@@ -31,15 +42,15 @@ Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 # agent sessions don't have to.
 Environment=SWARMBUS_OUTBOX_@AGENT_ID_UPPER@=@HOME@/sync/@AGENT_ID@-outbox.md
 
-ExecStart=@SWARMBUS_PATH@ start --agent-id @AGENT_ID@ --broker @BROKER@ --inbox @INBOX@ --invoke "@INVOKE@"
+ExecStart=@SWARMBUS_PATH@ start --agent-id @AGENT_ID@ --broker @BROKER@ --inbox @INBOX@@TOPIC_ROOT_ARG@ --invoke "@INVOKE@"
 
 Restart=on-failure
 RestartSec=5s
 
 # Logs to the operator's chosen location. Default: ~/sparrow-workspace/logs
 # or wherever the agent's own log dir is. Override via rendering.
-StandardOutput=append:@HOME@/logs/swarmbus-@AGENT_ID@.log
-StandardError=append:@HOME@/logs/swarmbus-@AGENT_ID@.log
+StandardOutput=append:@HOME@/logs/swarmbus-@UNIT_SCOPE@.log
+StandardError=append:@HOME@/logs/swarmbus-@UNIT_SCOPE@.log
 
 [Install]
 WantedBy=default.target

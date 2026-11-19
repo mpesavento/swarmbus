@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock, patch
 from click.testing import CliRunner
 
 from swarmbus.cli import main
+from swarmbus.config import load_config
 from swarmbus.maintenance import RegistryListReport
+from swarmbus.topics import TopicMap
 
 SEND = ["send", "--to", "wren", "--subject", "x", "--body", "y"]
 
@@ -90,6 +92,7 @@ tls = yes
         "ca_cert": None,
         "client_cert": None,
         "client_key": None,
+        "topics": TopicMap(),
         "snapshot_seconds": 0.5,
     }
 
@@ -115,6 +118,13 @@ port =
     kw = bus.call_args.kwargs
     assert not kw["ca_cert"].startswith("~") and kw["ca_cert"].endswith("ca.pem")
     assert kw["port"] == 1883          # an empty value counts as not set
+
+
+def test_a_config_topic_root_is_normalized_at_load(tmp_path):
+    """Every process on the broker has to land on the same string."""
+    cfg = _write(tmp_path / "root.ini", "[broker]\ntopic_root =  /fleet/ \n")
+
+    assert load_config(str(cfg)).params["topic_root"] == "fleet"
 
 
 def test_config_reaches_the_listeners_and_tail(tmp_path):
@@ -202,6 +212,8 @@ def test_config_errors_fail_loud_with_the_path_and_never_the_value(tmp_path):
         "negative.ini": ("[limits]\nhop_limit = -1\n", "[limits] hop_limit"),
         "inf-cooldown.ini": ("[limits]\nrate_cooldown = inf\n", "[limits] rate_cooldown"),
         "bad-bool.ini": ("[broker]\ntls = SECRET1\n", "[broker] tls"),
+        "wildcard-root.ini": ("[broker]\ntopic_root = SECRET1/+\n",
+                              "[broker] topic_root"),
     }
     for name, (text, needle) in cases.items():
         cfg = _write(tmp_path / name, text)

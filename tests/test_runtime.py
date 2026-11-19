@@ -25,6 +25,7 @@ from swarmbus.runtime import (
     TransportUnavailable,
     _ManualAckAdapter,
 )
+from swarmbus.topics import TopicMap
 
 
 class _FakePaho:
@@ -1143,6 +1144,21 @@ async def test_persistent_runtime_uses_only_canonical_mqtt_client_id():
         runtime._client.publish.await_args.args[1]
     )
     assert "mqtt_client_id" not in record.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_persistent_runtime_client_id_carries_the_topic_root():
+    """One agent id under two roots must be two sessions on one broker."""
+    fleet = TopicMap(root="fleet")
+    runtime = _runtime(
+        _FakeStore([]),
+        presence=True,
+        persistent=True,
+        topics=fleet,
+    )
+
+    assert runtime._client_kwargs()["identifier"] == fleet.session_client_id("foo")
+    assert runtime._client_kwargs()["clean_session"] is False
 
 
 @pytest.mark.asyncio

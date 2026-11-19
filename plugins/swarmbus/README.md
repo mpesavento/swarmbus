@@ -22,16 +22,19 @@ The plugin starts the sidecar but does not install swarmbus or run a broker. Bef
 claude plugin install swarmbus --marketplace mpesavento/swarmbus
 ```
 
-Claude Code asks for the agent id. The broker host, port, username and password are optional. An empty host or port is taken from `~/.swarmbus/config.ini` (`[broker] host` / `port`), then `localhost:1883`. The username and password are stored as sensitive values. Change any of them later in `/config`.
+Claude Code asks for the agent id. The broker host, port, username, password and topic root are optional. An empty host or port is taken from `~/.swarmbus/config.ini` (`[broker] host` / `port`), then `localhost:1883`. The username and password are stored as sensitive values. Change any of them later in `/config`.
+
+The topic root is the namespace prefix of the swarm this agent joins, such as `fleet`. Leave it empty and the root comes from `[broker] topic_root` in `~/.swarmbus/config.ini`; if that is unset too, the layout is unrooted. Every agent in a swarm must use the same topic root: a session on the wrong root publishes and subscribes where nobody else is, and MQTT reports no error for that.
 
 ## What it runs and connects to
 
 - It runs `sh -c` with a one-line check that `swarmbus` is on your PATH, then `swarmbus mcp-attach --agent-id <id> --broker <host> --port <port> --persistent --presence`, once per Claude Code session. The settings reach `swarmbus` as separate arguments, never as part of the shell line.
-- `mcp-attach` looks for the shared daemon for this agent id. The first session starts one, detached from the session, and later sessions attach to it with no second broker connection. The session itself only serves the `send_message`, `read_inbox` and `agent_state` tools through that daemon.
+- A non-empty topic root reaches the sidecar as `--topic-root=<root>`, so it beats the config file. An empty one is left off the command line entirely, which is what lets the config file's root apply.
+- `mcp-attach` looks for the shared daemon for this agent id and topic root. The first session starts one, detached from the session, and later sessions attach to it with no second broker connection. The session itself only serves the `send_message`, `read_inbox` and `agent_state` tools through that daemon.
 - The daemon runs `--persistent`, so messages sent to this agent id while no session is open are queued by the broker for the id and arrive when a session reads its inbox.
 - With `--presence` the daemon publishes this agent's online or offline state and a registry record to the broker, retained, so peers can see it. That is also what lets `agent_state` answer.
-- The daemon connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one. Its log is `~/.local/state/swarmbus/<agent-id>.daemon.log`.
-- An empty host or port counts as unset, so the config file's value applies, then the built-in default. A host or port set in the plugin beats the config file.
+- The daemon connects only to the broker you name. It keeps a local SQLite inbox under `~/.local/state/swarmbus` and reads `~/.swarmbus/config.ini` if you have one. Its log is `~/.local/state/swarmbus/<agent-id>.daemon.log` unrooted, and `~/.local/state/swarmbus/<agent-id>@<root>.daemon.log` under a topic root. There is one daemon per agent id and root, so changing the root starts a second one rather than moving the first.
+- An empty host, port or topic root counts as unset, so the config file's value applies, then the built-in default. A host, port or topic root set in the plugin beats the config file.
 - The username and password reach the sidecar as `SWARMBUS_BROKER_USERNAME` / `SWARMBUS_BROKER_PASSWORD`. An empty one counts as unset, so the config file's values apply.
 - TLS settings still come from the config file or the `SWARMBUS_BROKER_*` environment variables; see `docs/configuration.md`.
 
